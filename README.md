@@ -43,10 +43,35 @@ The app will auto-elevate via a UAC prompt if launched without admin rights.
 |-----------------|-----------------------------------------------------------------|
 | Left-click      | Toggle blocking ON (green ✓) / OFF (grey ✕)                    |
 | **Toggle**      | Same as left-click                                              |
+| **🎵 Ad is playing — capture now** | Learn mode. Click this the moment an ad plays — see below |
+| **Reload filters** | Re-reads all files in `filters/` without restarting          |
 | **Install certificate** | Re-install mitmproxy CA (if you cleared it manually)    |
 | **Open filter rules**   | Opens `filters/` in Explorer so you can edit rules      |
 | **View blocked requests** | Toast with per-app counts + opens `blocked.log`       |
 | **Exit**        | Stops proxy, restores system proxy, quits                       |
+
+## Learn mode — teach it what an ad looks like
+
+The proxy keeps a **rolling 60-second buffer** of every request Spotify makes that wasn't already blocked. When you hear an ad:
+
+1. **Pause Spotify** the moment you notice the ad.
+2. Right-click the tray icon → **🎵 Ad is playing — capture now**.
+3. HostsBlock Pro scans the last 30 s of traffic and keeps entries that are:
+   - on a known ad-network host, **or**
+   - under an ad-shaped path (`/ads/`, `/promo/`, `/tracking/`, `/pixel`, …), **or**
+   - an audio/video response (the actual ad stream).
+4. New rules are appended to **`filters/spotify-learned.txt`** (deduped against existing rules), the engine reloads, and a toast shows what was added.
+5. `apps.json` is updated automatically so the learned file is always loaded.
+
+**This is the file you commit to git** — share your captures by pushing:
+
+```bat
+git add filters/spotify-learned.txt apps.json
+git commit -m "Add learned Spotify ad endpoints"
+git push
+```
+
+Review the file before committing — the heuristics are conservative but not perfect. Remove anything that looks like legit music/auth traffic.
 
 ## Filter syntax
 

@@ -271,6 +271,33 @@ class HostsBlockProApp:
         except Exception as e:
             self.notify(f"Could not open filters folder: {e}")
 
+    def capture_ad(self, *_args) -> None:
+        """
+        Learn-mode: the user just heard/saw an ad. Pause it, click this, and we
+        promote ad-shaped requests from the last 30s of traffic into
+        ``filters/spotify-learned.txt`` (deduped, persisted, reloaded live).
+        Commit that file to git to share your finds.
+        """
+        def worker():
+            added, rules, path = self.addon.capture_candidates(app="spotify", window_sec=30)
+            if added == 0:
+                self.notify(
+                    "No new ad-shaped requests in the last 30s. "
+                    "Try clicking sooner after the ad starts, or check blocked.log."
+                )
+                return
+            preview = "\n".join(rules[:5])
+            more = f"\n(+{added - 5} more)" if added > 5 else ""
+            self.notify(f"Captured {added} new rule(s) into {path.name}:\n{preview}{more}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def reload_filters(self, *_args) -> None:
+        try:
+            self.addon.engine.reload()
+            self.notify(f"Filters reloaded — {len(self.addon.engine.rules)} rules active")
+        except Exception as e:
+            self.notify(f"Reload failed: {e}")
+
     def view_blocked(self, *_args) -> None:
         self.notify(self.addon.summary())
         # Also open the raw log for detail
@@ -291,6 +318,10 @@ class HostsBlockProApp:
     def build_menu(self) -> Menu:
         return Menu(
             Item("Toggle", self.toggle, default=True),
+            Menu.SEPARATOR,
+            Item("🎵 Ad is playing — capture now", self.capture_ad),
+            Item("Reload filters", self.reload_filters),
+            Menu.SEPARATOR,
             Item("Install certificate", self.install_cert),
             Item("Open filter rules", self.open_filters),
             Item("View blocked requests", self.view_blocked),
