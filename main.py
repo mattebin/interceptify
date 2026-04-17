@@ -203,6 +203,9 @@ class HostsBlockProApp:
     # -- helpers -----------------------------------------------------------
 
     def notify(self, msg: str, title: str = APP_NAME) -> None:
+        # Always log too — Windows toast notifications are unreliable on some
+        # setups (Focus Assist, missing Action Center prefs, etc.).
+        log.info("NOTIFY: %s", msg)
         try:
             if self.icon is not None:
                 self.icon.notify(msg, title)
@@ -266,7 +269,10 @@ class HostsBlockProApp:
 
     def install_cert(self, *_args) -> None:
         def worker():
+            cert = cert_manager.find_ca()
+            log.info("Install certificate clicked. CA path: %s", cert)
             ok, msg = cert_manager.install_ca()
+            log.info("Install certificate result: ok=%s msg=%s", ok, msg)
             self.notify(msg)
             if ok:
                 self.cfg["cert_installed"] = True
