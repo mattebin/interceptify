@@ -53,6 +53,8 @@ jobs:
 
             Windows tray app that blocks ads in Spotify (and other desktop apps) via an embedded mitmproxy.
 
+            > 🛑 **READ THIS FIRST** — You need the **desktop installer** version of Spotify from [spotify.com/download](https://www.spotify.com/download). The **Microsoft Store version will NOT work** (sandbox blocks loopback / ignores system proxy). Uninstall the Store version and install from spotify.com before using this.
+
             ### Install
             1. Download **Interceptify.exe** below.
             2. Double-click. Accept the UAC prompt (needed to install the mitmproxy CA).

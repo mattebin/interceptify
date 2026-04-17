@@ -2,6 +2,14 @@
 
 A Windows tray app that runs an **embedded mitmproxy** to block ad & telemetry requests made by desktop apps — starting with **Spotify**. Extensible to any other app by dropping a filter file.
 
+> 🛑 **READ THIS FIRST — Spotify compatibility**
+>
+> You need the **desktop installer** version of Spotify from **[spotify.com/download](https://www.spotify.com/download)**.
+>
+> The **Microsoft Store version will NOT work** — it runs inside a Windows AppContainer sandbox that blocks loopback connections to `127.0.0.1` and ignores the system proxy. Interceptify can't reach it.
+>
+> If you have the Store version: uninstall it, download the installer from spotify.com, sign in again. Same app, same library, no sandbox.
+
 > ⚠️ **Honest disclaimer.** This is a learning / hobby tool.
 > - **Spotify audio ads stream from the same CDN as music**, so they cannot be reliably blocked by URL filtering. Expect to still hear some audio ads.
 > - Spotify ships updates that rename endpoints — filters will need occasional tuning.
@@ -27,6 +35,8 @@ Toggling ON:
 Toggling OFF reverses all three.
 
 ## Install
+
+> ⚠️ Before installing: make sure you're using **Spotify from [spotify.com/download](https://www.spotify.com/download)**, not the Microsoft Store version. The Store version is sandboxed and won't work with this tool (see the note at the top).
 
 ### Easy way — download the prebuilt exe
 1. Grab **Interceptify.exe** from the [Releases page](https://github.com/mattebin/interceptify/releases).
