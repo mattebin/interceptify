@@ -279,6 +279,20 @@ class HostsBlockProApp:
                 save_config(self.cfg)
         threading.Thread(target=worker, daemon=True).start()
 
+    def uninstall_cert(self, *_args) -> None:
+        """Remove the mitmproxy CA from the Windows Trusted Root store."""
+        def worker():
+            # Make sure we're not actively intercepting when the cert disappears
+            if self.active:
+                self.turn_off()
+            ok, msg = cert_manager.remove_ca()
+            log.info("Uninstall certificate result: ok=%s msg=%s", ok, msg)
+            self.notify(msg)
+            if ok:
+                self.cfg["cert_installed"] = False
+                save_config(self.cfg)
+        threading.Thread(target=worker, daemon=True).start()
+
     def open_filters(self, *_args) -> None:
         try:
             os.startfile(str(FILTERS_DIR))  # type: ignore[attr-defined]
@@ -337,6 +351,7 @@ class HostsBlockProApp:
             Item("Reload filters", self.reload_filters),
             Menu.SEPARATOR,
             Item("Install certificate", self.install_cert),
+            Item("Uninstall certificate", self.uninstall_cert),
             Item("Open filter rules", self.open_filters),
             Item("View blocked requests", self.view_blocked),
             Menu.SEPARATOR,
