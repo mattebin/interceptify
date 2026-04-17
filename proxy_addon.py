@@ -1,5 +1,5 @@
 """
-mitmproxy addon + filter engine for HostsBlock Pro.
+mitmproxy addon + filter engine for Interceptify.
 
 Filter rules live in ``filters/<appname>.txt``. The ``FilterEngine`` loads and
 compiles them at startup; ``BlockerAddon`` hooks every HTTP request and returns
@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 
 from mitmproxy import http
 
-log = logging.getLogger("hostsblock")
+log = logging.getLogger("interceptify")
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ class BlockerAddon:
 
         flow.response = http.Response.make(
             403,
-            b"Blocked by HostsBlock Pro\n",
+            b"Blocked by Interceptify\n",
             {"Content-Type": "text/plain"},
         )
         self._record(req.method, url, rule)
@@ -314,7 +314,7 @@ class BlockerAddon:
             with learned_path.open("a", encoding="utf-8") as f:
                 if header_needed:
                     f.write(
-                        f"# HostsBlock Pro — learned rules for {app}\n"
+                        f"# Interceptify — learned rules for {app}\n"
                         f"# Auto-captured from recent traffic. Review before committing.\n"
                     )
                 f.write(f"\n# --- Captured {datetime.now().isoformat(timespec='seconds')} ---\n")

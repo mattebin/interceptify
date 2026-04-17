@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="HostsBlockPro" type="win32"/>
-  <description>HostsBlock Pro tray app</description>
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Interceptify" type="win32"/>
+  <description>Interceptify tray app</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

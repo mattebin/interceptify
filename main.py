@@ -1,5 +1,5 @@
 """
-HostsBlock Pro — Windows tray app that runs an embedded mitmproxy to block
+Interceptify — Windows tray app that runs an embedded mitmproxy to block
 ads inside the Spotify desktop app (and any other app you add a filter for).
 
 High-level flow:
@@ -36,12 +36,12 @@ import cert_manager
 import system_proxy
 from proxy_addon import BlockerAddon
 
-APP_NAME = "HostsBlock Pro"
+APP_NAME = "Interceptify"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 8080
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("hostsblock")
+log = logging.getLogger("interceptify")
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ class ProxyRunner:
 # Tray application
 # ---------------------------------------------------------------------------
 
-class HostsBlockProApp:
+class InterceptifyApp:
     def __init__(self) -> None:
         self.cfg = load_config()
         self.active = False
@@ -376,7 +376,7 @@ def main() -> None:
     if not is_admin():
         relaunch_as_admin()
         return
-    HostsBlockProApp().run()
+    InterceptifyApp().run()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 Installs mitmproxy's CA certificate into the Windows Trusted Root store.
 
 mitmproxy auto-generates its CA on first launch at ``~/.mitmproxy/``. This
-module wraps ``certutil -addstore`` so HostsBlock Pro can install/re-install
+module wraps ``certutil -addstore`` so Interceptify can install/re-install
 the cert without shelling out to UAC every time (the app is already elevated).
 """
 
@@ -12,7 +12,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-log = logging.getLogger("hostsblock")
+log = logging.getLogger("interceptify")
 
 MITMPROXY_DIR = Path.home() / ".mitmproxy"
 CA_CERT_PATH = MITMPROXY_DIR / "mitmproxy-ca-cert.cer"

@@ -1,4 +1,4 @@
-# HostsBlock Pro
+# Interceptify
 
 A Windows tray app that runs an **embedded mitmproxy** to block ad & telemetry requests made by desktop apps — starting with **Spotify**. Extensible to any other app by dropping a filter file.
 
@@ -29,7 +29,7 @@ Toggling OFF reverses all three.
 ## Install
 
 ### Easy way — download the prebuilt exe
-1. Grab **HostsBlockPro.exe** from the [Releases page](https://github.com/mattebin/hostsblock-pro/releases).
+1. Grab **Interceptify.exe** from the [Releases page](https://github.com/mattebin/interceptify/releases).
 2. Double-click it. Accept the UAC prompt.
 3. Shield icon appears in your tray.
 
@@ -59,7 +59,7 @@ The proxy keeps a **rolling 60-second buffer** of every request Spotify makes th
 
 1. **Pause Spotify** the moment you notice the ad.
 2. Right-click the tray icon → **🎵 Ad is playing — capture now**.
-3. HostsBlock Pro scans the last 30 s of traffic and keeps entries that are:
+3. Interceptify scans the last 30 s of traffic and keeps entries that are:
    - on a known ad-network host, **or**
    - under an ad-shaped path (`/ads/`, `/promo/`, `/tracking/`, `/pixel`, …), **or**
    - an audio/video response (the actual ad stream).
@@ -107,7 +107,7 @@ For per-app logic more complex than URL blocking (e.g. rewriting JSON response b
 
 ## Test plan — verify the proxy is live
 
-1. Toggle HostsBlock Pro **ON**.
+1. Toggle Interceptify **ON**.
 2. In any browser using the system proxy (Edge, Chrome), go to **http://mitm.it** — the mitmproxy landing page should load, proving traffic is being intercepted.
 3. Visit **https://example.com** — it should load cleanly (cert chain will show "mitmproxy" as the issuer — that's expected).
 4. Play Spotify for a bit. Right-click the tray icon → **View blocked requests** — you should see a count for `spotify` and entries in `blocked.log` like:
@@ -133,15 +133,15 @@ For per-app logic more complex than URL blocking (e.g. rewriting JSON response b
 ```bat
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --windowed ^
-  --name "HostsBlockPro" ^
-  --manifest hostsblock-pro.manifest ^
+  --name "Interceptify" ^
+  --manifest interceptify.manifest ^
   --uac-admin ^
   --add-data "filters;filters" ^
   --add-data "apps.json;." ^
   main.py
 ```
 
-The `.exe` lands in `dist\HostsBlockPro.exe`.
+The `.exe` lands in `dist\Interceptify.exe`.
 
 ## Security note
 

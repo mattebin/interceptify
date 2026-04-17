@@ -18,7 +18,7 @@ from pathlib import Path
 
 import winreg
 
-log = logging.getLogger("hostsblock")
+log = logging.getLogger("interceptify")
 
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 

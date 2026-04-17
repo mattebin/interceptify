@@ -1,4 +1,4 @@
-# HostsBlock Pro — Spotify filter rules
+# Interceptify — Spotify filter rules
 #
 # Syntax (one rule per line):
 #   example.com               Exact hostname match (any path)
