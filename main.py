@@ -33,6 +33,7 @@ from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
 import cert_manager
+import spotify_patcher
 import system_proxy
 from proxy_addon import BlockerAddon
 
@@ -415,6 +416,70 @@ class InterceptifyApp:
         except Exception as e:
             self.notify(f"Could not open filters folder: {e}")
 
+    # -- Spotify client-side patch ----------------------------------------
+
+    def _current_show_badge(self) -> bool:
+        return bool(self.cfg.get("show_badge", True))
+
+    def patch_spotify(self, *_args) -> None:
+        """Inject Interceptify's ad-handler JS into Spotify's xpui.spa."""
+        def worker():
+            if not spotify_patcher.is_installed():
+                self.notify("Spotify not found. Install from spotify.com (desktop, not Store).")
+                return
+            was_running = spotify_patcher.is_spotify_running()
+            if was_running:
+                spotify_patcher.kill_spotify()
+                import time; time.sleep(2)
+            ok, msg = spotify_patcher.patch(show_badge=self._current_show_badge())
+            log.info("patch_spotify: ok=%s msg=%s", ok, msg)
+            # Auto-relaunch if we had to kill it, so the user doesn't have to
+            if ok and was_running:
+                if spotify_patcher.launch_spotify():
+                    self.notify("Spotify patched and relaunched.")
+                    return
+            self.notify(msg)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def toggle_show_badge(self, *_args) -> None:
+        """Flip the show-badge preference and re-patch Spotify to apply."""
+        def worker():
+            new_val = not self._current_show_badge()
+            self.cfg["show_badge"] = new_val
+            save_config(self.cfg)
+            if not spotify_patcher.is_installed():
+                self.notify(f"Badge preference saved ({'on' if new_val else 'off'}). Spotify not installed.")
+                return
+            was_running = spotify_patcher.is_spotify_running()
+            if was_running:
+                spotify_patcher.kill_spotify()
+                import time; time.sleep(2)
+            ok, msg = spotify_patcher.patch(show_badge=new_val)
+            log.info("toggle_show_badge -> %s: %s", new_val, msg)
+            if ok and was_running and spotify_patcher.launch_spotify():
+                self.notify(f"Status dot {'shown' if new_val else 'hidden'}. Spotify relaunched.")
+                return
+            if ok:
+                self.notify(f"Status dot {'shown' if new_val else 'hidden'}. Restart Spotify to apply.")
+            else:
+                self.notify(msg)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def unpatch_spotify(self, *_args) -> None:
+        """Restore Spotify's original xpui.spa from backup."""
+        def worker():
+            was_running = spotify_patcher.is_spotify_running()
+            if was_running:
+                spotify_patcher.kill_spotify()
+                import time; time.sleep(2)
+            ok, msg = spotify_patcher.unpatch()
+            log.info("unpatch_spotify: ok=%s msg=%s", ok, msg)
+            if ok and was_running and spotify_patcher.launch_spotify():
+                self.notify("Spotify restored and relaunched.")
+                return
+            self.notify(msg)
+        threading.Thread(target=worker, daemon=True).start()
+
     def open_bypass(self, *_args) -> None:
         """Open bypass.txt — hosts that should never be intercepted."""
         try:
@@ -478,6 +543,14 @@ class InterceptifyApp:
             Menu.SEPARATOR,
             Item("🎵 Ad is playing — capture now", self.capture_ad),
             Item("Reload filters", self.reload_filters),
+            Menu.SEPARATOR,
+            Item("Patch Spotify (client-side ad block)", self.patch_spotify),
+            Item("Unpatch Spotify", self.unpatch_spotify),
+            Item(
+                "Show status dot in Spotify",
+                self.toggle_show_badge,
+                checked=lambda item: self._current_show_badge(),
+            ),
             Menu.SEPARATOR,
             Item("Install certificate", self.install_cert),
             Item("Uninstall certificate", self.uninstall_cert),

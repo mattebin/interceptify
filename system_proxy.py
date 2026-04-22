@@ -21,6 +21,7 @@ import winreg
 log = logging.getLogger("interceptify")
 
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+CONN_REG_PATH = REG_PATH + r"\Connections"  # Windows 11 authoritative proxy blob
 ENV_REG_PATH = r"Environment"  # HKCU\Environment — persistent user env vars
 
 # WinINET option codes — signal other processes that proxy settings changed
@@ -45,8 +46,31 @@ def _read(name: str):
 
 
 def _write(name: str, value, value_type=winreg.REG_SZ) -> None:
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
-        winreg.SetValueEx(k, name, 0, value_type, value)
+    """
+    Write a value to our HKCU registry key.
+
+    Most values use winreg directly. For REG_DWORD we fall back to ``reg.exe``
+    via subprocess — on some Windows setups winreg's DWORD writes silently
+    fail (suspected security-product hook) while reg.exe succeeds.
+    After every write we read back and log a warning if it didn't stick.
+    """
+    import subprocess
+    if value_type == winreg.REG_DWORD:
+        subprocess.run(
+            ["reg", "add", "HKCU\\" + REG_PATH, "/v", name,
+             "/t", "REG_DWORD", "/d", str(int(value)), "/f"],
+            check=False, creationflags=0x08000000, capture_output=True,
+        )
+    else:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, value_type, value)
+
+    # Read-back verification — silent failures have bitten us before.
+    actual = _read(name)
+    expected = int(value) if value_type == winreg.REG_DWORD else value
+    if actual != expected:
+        log.warning("Registry write of %s didn't stick: wrote %r, reads %r",
+                    name, expected, actual)
 
 
 def _delete(name: str) -> None:
@@ -77,6 +101,69 @@ def _env_delete(name: str) -> None:
             winreg.DeleteValue(k, name)
     except FileNotFoundError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Windows 11 DefaultConnectionSettings binary blob
+#
+# On Windows 11 the legacy ProxyEnable / ProxyServer / ProxyOverride DWORDs
+# are NOT the authoritative source of proxy config — they're mirrored from a
+# binary blob stored at
+#   HKCU\...\Internet Settings\Connections\DefaultConnectionSettings
+# When WinINET refreshes, if the blob and the DWORDs disagree, the blob wins
+# and the DWORDs get reset. So our enable() has to write both in sync.
+#
+# Blob layout (little-endian):
+#   [0:4]   magic 0x46
+#   [4:8]   counter (increments on every change)
+#   [8:12]  connection flags (0x01 direct, 0x02 manual, 0x04 pac, 0x08 auto)
+#   [12:16] proxy_server length
+#   [...]   proxy_server bytes
+#   [...]   proxy_override length
+#   [...]   proxy_override bytes
+#   [...]   autoconfig_url length
+#   [...]   autoconfig_url bytes
+#   [last 32 bytes] reserved / connection GUID (usually zero)
+# ---------------------------------------------------------------------------
+
+import struct as _struct
+
+
+def _pack_conn_blob(counter: int, flags: int, server: str, override: str,
+                    autoconfig: str = "") -> bytes:
+    def _pstr(s: str) -> bytes:
+        b = s.encode("utf-8") if s else b""
+        return _struct.pack("<I", len(b)) + b
+    return (
+        _struct.pack("<I", 0x46)
+        + _struct.pack("<I", counter)
+        + _struct.pack("<I", flags)
+        + _pstr(server)
+        + _pstr(override)
+        + _pstr(autoconfig)
+        + b"\x00" * 32
+    )
+
+
+def _conn_counter() -> int:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CONN_REG_PATH, 0, winreg.KEY_READ) as k:
+            val, _ = winreg.QueryValueEx(k, "DefaultConnectionSettings")
+            return _struct.unpack_from("<I", val, 4)[0]
+    except FileNotFoundError:
+        return 0
+
+
+def _write_connection_blob(enabled: bool, server: str, override: str) -> None:
+    """Keep DefaultConnectionSettings in sync with the legacy DWORDs."""
+    counter = _conn_counter() + 1
+    flags = 0x01 | (0x02 if enabled else 0)  # always direct bit + optional manual
+    blob = _pack_conn_blob(counter, flags,
+                           server if enabled else "",
+                           override if enabled else "")
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CONN_REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, "DefaultConnectionSettings", 0, winreg.REG_BINARY, blob)
+        winreg.SetValueEx(k, "SavedLegacySettings", 0, winreg.REG_BINARY, blob)
 
 
 def _broadcast_env_change() -> None:
@@ -172,6 +259,8 @@ def enable(
     _write("ProxyEnable", 1, winreg.REG_DWORD)
     _write("ProxyServer", server)
     _write("ProxyOverride", full_override)
+    # Keep Windows 11's authoritative blob in sync or the DWORDs get reverted
+    _write_connection_blob(enabled=True, server=server, override=full_override)
     _notify_wininet()
 
     # Also set the NO_PROXY user env var so Python / Node / Go / cURL-based
@@ -199,6 +288,7 @@ def load_bypass_file(path: Path) -> list[str]:
 def disable() -> None:
     """Turn the system proxy OFF (leaves ProxyServer string in place but disabled)."""
     _write("ProxyEnable", 0, winreg.REG_DWORD)
+    _write_connection_blob(enabled=False, server="", override="")
     _notify_wininet()
 
 
@@ -216,6 +306,13 @@ def restore(snap: dict) -> None:
         else:
             _write(key, val)
 
+    # Keep the Win11 blob in sync with whatever we just restored
+    enabled_now = bool(snap.get("ProxyEnable"))
+    _write_connection_blob(
+        enabled=enabled_now,
+        server=snap.get("ProxyServer") or "",
+        override=snap.get("ProxyOverride") or "",
+    )
     _notify_wininet()
 
     # Restore (or clear) the NO_PROXY user env var we may have set.

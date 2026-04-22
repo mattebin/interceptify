@@ -58,6 +58,9 @@ The app auto-elevates via UAC if launched without admin rights.
 | **Toggle**      | Same as left-click                                              |
 | **🎵 Ad is playing — capture now** | Learn mode. Click this the moment an ad plays — see below |
 | **Reload filters** | Re-reads all files in `filters/` without restarting          |
+| **Patch Spotify (client-side ad block)** | Injects our JS into Spotify's `xpui.spa` to detect ads in the UI and auto-skip or mute them. Closes + relaunches Spotify. See [Client-side patching](#client-side-patching) |
+| **Unpatch Spotify** | Restores Spotify's original `xpui.spa` from backup. Closes + relaunches Spotify. |
+| **Show status dot in Spotify** | Checkbox. When patched, a small dot in Spotify's top bar shows ad-block state (green idle / red ad / orange network-block). Purely cosmetic. |
 | **Install certificate** | Re-install mitmproxy CA (if you cleared it manually)    |
 | **Open filter rules**   | Opens `filters/` in Explorer so you can edit rules      |
 | **Open bypass list**    | Opens `bypass.txt` — hosts that should never be intercepted |
@@ -100,6 +103,24 @@ api.anthropic.com
 api.github.com
 *.paypal.com
 ```
+
+## Client-side patching
+
+The proxy alone blocks ad *metadata* requests but can't stop Spotify's audio ads (they stream from the same CDN as music, indistinguishable by URL). To actually silence them, Interceptify can inject a small JS file into Spotify's own UI bundle.
+
+**What it does**
+- Hooks `fetch` / `XHR` inside Spotify and returns 403 for ad URLs — belt-and-braces with the network proxy.
+- Polls Spotify's DOM for ad markers. When an ad track starts, it clicks Spotify's own skip-forward button; if that's rate-limited (Free accounts cap skips), it mutes the `<audio>` element instead.
+- Optionally shows a small status dot in Spotify's top bar — green when idle, red when an ad is detected, orange when a network ad request just got blocked.
+
+**How to use**
+1. Tray → **Patch Spotify (client-side ad block)**. Interceptify closes Spotify, modifies `xpui.spa` (backed up to `xpui.spa.interceptify-backup`), and relaunches Spotify.
+2. To roll back: **Unpatch Spotify** restores the original bundle.
+
+**Limitations (honest)**
+- Spotify auto-updates wipe the patch. Interceptify detects this on next patch and re-injects cleanly — just hit **Patch Spotify** again after an update.
+- We detect ads via stable-ish DOM selectors (`data-testid="context-item-info-ad-title"`, etc.). If Spotify renames these in a future build, ads may play audibly until the selectors are updated in `extensions/adblock.js`.
+- DevTools is unlocked by the patcher (Ctrl+Shift+I) if you want to inspect what the injected script is doing.
 
 ## Filter syntax
 
