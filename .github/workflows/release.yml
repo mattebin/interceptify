@@ -1,0 +1,80 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "Interceptify" `
+            --manifest interceptify.manifest `
+            --uac-admin `
+            --add-data "extensions;extensions" `
+            main.py
+
+      - name: Compute SHA-256 checksum
+        run: |
+          $hash = (Get-FileHash dist/Interceptify.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  Interceptify.exe" | Out-File -Encoding ascii -NoNewline dist/Interceptify.exe.sha256
+          Write-Host "SHA256: $hash"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Interceptify
+          path: |
+            dist/Interceptify.exe
+            dist/Interceptify.exe.sha256
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Interceptify.exe
+            dist/Interceptify.exe.sha256
+          generate_release_notes: true
+          body: |
+            ## Interceptify
+
+            Windows tray app that blocks ads in the Spotify desktop client by patching its `xpui.spa` UI bundle.
+
+            > 🛑 **READ THIS FIRST** — You need the **desktop installer** version of Spotify from [spotify.com/download](https://www.spotify.com/download). The **Microsoft Store version will NOT work** (sandbox prevents file modification). Uninstall the Store version and install from spotify.com before using this.
+
+            ### Install
+            1. Download **Interceptify.exe** below.
+            2. Double-click. Accept the UAC prompt (needed to write Spotify's `xpui.spa`).
+            3. Right-click the tray icon → **Patch Spotify**. Spotify will close and relaunch with ad-blocking active.
+
+            ### How it works
+            - Injects a small JS file into Spotify's UI bundle (`%APPDATA%\Spotify\Apps\xpui.spa`)
+            - Watches the DOM for ad elements (`leavebehind-*`, `embedded-ad`, `ads-video-player-npv`, …) and Spotify's own `'adplaying'` events
+            - When detected: clicks Spotify's skip button; if skip is denied, mutes via Spotify's volume control
+            - Hides visual ad surfaces with CSS
+
+            ### Spotify auto-updates
+            Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update — original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.
+
+            See the [README](https://github.com/mattebin/interceptify#readme) for honest limitations.

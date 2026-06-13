@@ -1,0 +1,49 @@
+# Build artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.exe.new
+_interceptify_update.bat
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime state (never push)
+config.json
+proxy_snapshot.json
+blocked.log
+
+# --- Legacy network-proxy code ---
+# Spotify 1.2.88+ ignores the Windows system proxy, so the mitmproxy
+# pipeline no longer works for Spotify. These files stay on disk locally
+# but are not part of the public Interceptify project.
+apps.json
+bypass.txt
+cert_manager.py
+filters/
+proxy_addon.py
+proxy_watchdog.py
+system_proxy.py
+test_safety.py
+
+# Local-only analysis / diagnostic helpers
+ad_detective.py
+ad_detective.log
+afk_monitor.py
+afk_monitor.log
+cdp_eval.py
+diag_*.py
+hotfix_*.py
+dump_run.py
+run_dump_*.json
+
+# Session capture artifacts (ephemeral CDP/network diagnostic dumps, 2026-06-13)
+capture_*.json
+netlog_*.jsonl
+sni_log.txt
+*.pcapng
