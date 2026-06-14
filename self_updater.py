@@ -151,8 +151,9 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
     """Stream-download a release asset to ``dest`` and verify its integrity.
 
     Raises (and removes the partial file) on an untrusted host, a size
-    mismatch, or a SHA-256 mismatch. When no SHA-256 is published the download
-    is accepted on size alone with a warning. Returns the file's SHA-256 hex.
+    mismatch, a SHA-256 mismatch, or when no SHA-256 can be resolved at all
+    (fail-closed — an admin-level exe must be integrity-verified before it is
+    swapped in). Returns the file's SHA-256 hex.
     """
     if not _host_allowed(url):
         raise ValueError(f"Refusing to download update from untrusted host: {url}")
@@ -180,9 +181,12 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
             raise ValueError("Update SHA-256 mismatch -- refusing to install (possible tampering)")
         log.info("Update SHA-256 verified: %s", hexdigest)
     else:
-        log.warning(
-            "No published SHA-256 for this release; update verified by size only (%d bytes). "
-            "Publish an Interceptify.exe.sha256 asset to enable strong verification.", total
+        tmp.unlink(missing_ok=True)
+        raise ValueError(
+            "No published SHA-256 for this release -- refusing to install. "
+            "An admin-level exe must be integrity-verified; publish an "
+            "Interceptify.exe.sha256 asset (or a SHA-256 in the release body) "
+            "to enable updates."
         )
     tmp.replace(dest)
     return hexdigest

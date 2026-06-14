@@ -639,6 +639,127 @@ async function testB() {
 }
 
 // ===========================================================================
+// TEST C — IN-STREAM (L1) SKIP IS GATED  (regression for the audited bypass)
+// The L1 webpack-driven neutralizeInStreamAd() used to call api.skipToNext()
+// with NONE of advance()'s over-skip gates, so a re-read / lingering /
+// prefetched in-stream ad object could skip a REAL song. This test drives the
+// REAL webpack provider hook so the skip runs through the installed inStreamAd
+// getter/setter, then asserts the skip is SUPPRESSED in the two over-skip cases
+// the new inStreamSkipSafe() gate must block:
+//   C2 — inside the post-skip transition cooldown window
+//   C3 — when now-playing has moved off the confirmed ad to a real song
+// ===========================================================================
+function wireInStreamProvider(env, fixture) {
+  const chunk = env.sandbox.window.webpackChunkclient_web;
+  if (!Array.isArray(chunk)) return null;
+  const providerApi = {
+    inStreamAd: null,
+    skipToNext() { fixture.counts.skipToNext++; },
+  };
+  // NB: this factory's SOURCE must not contain BOTH "getInStreamAd" and
+  // "inStreamApi" or the hook takes its require.d fast-path. It exports d()
+  // (api accessor) + m() (ad accessor) so wrapInStreamExports accepts it.
+  function providerFactory(module) {
+    module.exports = {
+      d: function () { return providerApi; },
+      m: function () { return providerApi.inStreamAd; },
+    };
+  }
+  // 46849 == CFG.instreamModuleFallbackId; the hook replaces it with a wrapper.
+  chunk.push([["test-instream-chunk"], { 46849: providerFactory }]);
+  const pushed = chunk[chunk.length - 1];
+  const wrappedFactory = pushed && pushed[1] && pushed[1][46849];
+  if (typeof wrappedFactory !== "function") return null;
+  const moduleObj = { exports: {} };
+  wrappedFactory(moduleObj, moduleObj.exports, undefined); // webpack-style invoke
+  const api = moduleObj.exports && typeof moduleObj.exports.d === "function"
+    ? moduleObj.exports.d()   // calling d() installs the inStreamAd getter/setter
+    : null;
+  return api ? { api, providerApi } : null;
+}
+
+function testC() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST C"); };
+
+  // ---- C1 + C2: the post-skip cooldown lock ----
+  {
+    const clock = makeClock();
+    const fixture = makeFixture();
+    const env = loadAdblock({ fixture, clock, baseFetch });
+    assert("C.load: adblock.js loaded without throwing", env.loadError === null,
+      env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+    const wired = wireInStreamProvider(env, fixture);
+    assert("C.wire: in-stream provider hook installed the inStreamAd accessor", !!(wired && wired.api),
+      wired ? "" : "wrappedFactory / exports.d() not reachable");
+    if (!wired || !wired.api) return;
+    const api = wired.api;
+    const snap = () => env.sandbox.window.__interceptify.snapshot();
+
+    // C1: from IDLE, an in-stream ad object fires skipToNext AND arms cooldown.
+    fixture.nowPlayingTitle = "Advertisement";
+    env.sandbox.document.title = "Advertisement";
+    const c1Before = fixture.counts.skipToNext;
+    api.inStreamAd = { adId: "ad-c1", uri: "spotify:ad:c1", advertiser: "AcmeCo" };
+    assert("C1: in-stream ad (idle) fires skipToNext once — the lever still works",
+      fixture.counts.skipToNext === c1Before + 1,
+      `before=${c1Before} after=${fixture.counts.skipToNext}`);
+    assert("C1: the skip armed the post-skip transition cooldown lock",
+      snap().cooldownActive === true, `cooldownActive=${snap().cooldownActive}`);
+
+    // C2 (FIX): a DIFFERENT in-stream ad WITHIN the cooldown window is suppressed.
+    // Pre-fix this was ungated and would skipToNext onto a freshly-started real
+    // song. The distinct ad key rules out the dedupe Set as the cause.
+    clock.advance(500); // still < cooldownMs (1500)
+    const c2Before = fixture.counts.skipToNext;
+    api.inStreamAd = { adId: "ad-c2", uri: "spotify:ad:c2", advertiser: "AcmeCo" };
+    assert("C2 (FIX): in-stream skip SUPPRESSED inside the post-skip cooldown window",
+      fixture.counts.skipToNext === c2Before,
+      `before=${c2Before} after=${fixture.counts.skipToNext}`);
+  }
+
+  // ---- C3 (FIX, gate b2): now-playing moved off the confirmed ad -> suppressed ----
+  {
+    const clock = makeClock();
+    const fixture = makeFixture();
+    const env = loadAdblock({ fixture, clock, baseFetch });
+    const wired = wireInStreamProvider(env, fixture);
+    assert("C3.wire: in-stream provider hook installed", !!(wired && wired.api),
+      wired ? "" : "wrappedFactory / exports.d() not reachable");
+    if (!wired || !wired.api) return;
+    const api = wired.api;
+    const check = env.checkTick;
+    const tick = (ms = 500) => { clock.advance(ms); try { check(); } catch {} };
+    const state = () => env.sandbox.window.__interceptify.state();
+
+    // Drive the FSM through a painted ad so currentAdFp (the ad's now-playing
+    // fingerprint) is captured and we land in SKIPPING/COOLDOWN.
+    setAdPainted(fixture);
+    fixture.skipForwardVisible = true; fixture.skipForwardDisabled = false; fixture.seek15Visible = false;
+    fixture.nowPlayingTitle = "Advertisement";
+    env.sandbox.document.title = "Advertisement";
+    for (let i = 0; i < 3; i++) tick(500);
+    assert("C3.setup: FSM confirmed the ad (currentAdFp captured)",
+      ["CONFIRMED", "SKIPPING", "COOLDOWN"].includes(state()), `state=${state()}`);
+
+    // Real song is now playing. Expire the cooldown WITHOUT running a tick — a
+    // tick would release the ad state and null currentAdFp, leaving nothing for
+    // gate b2 to test. So here the cooldown gate passes and ONLY gate b2
+    // (now-playing moved off the ad) can stop the skip.
+    clearAdPainted(fixture);
+    fixture.nowPlayingTitle = "Real Song Name";
+    env.sandbox.document.title = "Real Song Name";
+    fixture.nowPlayingSubtitle = "Some Artist"; // NOT ad-looking
+    clock.advance(3000); // > cooldownMs (1500): the cooldown gate no longer applies
+
+    const before = fixture.counts.skipToNext;
+    api.inStreamAd = { adId: "ad-c3", uri: "spotify:ad:c3", advertiser: "AcmeCo" };
+    assert("C3 (FIX): in-stream skip SUPPRESSED when now-playing moved off the ad to a real song",
+      fixture.counts.skipToNext === before,
+      `before=${before} after=${fixture.counts.skipToNext}`);
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -647,6 +768,9 @@ async function main() {
   }
   try { await testB(); } catch (e) {
     assert("TEST B crashed", false, String(e && e.stack || e));
+  }
+  try { testC(); } catch (e) {
+    assert("TEST C crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

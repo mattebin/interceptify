@@ -53,6 +53,30 @@ the keystone assertion has teeth: when the ad genuinely persists, the advance
 counter keeps climbing — so the only reason TEST A passes is that adblock.js
 correctly stops advancing once now-playing moves off the ad.
 
+### TEST C — the L1 in-stream skip is gated (over-skip bypass)
+
+TEST A covers the DOM `advance()` choke point. TEST C covers the **other**
+advancing channel: the webpack-driven `neutralizeInStreamAd()` → `api.skipToNext()`
+path. This path used to call `skipToNext()` with none of `advance()`'s over-skip
+gates, so a re-read / lingering / prefetched in-stream ad object could skip a
+**real** song. The test drives the **real** webpack provider hook (pushes a
+synthetic module `46849` onto `webpackChunkclient_web`, invokes the wrapped
+factory webpack-style, then calls the wrapped `d()` to install the `inStreamAd`
+getter/setter), so the skip runs through the genuine code path — then asserts:
+
+1. **C1** — from idle, an in-stream ad object fires `skipToNext()` once (the
+   lever still works) and arms the post-skip cooldown lock.
+2. **C2** — a *different* in-stream ad **within** the cooldown window is
+   **suppressed** (the distinct ad key rules out the dedupe Set).
+3. **C3** — after the FSM confirms an ad (so `currentAdFp` is captured) and
+   now-playing has moved to a real song, the in-stream skip is **suppressed**
+   even after the cooldown expires.
+
+C2 and C3 have a **committed, verified negative control**: temporarily forcing
+`inStreamSkipSafe()` to `return true` (pre-fix ungated behavior) makes both fail
+with `before=1 after=2` (the skip lands on the real song), while C1 still passes
+— so the assertions provably catch the exact over-skip bypass.
+
 ### TEST B — the manifest classifier
 
 Exercises the `/manifests/v9/json/sources/<hex>/options/...` interception in the

@@ -546,6 +546,29 @@
     return false;
   }
 
+  // Over-skip guard for the L1 in-stream skipToNext() path. advance() (the FSM
+  // choke point) is fully gated; the webpack-driven neutralize path was NOT, so
+  // a re-read / lingering / prefetched in-stream ad object could fire
+  // skipToNext() onto a REAL song (audited bypass). This mirrors advance()'s two
+  // over-skip protections WITHOUT requiring CONFIRMED — gating on state would
+  // neuter early/preventive blocking (the in-stream skip is the only lever over
+  // core-process ad audio on current builds). It blocks the two realistic
+  // over-skip cases only:
+  //   (1) the post-skip transition window — we JUST advanced, so a second skip
+  //       now lands on the freshly-started real song (the user's #1 fear); and
+  //   (2) now-playing has moved off the confirmed ad to a different, non-ad
+  //       track (mirror of advance()'s keystone gate (b2)).
+  function inStreamSkipSafe() {
+    if (Date.now() < cooldownUntil) return false;        // (1) — always enforced
+    try {                                                  // (2) — fail-open: a guard
+      if (currentAdFp) {                                   //     error must not disable
+        const fpNow = nowPlayingSnapshot();               //     the only working lever
+        if (!fpEqual(fpNow, currentAdFp) && !fpLooksLikeAd(fpNow)) return false;
+      }
+    } catch {}
+    return true;
+  }
+
   function neutralizeInStreamAd(api, ad, reason) {
     const summary = summarizeAdObject(ad);
     if (!summary) return false;
@@ -559,11 +582,22 @@
       if (!window.__interceptify_neutralized_ads.has(key)) {
         window.__interceptify_neutralized_ads.add(key);
         if (api && typeof api.skipToNext === "function") {
-          try {
-            rememberInStreamApiCall("skipToNext.forAd", { ad: summary });
-            api.skipToNext();
-          } catch (e) {
-            rememberInStreamApiCall("skipToNext.error", { error: String(e && e.message || e) });
+          if (!inStreamSkipSafe()) {
+            // Over-skip guard tripped: suppress the skip. The ad object is still
+            // nulled below (UI suppressed), and advance() will skip it once
+            // CONFIRMED + fully gated, so a real ad is never leaked here.
+            rememberInStreamApiCall("skipToNext.suppressed", { ad: summary });
+          } else {
+            try {
+              rememberInStreamApiCall("skipToNext.forAd", { ad: summary });
+              api.skipToNext();
+              // Arm the SAME transition lock advance() uses, so a re-read ad
+              // object (or a real song that just started) cannot trigger a
+              // second skip inside the audio->song crossover window.
+              cooldownUntil = Math.max(cooldownUntil, Date.now() + (CFG.cooldownMs || 1500));
+            } catch (e) {
+              rememberInStreamApiCall("skipToNext.error", { error: String(e && e.message || e) });
+            }
           }
         }
       }
@@ -2488,7 +2522,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-06-13-v2",
+    version: "2026-06-14-v2",
     debugCapture: DEBUG_CAPTURE,
     stats: () => ({ ...stats }),
     state: () => adState,
