@@ -14,6 +14,7 @@
   "instreamWindowMs": 3000,
   "seek15Burst": 4,
   "seek15BurstSpacingMs": 150,
+  "adTextMarkers": "advert|annons|reklam|reclame|werb|anunci|publici|annonce|mainos|reklaam|реклама|sponsor",
 
   "strongAdSelectors": [
     "[data-testid=\"ad-controls\"]",

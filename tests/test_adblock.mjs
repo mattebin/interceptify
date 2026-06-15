@@ -760,6 +760,70 @@ function testC() {
 }
 
 // ===========================================================================
+// TEST D — LOCALE multi-ad break + cross-break key reset
+// Regression for the 2026-06-15 post-Spotify-update bug: Swedish ads
+// ("Annons"/"Reklam") weren't recognized by the English-only fpLooksLikeAd, so
+// the FSM falsely "verified" a skip mid-ad, marked the ad's adKey satisfied, and
+// then advance() permanently suppressed it (advance-suppressed: adKey-satisfied)
+// — the ad played out fully, muted. Also: DOM-fingerprint adKeys COLLIDE across
+// breaks, so a satisfied key from a prior break blocked an identical later ad.
+// ===========================================================================
+function testD() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST D"); };
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("D.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  if (env.loadError) return;
+  const check = env.checkTick;
+  const tick = (ms = 500) => { clock.advance(ms); try { check(); } catch {} };
+  const state = () => env.sandbox.window.__interceptify.state();
+
+  const paintAd = (title, sub) => {
+    fixture.present.add('[data-testid="ad-controls"]');
+    fixture.skipForwardVisible = true; fixture.skipForwardDisabled = false; fixture.seek15Visible = false;
+    fixture.nowPlayingTitle = title; fixture.nowPlayingSubtitle = sub;
+    env.sandbox.document.title = "Spotify – Reklam"; // Swedish "Reklam" = ads
+  };
+  const realSong = (title) => {
+    fixture.present.delete('[data-testid="ad-controls"]');
+    fixture.nowPlayingTitle = title; fixture.nowPlayingSubtitle = "Some Artist";
+    env.sandbox.document.title = title;
+  };
+
+  // ---- Break 1: a 2-ad Swedish break ----
+  paintAd("Spotify", "Annons • 1 av 2");
+  for (let i = 0; i < 3; i++) tick(500);            // confirm + skip ad1
+  const afterAd1 = fixture.counts.skipToNext;
+  assert("D1: Swedish ad1 triggered an in-stream skip (locale recognized)",
+    afterAd1 >= 1, `skipToNext=${afterAd1}`);
+
+  paintAd("Spotify", "Annons • 2 av 2");        // skip landed on ad2 (controls still up)
+  for (let i = 0; i < 6; i++) tick(500);            // re-confirm ad2 + skip (waits out cooldown)
+  const afterAd2 = fixture.counts.skipToNext;
+  assert("D2: ad2 of the multi-ad break ALSO skipped (not stuck adKey-satisfied)",
+    afterAd2 > afterAd1, `before=${afterAd1} after=${afterAd2}`);
+
+  realSong("Real Song One");                         // skip landed on a real song
+  for (let i = 0; i < 6; i++) tick(500);
+  const afterSong = fixture.counts.skipToNext;
+  assert("D3: NO further skip once a real song plays (over-skip protection holds)",
+    afterSong === afterAd2, `before=${afterAd2} after=${afterSong}`);
+  assert("D4: FSM returned to IDLE after the break", state() === "IDLE", `state=${state()}`);
+
+  // ---- Break 2: an ad whose key was SATISFIED in break 1 ----
+  // Without the per-break reset, "Annons 2 av 2" is still in _satisfiedAdKeys /
+  // the "advance:" dedup set -> advance() suppresses it forever (the bug).
+  const beforeB2 = fixture.counts.skipToNext;
+  paintAd("Spotify", "Annons • 2 av 2");
+  for (let i = 0; i < 3; i++) tick(500);
+  const afterB2 = fixture.counts.skipToNext;
+  assert("D5 (KEY RESET): an identical ad in a LATER break still skips (satisfied/dedupe keys cleared on IDLE)",
+    afterB2 > beforeB2, `before=${beforeB2} after=${afterB2}`);
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -771,6 +835,9 @@ async function main() {
   }
   try { testC(); } catch (e) {
     assert("TEST C crashed", false, String(e && e.stack || e));
+  }
+  try { testD(); } catch (e) {
+    assert("TEST D crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

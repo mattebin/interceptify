@@ -42,6 +42,10 @@
     instreamWindowMs: 3000,
     seek15Burst: 4,
     seek15BurstSpacingMs: 150,
+    // Locale-agnostic ad-text markers matched against now-playing
+    // title/subtitle/documentTitle to recognize "still on an ad" when the
+    // language isn't English. Build/locale-volatile -> externalized.
+    adTextMarkers: "advert|annons|reklam|reclame|werb|anunci|publici|annonce|mainos|reklaam|реклама|sponsor",
     // ---- DOM detection: ADVANCING gate (audio/video-ad subset ONLY) ----
     // ADVANCING gate: only audio/video-ad controls that UNMOUNT with the ad
     // audio. context-item-info-ad-* are deliberately NOT here — they are
@@ -2105,12 +2109,18 @@
     return a.documentTitle === b.documentTitle && a.title === b.title && a.subtitle === b.subtitle;
   }
   // Does the current now-playing fingerprint look like an ad? (used to refuse
-  // declaring a skip "successful" while still on an ad).
+  // declaring a skip "successful" while still on an ad). Locale-aware: the old
+  // English-only /advert/ missed Swedish "Annons"/"Reklam" etc., so a real ad
+  // read as "not an ad" -> false verified-advance -> the ad got marked done and
+  // never skipped (the 2026-06-15 post-update regression). Markers in CFG.
   function fpLooksLikeAd(fp) {
     try {
       if (!fp) return false;
-      if (/advert/i.test(fp.title || "")) return true;
-      if (/advert/i.test(fp.subtitle || "")) return true;
+      const re = rx(CFG.adTextMarkers || "advert", "i");
+      if (!re) return false;
+      if (re.test(fp.title || "")) return true;
+      if (re.test(fp.subtitle || "")) return true;
+      if (re.test(fp.documentTitle || "")) return true;
     } catch {}
     return false;
   }
@@ -2409,10 +2419,14 @@
       }
       case "SKIPPING": {
         const fpN = nowPlayingSnapshot();
-        // Skip verified when now-playing moved to a non-ad track — REGARDLESS of
-        // a lingering strong NODE. This routes us to cooldown (advance locked)
-        // instead of re-issuing a skip onto the real song that just started.
-        const verifiedAdvance = !fpEqual(fpN, preAdNowPlaying) && !fpLooksLikeAd(fpN);
+        // VERIFIED only when the ad-controls marker is GONE (!strong). now-playing
+        // TEXT is unreliable across locales (Swedish "Annons"/"Reklam" ARE ads but
+        // don't match /advert/) and changes mid-break while an ad still plays;
+        // ad-controls unmounts cleanly with the ad audio (verified live on the
+        // 2026-06-15 build), so it is the authoritative "ad ended" signal. Using
+        // text here marked a still-playing ad "satisfied", then advance() refused
+        // to re-skip it (adKey-satisfied) and the ad played out fully, muted.
+        const verifiedAdvance = !strong && !fpEqual(fpN, preAdNowPlaying);
         if (verifiedAdvance) {
           if (currentAdKey) _satisfiedAdKeys.add(currentAdKey);
           // The real (non-ad) track is verifiably playing now, so UN-MUTE
@@ -2428,7 +2442,19 @@
           enterCooldown("strong-cleared-skipping", /*unmute*/ false);
           break;
         }
-        // strong still present: re-issue ONE retry after skipRetryMs, capped.
+        // STILL on an ad (strong) but now-playing MOVED -> skipToNext advanced us
+        // to the NEXT ad of a multi-ad break. Re-confirm with a FRESH key/fp so it
+        // gets its own gated skip: a new "advance:" dedup key lets skipToNext fire
+        // again (reusing the prior key no-ops it, leaving the ad stuck muted).
+        if (!fpEqual(fpN, preAdNowPlaying)) {
+          currentAdKey = mintAdKey(strongMarker);
+          currentAdFp = fpN;
+          preAdNowPlaying = fpN;
+          confirmedSinceAt = Date.now();
+          adState = "CONFIRMED";
+          break;
+        }
+        // same ad still showing after our skip -> retry ONCE after skipRetryMs, capped.
         if (Date.now() - lastSkipIssueAt >= CFG.skipRetryMs) {
           const key = currentAdKey || mintAdKey(strongMarker);
           if ((_adKeyRetries[key] || 0) > 0) {
@@ -2464,6 +2490,20 @@
           releaseAdState("cooldown-elapsed");
           currentAdKey = "";
           preAdNowPlaying = null;
+          // Break fully over -> RESET per-break skip bookkeeping. adKeys are
+          // DOM-fingerprint based and COLLIDE across breaks (subtitle "Annons N
+          // av M" / "1 av 2" recurs), so a satisfied / "advance:"-deduped key
+          // from a prior break would permanently suppress an identical-looking
+          // future ad (advance-suppressed: adKey-satisfied — the observed bug).
+          // Per-ad in-stream neutralize keys (unique ad ids) are kept.
+          _satisfiedAdKeys.clear();
+          for (const k in _adKeyRetries) delete _adKeyRetries[k];
+          try {
+            const s = window.__interceptify_neutralized_ads;
+            if (s && s.forEach) Array.from(s).forEach((k) => {
+              if (typeof k === "string" && k.indexOf("advance:") === 0) s.delete(k);
+            });
+          } catch {}
         }
         break;
       }
@@ -2522,7 +2562,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-06-14-v2",
+    version: "2026-06-15-v2",
     debugCapture: DEBUG_CAPTURE,
     stats: () => ({ ...stats }),
     state: () => adState,
