@@ -57,7 +57,7 @@ except ImportError:
 
 
 APP_NAME = "Interceptify"
-APP_VERSION = "2.0.0"  # bump in lockstep with the GitHub tag
+APP_VERSION = "2.0.1"  # bump in lockstep with the GitHub tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("interceptify")

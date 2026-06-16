@@ -71,6 +71,7 @@
       '[data-testid="ad-controls"]',
       '[data-testid="ad-countdown-timer"]',
       '[data-testid="embedded-ad"]',
+      '[data-testid="embedded-ad-creative-link"]',
       '[data-testid="embedded-ad-carousel"]',
       '[data-testid="home-ad-card"]',
       '[data-testid="home-ads-container"]',
@@ -107,6 +108,11 @@
     playerStateFallbackId: 5563,        // used only if scan fails
     instreamModuleFallbackId: 46849,    // used only if scan fails (fast-path hint)
     enableInstreamHook: true,           // master kill-switch for L1; set false if a build breaks on it
+    inspectMode: false,                 // PASSIVE: detect+overlay only, NO skip/mute/hide (so ads stay on screen to Alt+click)
+    // ---- fast in-stream skip (audio ads) ----
+    enableInStreamPoll: true,           // proactive getInStreamAd() poll -> skip at ad-load, not the 500ms tick
+    inStreamPollMs: 80,                 // in-stream poll cadence
+    inStreamSkipLockMs: 300,            // short post-skip self-lock (decoupled from the 1500ms FSM cooldown) -> back-to-back multi-ad skips
     webpackChunkGlobal: "webpackChunkclient_web",
     // ---- network classifier ----
     manifestRegex: "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
@@ -145,7 +151,7 @@
 
   // Back-compat aliases for the surviving code below.
   const DEBUG_CAPTURE = CFG.debugCapture === true;
-  const blockInStreamSignal = () => CFG.blockInstreamSignal !== false;
+  const blockInStreamSignal = () => CFG.blockInstreamSignal !== false && CFG.inspectMode !== true;
 
   // ---- Diagnostic: capture uncaught errors + (optionally) show them in-page ----
   // Spotify gates DevTools, so when the patched client renders blank/broken this
@@ -179,7 +185,7 @@
     window.addEventListener("error", (e) => _onErr(e.message, e.filename, e.lineno, e.colno, e.error), true);
     window.addEventListener("unhandledrejection", (e) => _onErr("unhandledrejection: " + ((e.reason && e.reason.message) || e.reason), "", 0, 0, e.reason), true);
   } catch {}
-  if (CFG.diagnosticOverlay) {
+  if (CFG.diagnosticOverlay || DEBUG_CAPTURE) {   // overlay shows whenever Debug capture mode is ON
     // Alt+click any element to print its identity + ancestor chain in the
     // overlay — lets us pinpoint a blank/reserved banner container precisely.
     window.__interceptify_inspect = null;
@@ -208,7 +214,8 @@
         if (!d) {
           d = document.createElement("div");
           d.id = "interceptify-diag";
-          d.style.cssText = "position:fixed;top:44px;left:8px;right:8px;max-height:62%;overflow:auto;z-index:2147483647;background:rgba(25,0,0,0.94);color:#fff;font:11px/1.45 monospace;padding:10px;border:2px solid #ff3b30;white-space:pre-wrap;";
+          // background ~50% more transparent than before (0.94 -> 0.47); text stays fully opaque (#fff).
+          d.style.cssText = "position:fixed;top:44px;left:8px;right:8px;max-height:62%;overflow:auto;z-index:2147483647;background:rgba(25,0,0,0.47);color:#fff;font:11px/1.45 monospace;padding:10px;border:2px solid #ff3b30;white-space:pre-wrap;pointer-events:none;text-shadow:0 1px 2px #000;";
           (document.body || document.documentElement).appendChild(d);
         }
         let state = "?"; try { state = adState; } catch {}
@@ -342,6 +349,7 @@
   }
 
   function suppressAdUi(reason, ms) {
+    if (CFG.inspectMode) return;        // inspect: don't hide the ad UI
     try {
       installSuppressionCss();
       const until = Date.now() + (ms || 2500);
@@ -536,11 +544,18 @@
       if (ad) {
         rememberInStreamAd(ad, method);
         rememberInStreamApiCall(method, { ad: summarizeAdObject(ad), message: compactValue(msg, 0) });
+        // ACTIVELY skip from the callback. On this build some ads are delivered
+        // ONLY via the manager's onAdMessage callback and never populate
+        // getInStreamAd(), so the poll/getter never sees them — only this does.
+        // neutralizeInStreamAd is deduped + guarded + mutes, so this is the
+        // pre-paint fast path for those ads.
+        try { const _api = window.__interceptify_instream_api; if (_api && blockInStreamSignal()) neutralizeInStreamAd(_api, ad, method + ".callback"); } catch {}
         return true;
       }
       if (summarizeAdObject(msg)) {
         rememberInStreamAd(msg, method);
         rememberInStreamApiCall(method, { ad: summarizeAdObject(msg), message: compactValue(msg, 0) });
+        try { const _api = window.__interceptify_instream_api; if (_api && blockInStreamSignal()) neutralizeInStreamAd(_api, msg, method + ".callback"); } catch {}
         return true;
       }
       if (msg && /ad/i.test(JSON.stringify(compactValue(msg, 0)))) {
@@ -562,11 +577,25 @@
   //       now lands on the freshly-started real song (the user's #1 fear); and
   //   (2) now-playing has moved off the confirmed ad to a different, non-ad
   //       track (mirror of advance()'s keystone gate (b2)).
-  function inStreamSkipSafe() {
-    if (Date.now() < cooldownUntil) return false;        // (1) — always enforced
-    try {                                                  // (2) — fail-open: a guard
-      if (currentAdFp) {                                   //     error must not disable
-        const fpNow = nowPlayingSnapshot();               //     the only working lever
+  function inStreamSkipSafe(authoritative) {
+    if (Date.now() < inStreamSkipLockUntil) return false;  // (1) short post-skip self-lock (~300ms, NOT the 1500ms FSM cooldown)
+    // (2) corroboration. An AUTHORITATIVE signal — a FRESH AUDIO ad object
+    //     (format===AUDIO, first sighting of this adId) — is itself proof an
+    //     audio ad is here, so we skip PRE-PAINT (no DOM wait). A non-audio /
+    //     unknown-format object can be a stale / lingering / prefetched read, so
+    //     it must be corroborated by an INDEPENDENT live ad signal (ad-controls
+    //     present, ad-looking now-playing, or ad_active) — a real song has none.
+    if (!authoritative) {
+      let live = false;
+      try {
+        live = !!STRONG_PRESENT() || fpLooksLikeAd(nowPlayingSnapshot()) || window.__interceptify_ad_active === true;
+      } catch { live = false; }
+      if (!live) return false;
+    }
+    // (3) now-playing moved off the confirmed ad to a non-ad track (extra layer).
+    try {
+      if (currentAdFp) {
+        const fpNow = nowPlayingSnapshot();
         if (!fpEqual(fpNow, currentAdFp) && !fpLooksLikeAd(fpNow)) return false;
       }
     } catch {}
@@ -581,12 +610,22 @@
     rememberInStreamApiCall(`${reason}.neutralize`, { ad: summary });
     if (!blockInStreamSignal()) return false;
     try {
-      const key = inStreamAdKey(ad) || `${Date.now()}`;
+      const stableKey = inStreamAdKey(ad);
+      const key = stableKey || `${Date.now()}`;
+      // FRESH AUDIO ad object (format===AUDIO; first sighting of this adId since
+      // we're inside the not-yet-skipped dedup block) -> authoritative -> skip
+      // PRE-PAINT. Other/unknown format falls back to DOM-corroborated skipping.
+      const audioAdAuthoritative = !!(ad && (ad.format === 1 || ad.format === "AUDIO"));
       window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
       if (!window.__interceptify_neutralized_ads.has(key)) {
         window.__interceptify_neutralized_ads.add(key);
         if (api && typeof api.skipToNext === "function") {
-          if (!inStreamSkipSafe()) {
+          if (!stableKey) {
+            // No stable adId/uri/clickthrough -> do NOT authorize a skip. A thin
+            // /partial object must not drive skipToNext (its dedup key would be
+            // an unstable timestamp -> re-skip storm onto whatever plays next).
+            rememberInStreamApiCall("skipToNext.no-stable-key", { ad: summary });
+          } else if (!inStreamSkipSafe(audioAdAuthoritative)) {
             // Over-skip guard tripped: suppress the skip. The ad object is still
             // nulled below (UI suppressed), and advance() will skip it once
             // CONFIRMED + fully gated, so a real ad is never leaked here.
@@ -594,11 +633,22 @@
           } else {
             try {
               rememberInStreamApiCall("skipToNext.forAd", { ad: summary });
+              // MUTE INSTANTLY (before the skip) so the ~1.4s Spotify-core takes
+              // to actually advance the audio is SILENT. We skip at ~+1ms but the
+              // core keeps playing the ad audio until it processes the skip; the
+              // FSM's own mute lags up to one 500ms tick (the <0.5s you hear).
+              // The FSM unmutes on verified-advance when the real song starts.
+              try { armMute(); } catch {}
               api.skipToNext();
-              // Arm the SAME transition lock advance() uses, so a re-read ad
-              // object (or a real song that just started) cannot trigger a
-              // second skip inside the audio->song crossover window.
-              cooldownUntil = Math.max(cooldownUntil, Date.now() + (CFG.cooldownMs || 1500));
+              // Short SELF-lock (decoupled from the FSM's 1500ms cooldown) so the
+              // NEXT ad of a multi-ad break skips almost immediately, while a
+              // re-read of THIS ad is still blocked (dedup) + a real song that
+              // just started is blocked (corroboration above goes false).
+              inStreamSkipLockUntil = Date.now() + (CFG.inStreamSkipLockMs || 300);
+              // Clear the lingering "instream-ad-object" WEAK window so it can't
+              // make the FSM mute the REAL song that starts right after the skip
+              // (the brief double-mute). The next ad re-sets it on arrival.
+              try { window.__interceptify_instream_ad_until = 0; } catch {}
             } catch (e) {
               rememberInStreamApiCall("skipToNext.error", { error: String(e && e.message || e) });
             }
@@ -1669,6 +1719,7 @@
 
   // Hide visual-only ads with CSS so they never render.
   function injectAdHidingCSS() {
+    if (CFG.inspectMode) return;        // inspect: keep ad UI visible/clickable
     if (document.getElementById("interceptify-hide-css")) return;
     if (!VISUAL_AD_SELECTORS.length) return;
     const style = document.createElement("style");
@@ -2091,6 +2142,7 @@
   // ===================================================================
   let adState = "IDLE";
   let cooldownUntil = 0;      // advance() hard-disabled while Date.now() < this
+  let inStreamSkipLockUntil = 0; // L1 in-stream skip self-lock (short; decoupled from cooldownUntil)
   let lastAdvanceAt = 0;      // global anti-spin timestamp
   let lastStrongTickAt = 0;   // last tick STRONG_PRESENT() was true
   let suspectSinceAt = 0;     // for the suspectMaxMs mute-wedge bound
@@ -2146,6 +2198,7 @@
   // ===================================================================
   function advance(adKey, source) {
     try {
+      if (CFG.inspectMode) { snifferLog("advance-suppressed", { source, reason: "inspect-mode" }); return false; }
       // (a) state — ONLY CONFIRMED may advance. SUSPECTED/SKIPPING/COOLDOWN/IDLE never.
       if (adState !== "CONFIRMED") {
         snifferLog("advance-suppressed", { source, reason: "state:" + adState });
@@ -2265,9 +2318,11 @@
   //           muteAllAudio(false).
   // ===================================================================
   function armMute() {
+    if (CFG.inspectMode) return;        // inspect: let the ad play (audible)
     try { const was = _weMuted; muteAllAudio(true); if (_weMuted && !was) _diagLog("MUTED"); } catch {}
   }
   function armAdActive() {
+    if (CFG.inspectMode) return;
     try {
       const was = window.__interceptify_ad_active;
       window.__interceptify_ad_active = true;
@@ -2562,7 +2617,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-06-15-v2",
+    version: "2026-06-16-v2.2",
     debugCapture: DEBUG_CAPTURE,
     stats: () => ({ ...stats }),
     state: () => adState,
@@ -2595,6 +2650,7 @@
         ts: Date.now(), version: this.version,
         adState: safe(() => adState, "?"), adActive: !!window.__interceptify_ad_active,
         weMuted: safe(() => _weMuted, "?"), cooldownActive: safe(() => Date.now() < cooldownUntil, null),
+        inStreamLockActive: safe(() => Date.now() < inStreamSkipLockUntil, null),
         docTitle: document.title, nowPlaying: safe(() => nowPlayingSnapshot(), {}),
         strongPresent: safe(() => STRONG_PRESENT(), "?"), weak: safe(() => WEAK(), "?"),
         mediaElements: mediaEls, mediaSources, audioContexts,
@@ -2662,5 +2718,25 @@
   // across Spotify rebuilds because the mounted component changes; a simple
   // poll is more robust.
   setInterval(check, CFG.tickMs || 500);
+
+  // High-frequency in-stream poll: skip the AUDIO ad the instant the provider
+  // populates getInStreamAd(), beating the 500ms FSM tick AND the confirmTicks
+  // debounce. Song-safe: routed through neutralizeInStreamAd -> inStreamSkipSafe
+  // (requires a live ad signal: ad-controls/ad-countdown present, OR ad-looking
+  // now-playing, OR ad_active) + a stable adId. A real song has no ad object
+  // (early-return) AND no live ad signal, so it can never be skipped here.
+  if (CFG.enableInStreamPoll !== false && CFG.enableInstreamHook !== false) {
+    setInterval(() => {
+      try {
+        const api = window.__interceptify_instream_api;
+        if (!api || !blockInStreamSignal()) return;
+        let ad = null;
+        try { ad = (typeof api.getInStreamAd === "function") ? api.getInStreamAd() : api.inStreamAd; } catch {}
+        if (ad && (ad.adId || ad.id || ad.uri) && summarizeAdObject(ad)) {
+          neutralizeInStreamAd(api, ad, "instream-poll");
+        }
+      } catch {}
+    }, CFG.inStreamPollMs || 80);
+  }
   log("loaded (v2 FSM)");
 })();

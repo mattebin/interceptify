@@ -703,13 +703,13 @@ function testC() {
     assert("C1: in-stream ad (idle) fires skipToNext once — the lever still works",
       fixture.counts.skipToNext === c1Before + 1,
       `before=${c1Before} after=${fixture.counts.skipToNext}`);
-    assert("C1: the skip armed the post-skip transition cooldown lock",
-      snap().cooldownActive === true, `cooldownActive=${snap().cooldownActive}`);
+    assert("C1: the skip armed the short in-stream self-lock",
+      snap().inStreamLockActive === true, `inStreamLockActive=${snap().inStreamLockActive}`);
 
-    // C2 (FIX): a DIFFERENT in-stream ad WITHIN the cooldown window is suppressed.
+    // C2 (FIX): a DIFFERENT in-stream ad WITHIN the self-lock window is suppressed.
     // Pre-fix this was ungated and would skipToNext onto a freshly-started real
     // song. The distinct ad key rules out the dedupe Set as the cause.
-    clock.advance(500); // still < cooldownMs (1500)
+    clock.advance(100); // still < inStreamSkipLockMs (300)
     const c2Before = fixture.counts.skipToNext;
     api.inStreamAd = { adId: "ad-c2", uri: "spotify:ad:c2", advertiser: "AcmeCo" };
     assert("C2 (FIX): in-stream skip SUPPRESSED inside the post-skip cooldown window",

@@ -39,6 +39,7 @@
     "[data-testid=\"ad-controls\"]",
     "[data-testid=\"ad-countdown-timer\"]",
     "[data-testid=\"embedded-ad\"]",
+    "[data-testid=\"embedded-ad-creative-link\"]",
     "[data-testid=\"embedded-ad-carousel\"]",
     "[data-testid=\"home-ad-card\"]",
     "[data-testid=\"home-ads-container\"]",
@@ -84,5 +85,9 @@
   "blockInstreamSignal": true,
   "enableDomSprayLastResort": false,
   "enableMediaSourceEndOfStream": false,
-  "diagnosticOverlay": false
+  "diagnosticOverlay": false,
+  "inspectMode": false,
+  "enableInStreamPoll": true,
+  "inStreamPollMs": 80,
+  "inStreamSkipLockMs": 300
 }
