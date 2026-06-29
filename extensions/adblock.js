@@ -113,6 +113,13 @@
     enableInStreamPoll: true,           // proactive getInStreamAd() poll -> skip at ad-load, not the 500ms tick
     inStreamPollMs: 80,                 // in-stream poll cadence
     inStreamSkipLockMs: 300,            // short post-skip self-lock (decoupled from the 1500ms FSM cooldown) -> back-to-back multi-ad skips
+    // ---- TOTAL BLOCK (SpotX-style pre-play kill) ----
+    totalBlock: true,                   // call the ads connector's increaseStreamTime(-1e11) so ad breaks never SCHEDULE (proven SpotX lever). FSM skip+mute stays as the fallback (SSAI + any build where this lever moves).
+    streamTimeKillMs: 10000,            // re-apply the stream-time push on this interval (defends vs server ad-state resets)
+    streamTimeKillValue: -100000000000, // -1e11: pushes core stream-time so the ad-break threshold is never crossed
+    killAdEndpoints: true,              // point the ad-STATE pusher + per-slot ad-SERVER at a dead URL so the client can't be told to play / can't fetch an ad (live-tested stable). This is the real prevention lever (stream-time didn't prevent server-scheduled ads).
+    deadAdEndpoint: "https://localhost.invalid/no-ads",
+    adSlots: ["streaming", "watchnow", "mobile-screensaver", "sponsored-playlist", "homepage-takeover", "hpto", "billboard"],
     webpackChunkGlobal: "webpackChunkclient_web",
     // ---- network classifier ----
     manifestRegex: "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
@@ -602,9 +609,85 @@
     return true;
   }
 
+  // ===================================================================
+  // TOTAL BLOCK (SpotX-style): the ad-break SCHEDULER keys off core stream-time
+  // (elapsed_stream_time - last_ad_break_stream_time > threshold; see
+  // ad-state-storage.bnk). The ads connector exposes increaseStreamTime() — a
+  // Cosmos RPC into the C++ core. Pushing it hugely negative means the threshold
+  // is never crossed -> ad breaks are never scheduled (silent, pre-play). Found
+  // by SIGNATURE (increaseStreamTime + overrideAdServerEndpoint) so it survives
+  // module-id churn. The reactive FSM (skip+mute) stays as the fallback for SSAI
+  // ads and any build where this lever moves/renames.
+  function getAdsDebugConnector() {
+    if (window.__interceptify_ads_debug) return window.__interceptify_ads_debug;
+    try {
+      const req = window.__interceptify_webpack_require;
+      if (!req || !req.m) return null;
+      for (const id in req.m) {
+        let s = ""; try { s = Function.prototype.toString.call(req.m[id]); } catch {}
+        if (s.indexOf("increaseStreamTime") < 0) continue;
+        if (s.indexOf("overrideAdServerEndpoint") < 0 && s.indexOf("AdStatePusher") < 0) continue;
+        let mod; try { mod = (req.c && req.c[id]) ? req.c[id].exports : req(id); } catch { continue; }
+        if (!mod) continue;
+        const cands = [mod, mod.D, mod.default].concat(
+          Object.keys(mod).map((k) => { try { return mod[k]; } catch { return null; } }));
+        for (const c of cands) {
+          try {
+            if (c && typeof c.increaseStreamTime === "function") {
+              window.__interceptify_ads_debug = c;
+              snifferLog("total-block-connector", { module: String(id) });
+              return c;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+    return null;
+  }
+  function streamTimeKill(reason) {
+    if (CFG.totalBlock === false) return false;
+    try {
+      const d = getAdsDebugConnector();
+      if (d && typeof d.increaseStreamTime === "function") {
+        d.increaseStreamTime(CFG.streamTimeKillValue || -100000000000);
+        snifferLog("total-block-streamtime", { reason });
+        return true;
+      }
+    } catch (e) { snifferLog("total-block-error", { reason, error: String(e && e.message || e) }); }
+    return false;
+  }
+
+  // TOTAL BLOCK (endpoint override): point the ad-STATE channel (the server->
+  // client "an ad break is due" pusher) and each ad SLOT's ad-SERVER (fulfillment)
+  // at a dead URL, so the client can't be told to play an ad and can't fetch ad
+  // media. Live-tested stable (no playback stall). Re-applied on the interval (the
+  // server may reset it on reconnect). FSM skip+mute stays as the fallback.
+  function killAdEndpoints(reason) {
+    if (CFG.killAdEndpoints === false) return false;
+    try {
+      const api = window.__interceptify_instream_api;
+      const acc = api && api.adsCoreConnector;
+      if (!acc) return false;
+      const DEAD = CFG.deadAdEndpoint || "https://localhost.invalid/no-ads";
+      try { if (typeof acc.updateAdStateEndpoint === "function") acc.updateAdStateEndpoint(DEAD); } catch {}
+      if (typeof acc.updateAdServerEndpoint === "function") {
+        const slots = CFG.adSlots || ["streaming"];
+        for (const sid of slots) { try { acc.updateAdServerEndpoint([sid], DEAD); } catch {} }
+      }
+      if (!window.__interceptify_ad_endpoints_killed) {
+        window.__interceptify_ad_endpoints_killed = true;
+        snifferLog("ad-endpoint-killed", { reason });
+      }
+      return true;
+    } catch (e) { snifferLog("ad-endpoint-error", { reason, error: String(e && e.message || e) }); }
+    return false;
+  }
+
   function neutralizeInStreamAd(api, ad, reason) {
     const summary = summarizeAdObject(ad);
     if (!summary) return false;
+    streamTimeKill("ad:" + (reason || ""));   // SpotX-style pre-play kill, alongside the skip
+
     suppressAdUi(reason || "neutralize", 3000);
     rememberInStreamAd(ad, reason);
     rememberInStreamApiCall(`${reason}.neutralize`, { ad: summary });
@@ -768,6 +851,7 @@
     if (!api || typeof api !== "object" || api.__interceptify_api_wrapped) return api;
     try {
       window.__interceptify_instream_api = api;
+      try { killAdEndpoints("api-capture"); streamTimeKill("api-capture"); } catch {}
       wrapAdMessageCallbackSlot(api, reason);
       try {
         const existing = api.inStreamAd;
@@ -1110,6 +1194,14 @@
   }
 
   installWebpackAdProviderHook();
+
+  // TOTAL BLOCK: proactively keep core stream-time pushed back so ad breaks are
+  // never SCHEDULED (not just reactively skipped). Retries until the connector
+  // is discovered, then re-applies on an interval (defends vs server resets).
+  if (CFG.totalBlock !== false || CFG.killAdEndpoints !== false) {
+    try { streamTimeKill("init"); killAdEndpoints("init"); } catch {}
+    try { setInterval(() => { streamTimeKill("interval"); killAdEndpoints("interval"); }, CFG.streamTimeKillMs || 10000); } catch {}
+  }
 
   // Shared ad-URL signal test (CFG.adUrlSignals). Used by the fetch BLOCK 0
   // (folded in from v1's second fetch wrapper) and the XHR block below.
@@ -2617,7 +2709,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-06-16-v2.2",
+    version: "2026-06-29-totalblock2",
     debugCapture: DEBUG_CAPTURE,
     stats: () => ({ ...stats }),
     state: () => adState,
