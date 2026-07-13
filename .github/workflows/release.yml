@@ -70,9 +70,10 @@ jobs:
 
             ### How it works
             - Injects a small JS file into Spotify's UI bundle (`%APPDATA%\Spotify\Apps\xpui.spa`)
-            - Watches the DOM for ad elements (`leavebehind-*`, `embedded-ad`, `ads-video-player-npv`, …) and Spotify's own `'adplaying'` events
-            - When detected: clicks Spotify's skip button; if skip is denied, mutes via Spotify's volume control
-            - Hides visual ad surfaces with CSS
+            - **Total block:** flips Spotify's core ad-scheduler off (`ad_enabled = false`) and clears queued ad slots, so ad breaks are never scheduled or loaded — not just skipped after they start. Re-applied continuously so a server refresh can't reopen ads.
+            - Reactive fallback: if an ad ever slips through, it's skipped (via Spotify's own override-skip) and muted so it's silent.
+            - Hides visual ad surfaces with CSS.
+            - Supports Spotify's current V8-snapshot desktop build (1.2.93+), where the ad modules are reached at runtime from `__webpack_modules__`.
 
             ### Spotify auto-updates
             Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update — original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.
