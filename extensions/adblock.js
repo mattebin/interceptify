@@ -120,6 +120,14 @@
     killAdEndpoints: true,              // point the ad-STATE pusher + per-slot ad-SERVER at a dead URL so the client can't be told to play / can't fetch an ad (live-tested stable). This is the real prevention lever (stream-time didn't prevent server-scheduled ads).
     deadAdEndpoint: "https://localhost.invalid/no-ads",
     adSlots: ["streaming", "watchnow", "mobile-screensaver", "sponsored-playlist", "homepage-takeover", "hpto", "billboard"],
+    // ---- snapshot-build ads-connector resurrection (Spotify 1.2.93+ V8 snapshot) ----
+    snapshotConnector: true,            // rebuild ads-connector access from window.__webpack_modules__ when the closure require is trapped (chunk.push no longer threads it). Powers adEnabledKill + killAdEndpoints + overrideSkip on snapshot builds.
+    adEnabledKill: true,                // THE MASTER PREVENTION LEVER. putState('ad_enabled','false') on the core ad-scheduler state stops ad breaks from being SCHEDULED at all (not reactively skipped). Live-proven on 1.2.93: 10 forced skips that previously triggered an ad -> 0 ads. Re-applied fast to survive product-state refreshes re-pushing ad_enabled:true.
+    adEnabledKillMs: 1000,              // fast re-apply cadence for ad_enabled=false (it held ~8s untouched, so 1s is safe headroom)
+    clearAdSlots: true,                 // also clearSlot() the ad slots each cycle: ad_enabled=false only stops NEW scheduling, so an ad already queued before the block took hold (e.g. one pre-queued at startup) still needs flushing. With this on, 0/14 forced skips produced an ad (vs 1/14 pre-queued without it).
+    clearSlotReason: 1,
+    overrideSkip: true,                 // reactive belt ONLY: skipToNextWithOverride() bypasses the Free "skip disabled during ad" lock for any ad that slips the ad_enabled prevention (e.g. the startup window before the connector resolves, or SSAI). Gated ONLY via advance().
+    totalBlockIntervalMs: 3000,         // re-apply connector-capture + endpoint-kill on this cadence (faster than the 10s stream-time interval so the kill lands before the first ad once the lazy ads chunk loads)
     webpackChunkGlobal: "webpackChunkclient_web",
     // ---- network classifier ----
     manifestRegex: "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
@@ -621,7 +629,7 @@
   function getAdsDebugConnector() {
     if (window.__interceptify_ads_debug) return window.__interceptify_ads_debug;
     try {
-      const req = window.__interceptify_webpack_require;
+      const req = anyAdsRequire();
       if (!req || !req.m) return null;
       for (const id in req.m) {
         let s = ""; try { s = Function.prototype.toString.call(req.m[id]); } catch {}
@@ -644,6 +652,123 @@
     } catch {}
     return null;
   }
+  // =========================================================================
+  // SNAPSHOT-BUILD ADS-CONNECTOR RESURRECTION (Spotify 1.2.93+)
+  // ------------------------------------------------------------------------
+  // On V8-snapshot builds Spotify's webpack require + module cache are trapped
+  // in a closure and chunk.push no longer threads a require, so the L1 provider
+  // hook never captures the ads connector -> killAdEndpoints/streamTimeKill
+  // silently no-op and only the DOM mute survives (the "only mutes now" bug).
+  // The one surface still exposed is `window.__webpack_modules__` (the factory
+  // registry, writable). A require reconstructed over it can instantiate the ad
+  // connector; its RPC methods (skipToNextWithOverride / updateAdStateEndpoint /
+  // updateAdServerEndpoint) proxy to the shared C++ core, so they drive the REAL
+  // ad flow even from a rebuilt instance — live-proven: an override-skip advanced
+  // a real track. We also opportunistically capture the GENUINE live require by
+  // wrapping registry factories in place (belt; preferred when available).
+  let _snapshotRequire = null;
+  function buildSnapshotRequire() {
+    if (_snapshotRequire) return _snapshotRequire;
+    const M = window.__webpack_modules__;
+    if (!M || typeof M !== "object") return null;
+    const cache = {};
+    const req = function (id) {
+      if (cache[id]) return cache[id].exports;
+      const mod = cache[id] = { id: id, exports: {}, loaded: false };
+      M[id].call(mod.exports, mod, mod.exports, req);
+      mod.loaded = true;
+      return mod.exports;
+    };
+    req.m = M; req.c = cache;
+    req.d = (e, t) => { for (const o in t) if (Object.prototype.hasOwnProperty.call(t, o) && !Object.prototype.hasOwnProperty.call(e, o)) Object.defineProperty(e, o, { enumerable: true, get: t[o] }); };
+    req.o = (o, p) => Object.prototype.hasOwnProperty.call(o, p);
+    req.r = (e) => { if (typeof Symbol !== "undefined" && Symbol.toStringTag) Object.defineProperty(e, Symbol.toStringTag, { value: "Module" }); Object.defineProperty(e, "__esModule", { value: true }); };
+    req.n = (e) => { const g = e && e.__esModule ? () => e.default : () => e; req.d(g, { a: g }); return g; };
+    req.t = function (v) { return v; };
+    req.e = () => Promise.resolve();
+    req.f = {}; req.u = (e) => e + ".js"; req.g = window; req.p = "";
+    try { req.b = document.baseURI || self.location.href; } catch { req.b = ""; }
+    req.nmd = (m) => { m.paths = []; m.children = m.children || []; return m; };
+    req.hmd = (m) => m;
+    _snapshotRequire = req;
+    return req;
+  }
+  // The genuine live require if captured (returns live-cached singletons); else
+  // the reconstructed one (parallel instance, RPCs still reach the shared core).
+  function anyAdsRequire() {
+    const live = window.__interceptify_webpack_require;
+    if (live && live.m) return live;
+    return buildSnapshotRequire();
+  }
+  // Capture the GENUINE live require by wrapping registry factories in place; the
+  // next time the app instantiates a not-yet-cached wrapped module we grab its
+  // require (3rd arg). Idempotent + re-runnable (catches lazily added factories).
+  function captureLiveRequire() {
+    try {
+      if (window.__interceptify_webpack_require) return;
+      const M = window.__webpack_modules__;
+      if (!M || typeof M !== "object") return;
+      for (const id of Object.keys(M)) {
+        const orig = M[id];
+        if (typeof orig !== "function" || orig.__intc_capwrap) continue;
+        const w = function (module, exports, require) {
+          if (require && require.m && !window.__interceptify_webpack_require) {
+            try { window.__interceptify_webpack_require = require; } catch {}
+          }
+          return orig.apply(this, arguments);
+        };
+        w.__intc_capwrap = true; w.__intc_orig = orig;
+        try { M[id] = w; } catch {}
+      }
+    } catch {}
+  }
+  // Find + instantiate the ad connector (adsCoreConnector exposing
+  // skipToNextWithOverride + updateAdStateEndpoint). By SIGNATURE, never a
+  // hard-coded id (ids churn every Spotify build; the module also lives in a
+  // LAZY chunk, so it appears only once the ads subsystem has loaded — hence the
+  // retry loop on the interval). Cached once found.
+  let _adsConnector = null;
+  function resolveAdsConnector() {
+    if (_adsConnector) return _adsConnector;
+    if (CFG.snapshotConnector === false) return null;
+    const M = window.__webpack_modules__;
+    const req = anyAdsRequire();
+    if (!M || !req) return null;
+    for (const id of Object.keys(M)) {
+      let src = "";
+      try { const f = M[id] && M[id].__intc_orig ? M[id].__intc_orig : M[id]; src = Function.prototype.toString.call(f); } catch { continue; }
+      if (src.indexOf("skipToNextWithOverride") < 0) continue;
+      if (src.indexOf("updateAdStateEndpoint") < 0 && src.indexOf("adsCoreConnector") < 0) continue;
+      let ex; try { ex = req(id); } catch { continue; }
+      const ac = ex && ex.adsCoreConnector;
+      if (ac && typeof ac.skipToNextWithOverride === "function") {
+        _adsConnector = ac;
+        window.__interceptify_ads_connector = ac;
+        snifferLog("ads-connector-resolved", { module: String(id), live: !!(window.__interceptify_webpack_require && window.__interceptify_webpack_require.m) });
+        return ac;
+      }
+    }
+    return null;
+  }
+  // Reactive OVERRIDE skip. skipToNextWithOverride() -> skipNext({overrideRestrictions:
+  // true}), which bypasses the Free "skip disabled during ad" lock. Gated ONLY
+  // through advance() (fully song-safe); pairs with armMute() so the ~1s core
+  // advance window is silent. Belt for any ad that slips prevention (SSAI, or the
+  // window before the connector/endpoint-kill is live).
+  function overrideSkip(reason) {
+    if (CFG.overrideSkip === false) return false;
+    try {
+      const ac = resolveAdsConnector();
+      if (ac && typeof ac.skipToNextWithOverride === "function") {
+        try { armMute(); } catch {}
+        ac.skipToNextWithOverride();
+        snifferLog("override-skip", { reason });
+        return true;
+      }
+    } catch (e) { snifferLog("override-skip-error", { reason, error: String(e && e.message || e) }); }
+    return false;
+  }
+
   function streamTimeKill(reason) {
     if (CFG.totalBlock === false) return false;
     try {
@@ -666,7 +791,9 @@
     if (CFG.killAdEndpoints === false) return false;
     try {
       const api = window.__interceptify_instream_api;
-      const acc = api && api.adsCoreConnector;
+      // Prefer the L1-hooked instream api's connector (old builds); on snapshot
+      // builds that hook is dead, so fall back to the resurrected connector.
+      const acc = (api && api.adsCoreConnector) || resolveAdsConnector();
       if (!acc) return false;
       const DEAD = CFG.deadAdEndpoint || "https://localhost.invalid/no-ads";
       try { if (typeof acc.updateAdStateEndpoint === "function") acc.updateAdStateEndpoint(DEAD); } catch {}
@@ -680,6 +807,36 @@
       }
       return true;
     } catch (e) { snifferLog("ad-endpoint-error", { reason, error: String(e && e.message || e) }); }
+    return false;
+  }
+
+  // MASTER PREVENTION (Spotify 1.2.93+): flip the core ad-scheduler's `ad_enabled`
+  // state to "false" via the connector's putState RPC. This is the switch the core
+  // reads to decide whether to SCHEDULE ad breaks — setting it false stops ads from
+  // ever loading/playing (not a reactive skip). Live-proven: with it held, 10 forced
+  // skips that reliably triggered an ad break produced zero ads. Re-applied fast
+  // because a product-state refresh (reconnect/login) can re-push ad_enabled:true.
+  function suppressAdState(reason) {
+    if (CFG.adEnabledKill === false) return false;
+    try {
+      const ac = (window.__interceptify_instream_api && window.__interceptify_instream_api.adsCoreConnector) || resolveAdsConnector();
+      if (ac && typeof ac.putState === "function") {
+        ac.putState("ad_enabled", "false");
+        // Flush any ad already QUEUED before the block took hold (ad_enabled=false
+        // only stops NEW scheduling; a pre-queued ad — e.g. one queued at startup —
+        // still plays on the next transition unless cleared). No-op when no ad is
+        // queued, so it's cheap to run every cycle.
+        if (CFG.clearAdSlots !== false && typeof ac.clearSlot === "function") {
+          const slots = CFG.adSlots || ["streaming"];
+          for (const s of slots) { try { ac.clearSlot(s, CFG.clearSlotReason != null ? CFG.clearSlotReason : 1); } catch {} }
+        }
+        if (!window.__interceptify_ad_enabled_killed) {
+          window.__interceptify_ad_enabled_killed = true;
+          snifferLog("ad-enabled-killed", { reason });
+        }
+        return true;
+      }
+    } catch (e) { snifferLog("ad-enabled-error", { reason, error: String(e && e.message || e) }); }
     return false;
   }
 
@@ -1195,12 +1352,27 @@
 
   installWebpackAdProviderHook();
 
-  // TOTAL BLOCK: proactively keep core stream-time pushed back so ad breaks are
-  // never SCHEDULED (not just reactively skipped). Retries until the connector
-  // is discovered, then re-applies on an interval (defends vs server resets).
-  if (CFG.totalBlock !== false || CFG.killAdEndpoints !== false) {
-    try { streamTimeKill("init"); killAdEndpoints("init"); } catch {}
-    try { setInterval(() => { streamTimeKill("interval"); killAdEndpoints("interval"); }, CFG.streamTimeKillMs || 10000); } catch {}
+  // TOTAL BLOCK: proactively point the ad-state/ad-server endpoints at a dead URL
+  // so ad breaks are never scheduled/fetched (not just reactively skipped). On
+  // snapshot builds this first resurrects the connector from __webpack_modules__
+  // (the ads chunk is lazy, so resolveAdsConnector retries until it appears; once
+  // found the endpoint-kill is applied and re-applied to defend vs server resets).
+  if (CFG.totalBlock !== false || CFG.killAdEndpoints !== false || CFG.snapshotConnector !== false || CFG.adEnabledKill !== false) {
+    const applyTotalBlock = (reason) => {
+      try { captureLiveRequire(); } catch {}   // best-effort: prefer the genuine live require
+      try { resolveAdsConnector(); } catch {}   // find the lazy ads connector once loaded
+      try { suppressAdState(reason); } catch {} // MASTER: ad_enabled=false -> ads never scheduled
+      try { killAdEndpoints(reason); } catch {}
+      try { streamTimeKill(reason); } catch {}
+    };
+    try { applyTotalBlock("init"); } catch {}
+    // Fast cadence so the kill lands the moment the lazy ads chunk loads (before
+    // the first ad); the connector + require are cached once found so this is cheap.
+    try { setInterval(() => applyTotalBlock("interval"), CFG.totalBlockIntervalMs || 3000); } catch {}
+    // Dedicated FAST re-apply of the master ad_enabled=false switch — the one lever
+    // proven to prevent ad loading — so a product-state refresh can't reopen ads
+    // for more than ~1s (endpoint/stream-time kills stay on the slower interval).
+    try { setInterval(() => { try { suppressAdState("fast"); } catch {} }, CFG.adEnabledKillMs || 1000); } catch {}
   }
 
   // Shared ad-URL signal test (CFG.adUrlSignals). Used by the fetch BLOCK 0
@@ -2335,8 +2507,18 @@
       }
       // (d) actions — reached ONLY after CONFIRMED + strong + now-playing==ad.
       let acted = false;
-      // PREFERRED: in-stream skipToNext() once per unique ad key. The L1 wrap
-      // also fires it on neutralize; this is a belt. Song-safe: gated above.
+      // PRIMARY on snapshot builds (1.2.93+): override-skip bypasses the Free
+      // skip-lock. Once per unique ad key (the connector's skip is not self-
+      // gating, so it leans entirely on the advance() gate above + this dedupe).
+      try {
+        window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
+        const ovKey = "override:" + key;
+        if (!window.__interceptify_neutralized_ads.has(ovKey)) {
+          if (overrideSkip("advance:" + key)) { window.__interceptify_neutralized_ads.add(ovKey); acted = true; }
+        }
+      } catch {}
+      // PREFERRED (old builds): in-stream skipToNext() once per unique ad key. The
+      // L1 wrap also fires it on neutralize; this is a belt. Song-safe: gated above.
       try {
         const api = window.__interceptify_instream_api;
         if (api && typeof api.skipToNext === "function") {
@@ -2709,7 +2891,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-06-29-totalblock2",
+    version: "2026-07-13-ad-enabled-kill+clearslot",
     debugCapture: DEBUG_CAPTURE,
     stats: () => ({ ...stats }),
     state: () => adState,
