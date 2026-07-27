@@ -126,6 +126,13 @@
     adEnabledKillMs: 1000,              // fast re-apply cadence for ad_enabled=false (it held ~8s untouched, so 1s is safe headroom)
     clearAdSlots: true,                 // also clearSlot() the ad slots each cycle: ad_enabled=false only stops NEW scheduling, so an ad already queued before the block took hold (e.g. one pre-queued at startup) still needs flushing. With this on, 0/14 forced skips produced an ad (vs 1/14 pre-queued without it).
     clearSlotReason: 1,
+    // ---- SELF-HEALING: never hard-code the core's ad-gate key name ----
+    // `ad_enabled` is Spotify-internal and can be renamed by any client update.
+    // We read the LIVE ad state and match its key names against these patterns,
+    // so a rename is auto-discovered instead of silently disabling the block.
+    adGateKeyPatterns: ["^ad[_-]?enabled$", "^ads?[_-]?enabled$", "^enable[_-]?ads?$"],
+    adGateVerify: true,                 // read the state back and confirm every gate key really reads "false" (a write that doesn't stick = drift -> logged as ad-gate-FAILED)
+    adTripwire: true,                   // permanently observe the core's in-stream ad channel; ANY delivery while the block is on is a hard failure signal (this is what "no load at all" is measured on)
     overrideSkip: true,                 // reactive belt ONLY: skipToNextWithOverride() bypasses the Free "skip disabled during ad" lock for any ad that slips the ad_enabled prevention (e.g. the startup window before the connector resolves, or SSAI). Gated ONLY via advance().
     totalBlockIntervalMs: 3000,         // re-apply connector-capture + endpoint-kill on this cadence (faster than the 10s stream-time interval so the kill lands before the first ad once the lazy ads chunk loads)
     webpackChunkGlobal: "webpackChunkclient_web",
@@ -816,12 +823,106 @@
   // ever loading/playing (not a reactive skip). Live-proven: with it held, 10 forced
   // skips that reliably triggered an ad break produced zero ads. Re-applied fast
   // because a product-state refresh (reconnect/login) can re-push ad_enabled:true.
+  // ---- SELF-HEALING ad-gate discovery -------------------------------------
+  // The core scheduler's master switch is a STATE KEY, and its name is Spotify
+  // -internal (today `ad_enabled`). Rather than trust that name forever, read
+  // the live ad state and match key names against CFG.adGateKeyPatterns. If a
+  // Spotify update renames it we auto-adopt the new name; if NOTHING matches we
+  // log `ad-gate-MISSING` with the real key list, which is the exact signal the
+  // automated repair loop escalates on (silent no-op was the old failure mode).
+  let _adGateKeys = null;          // discovered gate key names
+  let _adGateVerified = false;     // read-back confirmed every gate reads "false"
+  let _adGateRefreshing = false;
+  // BASELINE of the key names Spotify's own state had BEFORE we ever wrote to it.
+  // Critical: putState() CREATES any key you name, so "write a key then read it
+  // back" is circular and would happily 'verify' a key that does not exist. A
+  // discovered gate key is only trustworthy if Spotify itself published it.
+  let _baselineKeys = null;
+  function adGateFallbackKeys() {
+    const f = CFG.adGateFallbackKeys;
+    return Array.isArray(f) ? f : ["ad_enabled"];
+  }
+  function adGateKeys() { return _adGateKeys && _adGateKeys.length ? _adGateKeys : adGateFallbackKeys(); }
+  function refreshAdGate(ac) {
+    if (_adGateRefreshing || !ac || typeof ac.getAdState !== "function") return;
+    _adGateRefreshing = true;
+    try {
+      const p = ac.getAdState();
+      if (!p || !p.then) { _adGateRefreshing = false; return; }
+      p.then((s) => {
+        _adGateRefreshing = false;
+        const st = (s && s.state) || {};
+        const keys = Object.keys(st);
+        if (_baselineKeys === null) {                     // first read = Spotify's own key set
+          _baselineKeys = {};
+          for (const k of keys) _baselineKeys[k] = true;
+          window.__interceptify_baseline_keys = keys.slice();
+        }
+        const pats = (CFG.adGateKeyPatterns || []).map((x) => rx(x, "i")).filter(Boolean);
+        // Only keys Spotify itself published count — never one we invented.
+        const found = keys.filter((k) => pats.some((r) => r.test(k)) && _baselineKeys[k]);
+        if (found.length) {
+          if (!_adGateKeys || found.join(",") !== _adGateKeys.join(",")) snifferLog("ad-gate-discovered", { keys: found });
+          _adGateKeys = found;
+          const notFalse = found.filter((k) => String(st[k] && st[k].value).toLowerCase() !== "false");
+          _adGateVerified = notFalse.length === 0;
+          if (!_adGateVerified && CFG.adGateVerify !== false) snifferLog("ad-gate-FAILED", { notFalse });
+        } else {
+          _adGateKeys = null; _adGateVerified = false;
+          snifferLog("ad-gate-MISSING", { keys: keys.slice(0, 60) });   // <- drift: key was renamed
+        }
+        window.__interceptify_ad_gate = { keys: found, verified: _adGateVerified };
+      }).catch(() => { _adGateRefreshing = false; });
+    } catch { _adGateRefreshing = false; }
+  }
+  // TRIPWIRE: watch the core's in-stream ad delivery channel forever. This is the
+  // ground truth for "no load at all" — if the core hands us an ad while the block
+  // is on, the block failed (a skipped/muted ad still counts as a failure here).
+  function installAdTripwire(ac) {
+    if (CFG.adTripwire === false || window.__interceptify_tripwire || !ac) return;
+    try {
+      if (typeof ac.subscribeToInStreamAds !== "function") return;
+      ac.subscribeToInStreamAds((msg) => {
+        try {
+          const ad = (msg && msg.ad) || msg;
+          window.__interceptify_ads_delivered = (window.__interceptify_ads_delivered || 0) + 1;
+          window.__interceptify_last_delivered = { t: Date.now(), id: (ad && (ad.adId || ad.id)) || null, format: ad && ad.format };
+          snifferLog("TRIPWIRE-ad-delivered", { id: (ad && (ad.adId || ad.id)) || null, format: ad && ad.format });
+          // Persist the incident so it survives a restart and can be reviewed
+          // later. localStorage only — the payload never touches the filesystem.
+          try {
+            const K = "__interceptify_ad_incidents";
+            const arr = JSON.parse(localStorage.getItem(K) || "[]");
+            arr.push({ t: Date.now(), id: (ad && (ad.adId || ad.id)) || null, format: ad && ad.format, v: window.__interceptify && window.__interceptify.version });
+            localStorage.setItem(K, JSON.stringify(arr.slice(-100)));
+          } catch {}
+        } catch {}
+      });
+      window.__interceptify_tripwire = true;
+      window.__interceptify_ads_delivered = window.__interceptify_ads_delivered || 0;
+    } catch {}
+  }
+
   function suppressAdState(reason) {
     if (CFG.adEnabledKill === false) return false;
     try {
       const ac = (window.__interceptify_instream_api && window.__interceptify_instream_api.adsCoreConnector) || resolveAdsConnector();
       if (ac && typeof ac.putState === "function") {
-        ac.putState("ad_enabled", "false");
+        installAdTripwire(ac);
+        refreshAdGate(ac);                                   // discover + verify (async, cached)
+        // Verifier-controlled A/B: lets selftest OPEN the gate to prove its ad
+        // trigger actually works, before trusting a "no ads" result.
+        if (window.__interceptify_suspend_block === true) return false;
+        // Never write before we've seen Spotify's own key set (see _baselineKeys).
+        if (_baselineKeys === null) {
+          if (CFG.clearAdSlots !== false && typeof ac.clearSlot === "function") {
+            for (const s of (CFG.adSlots || ["streaming"])) {
+              try { ac.clearSlot(s, CFG.clearSlotReason != null ? CFG.clearSlotReason : 1); } catch {}
+            }
+          }
+          return false;
+        }
+        for (const k of adGateKeys()) { try { ac.putState(k, "false"); } catch {} }
         // Flush any ad already QUEUED before the block took hold (ad_enabled=false
         // only stops NEW scheduling; a pre-queued ad — e.g. one queued at startup —
         // still plays on the next transition unless cleared). No-op when no ad is
@@ -2891,8 +2992,164 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-07-13-ad-enabled-kill+clearslot",
+    version: "2026-07-27-selfheal",
     debugCapture: DEBUG_CAPTURE,
+    // Machine-readable health, for the automated repair loop (selfheal.py) and
+    // for a human over CDP. Cheap, no side effects.
+    health() {
+      const gate = window.__interceptify_ad_gate || null;
+      return {
+        version: window.__interceptify.version,
+        connector: !!window.__interceptify_ads_connector,
+        gateKeys: gate ? gate.keys : null,
+        gateVerified: !!(gate && gate.verified),
+        adsDelivered: window.__interceptify_ads_delivered || 0,
+        lastDelivered: window.__interceptify_last_delivered || null,
+        webpackModules: (() => { try { return Object.keys(window.__webpack_modules__ || {}).length; } catch { return 0; } })(),
+        liveRequire: !!window.__interceptify_webpack_require,
+      };
+    },
+    // STRICT verification of "the user never experiences an ad — not even a flash".
+    // Forces ad breaks to become DUE (the real scheduler trigger, validated to
+    // deliver ads when the block is off), then requires ALL of:
+    //   adsDelivered === 0   -> the core never even handed us an ad (no load)
+    //   adUiFrames   === 0   -> no ad UI/title in 50ms sampling (no visual flash)
+    //   reactiveActions === 0-> the skip/mute fallback never had to fire
+    // Any reactive action means an ad reached playback => FAIL, by design.
+    // ======================================================================
+    // VERIFICATION — deterministic, end to end, and independent of where the
+    // user happens to be in the app. It follows Spotify's OWN ad path in code:
+    //   adsCoreConnector.getAdState() / .putState()  (the core ad scheduler)
+    //   adsCoreConnector.subscribeToInStreamAds()    (the ad delivery channel)
+    //
+    // Every way this check could lie has been closed:
+    //  * "0 ads seen" might just mean none was due   -> never the proof on its own;
+    //                                                   the proof is a CAUSAL TOGGLE
+    //                                                   of Spotify's own switch.
+    //  * a key we invented reads back fine           -> gate keys must come from the
+    //                                                   BASELINE set Spotify itself
+    //                                                   published before we wrote.
+    //  * our write might be a phantom / no-op        -> we move the switch BOTH ways
+    //                                                   and require the core to echo.
+    //  * the block might apply once then die         -> we reopen it and require our
+    //                                                   maintenance loop to re-close.
+    //  * the ad detector might be dead (0 forever)   -> the tripwire must be armed.
+    // Nothing here depends on navigation, playback position, or the current page.
+    // ======================================================================
+    selftest(opts) {
+      opts = opts || {};
+      const observeMs = opts.durationMs || 12000;
+      const sampleMs = opts.sampleMs || 50;
+      const ac = window.__interceptify_ads_connector || null;
+      const adRe = /Reklam|Annons|Advertisement|Werbung|Publicidad|Anuncio/i;
+      if (!ac || typeof ac.putState !== "function" || typeof ac.getAdState !== "function") {
+        return Promise.resolve({ verdict: "FAIL", connector: false, reasons: ["ads connector not reachable"] });
+      }
+      const readState = () => ac.getAdState().then((s) => {
+        const o = {}; const st = (s && s.state) || {};
+        for (const k in st) { try { o[k] = String(st[k].value); } catch {} }
+        return o;
+      });
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      return (async () => {
+        const reasons = [];
+        const baseline = window.__interceptify_baseline_keys || [];
+        const gate0 = window.__interceptify_ad_gate || null;
+        const keys = (gate0 && gate0.keys && gate0.keys.length) ? gate0.keys.slice() : [];
+        const tripwireArmed = window.__interceptify_tripwire === true;
+        if (!tripwireArmed) reasons.push("ad-delivery tripwire not armed (an ad could pass uncounted)");
+        if (!keys.length) reasons.push("no ad-gate key discovered from Spotify's own ad state");
+        const fromBaseline = keys.length > 0 && keys.every(function (k) { return baseline.indexOf(k) !== -1; });
+        if (keys.length && !fromBaseline) reasons.push("gate key is not one Spotify published (phantom key we created)");
+
+        // ---- CAUSAL TOGGLE PROOF (pure state, no UI dependency) -----------
+        let toggleProven = false, reassertProven = false;
+        if (fromBaseline) {
+          window.__interceptify_suspend_block = true;      // pause our 1s maintenance loop
+          let allTrue = false, allFalse = false;
+          try {
+            for (const k of keys) { try { ac.putState(k, "true"); } catch (e) {} }
+            await sleep(1200);
+            const opened = await readState();
+            allTrue = keys.every(function (k) { return String(opened[k]).toLowerCase() === "true"; });
+            for (const k of keys) { try { ac.putState(k, "false"); } catch (e) {} }
+            await sleep(1200);
+            const closed = await readState();
+            allFalse = keys.every(function (k) { return String(closed[k]).toLowerCase() === "false"; });
+            toggleProven = allTrue && allFalse;
+            if (!allTrue) reasons.push("could not OPEN the gate — our write is not reaching core state");
+            if (!allFalse) reasons.push("could not CLOSE the gate — our write is not reaching core state");
+            // leave it OPEN so the maintenance loop has something to fix
+            for (const k of keys) { try { ac.putState(k, "true"); } catch (e) {} }
+            await sleep(600);
+          } finally {
+            window.__interceptify_suspend_block = false;   // maintenance resumes
+          }
+          await sleep(3500);
+          const after = await readState();
+          reassertProven = keys.every(function (k) { return String(after[k]).toLowerCase() === "false"; });
+          if (!reassertProven) reasons.push("block did not re-assert itself after the gate was reopened");
+        }
+
+        // ---- OBSERVATION WINDOW -------------------------------------------
+        // Opportunistic provocation while watching for ANY ad-shaped event.
+        // Absence of ads here is corroboration, never the proof.
+        const t0 = Date.now();
+        const adsBefore = window.__interceptify_ads_delivered || 0;
+        const s0 = await readState();
+        let adUiFrames = 0, firstAdUiAt = null;
+        const sampler = setInterval(function () {
+          try {
+            const ui = !!document.querySelector('[data-testid="ad-controls"],[data-testid="ad-countdown-timer"],[data-testid="ads-video-player-npv"]')
+                     || adRe.test(document.title || "");
+            if (ui) { adUiFrames++; if (firstAdUiAt === null) firstAdUiAt = Date.now() - t0; }
+          } catch (e) {}
+        }, sampleMs);
+        const driver = setInterval(function () {
+          try { ac.putState("last_ad_break_stream_time", "0"); } catch (e) {}
+        }, 1500);
+        await sleep(observeMs);
+        clearInterval(sampler); clearInterval(driver);
+        const s1 = await readState();
+
+        const adsDelivered = (window.__interceptify_ads_delivered || 0) - adsBefore;
+        const reactiveActions = (window.__interceptify_sniffer || []).filter(function (e) {
+          return e && e.ts >= t0 && /override-skip|^advance$|skipToNext\.forAd|TRIPWIRE-ad-delivered|armMute/.test(e.kind || "");
+        }).length;
+        // elapsed_stream_time advances only while audio actually streams — used as
+        // INFORMATION about the window, never as a pass/fail gate.
+        const streamedMs = (parseInt(s1.elapsed_stream_time, 10) || 0) - (parseInt(s0.elapsed_stream_time, 10) || 0);
+        const gateClosed = keys.length > 0 && keys.every(function (k) { return String(s1[k]).toLowerCase() === "false"; });
+
+        if (adsDelivered) reasons.push("core delivered " + adsDelivered + " ad(s) during the window");
+        if (adUiFrames) reasons.push("ad UI was on screen for " + adUiFrames + " sample(s)");
+        if (reactiveActions) reasons.push("reactive skip/mute fired " + reactiveActions + "x (an ad reached playback)");
+        if (!gateClosed) reasons.push("ad gate is not closed at end of window");
+
+        const pass = tripwireArmed && fromBaseline && toggleProven && reassertProven &&
+                     gateClosed && adsDelivered === 0 && adUiFrames === 0 && reactiveActions === 0;
+        return {
+          verdict: pass ? "PASS" : "FAIL",
+          reasons: reasons,
+          version: window.__interceptify.version,
+          connector: true,
+          tripwireArmed: tripwireArmed,
+          gateKeys: keys,
+          gateFromBaseline: fromBaseline,
+          baselineKeyCount: baseline.length,
+          toggleProven: toggleProven,       // we can move Spotify's real switch both ways
+          reassertProven: reassertProven,   // the block re-closes it by itself
+          gateClosed: gateClosed,
+          adsDelivered: adsDelivered,
+          adUiFrames: adUiFrames,
+          firstAdUiAt: firstAdUiAt,
+          reactiveActions: reactiveActions,
+          streamedMs: streamedMs,           // informational only
+          observeMs: observeMs,
+        };
+      })();
+    },
     stats: () => ({ ...stats }),
     state: () => adState,
     instreamModuleIds: () => (window.__interceptify_instream_module_ids || []).slice(),

@@ -1,6 +1,5 @@
 {
   "_comment": "Interceptify v2 ad-block tunables. The patcher injects this as window.__INTERCEPTIFY_CONFIG and adblock.js shallow-merges it over its built-in defaults. After a Spotify update that breaks blocking, fix it HERE (selectors / module signatures / regexes / threshold) and re-patch -- no JS edit or rebuild needed. Regexes are strings compiled with new RegExp() at use sites; escape backslashes for JSON.",
-
   "tickMs": 500,
   "cooldownMs": 1500,
   "suspectClearTicks": 2,
@@ -14,8 +13,7 @@
   "instreamWindowMs": 3000,
   "seek15Burst": 4,
   "seek15BurstSpacingMs": 150,
-  "adTextMarkers": "advert|annons|reklam|reclame|werb|anunci|publici|annonce|mainos|reklaam|реклама|sponsor",
-
+  "adTextMarkers": "advert|annons|reklam|reclame|werb|anunci|publici|annonce|mainos|reklaam|\u0440\u0435\u043a\u043b\u0430\u043c\u0430|sponsor",
   "strongAdSelectors": [
     "[data-testid=\"ad-controls\"]",
     "[data-testid=\"ad-countdown-timer\"]",
@@ -50,7 +48,6 @@
     ".ScclvBC0NsMgQLQC",
     "div:has(> .ScclvBC0NsMgQLQC)"
   ],
-
   "skipForwardTestId": "control-button-skip-forward",
   "seekForward15TestId": "control-button-seek-forward-15",
   "muteButtonTestId": "volume-bar-toggle-mute-button",
@@ -60,16 +57,23 @@
     "[data-testid=\"context-item-info-title\"]",
     "[data-testid=\"now-playing-widget\"] a"
   ],
-
-  "instreamSourceSignatures": [["getInStreamAd", "inStreamApi"]],
+  "instreamSourceSignatures": [
+    [
+      "getInStreamAd",
+      "inStreamApi"
+    ]
+  ],
   "instreamSourceRegex": "",
-  "playerStateSignatures": [["AdsAPIProvider"]],
+  "playerStateSignatures": [
+    [
+      "AdsAPIProvider"
+    ]
+  ],
   "playerStateRegex": "",
   "playerStateFallbackId": 5563,
   "instreamModuleFallbackId": 46849,
   "enableInstreamHook": true,
   "webpackChunkGlobal": "webpackChunkclient_web",
-
   "manifestRegex": "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
   "manifestAdMaxMs": 60000,
   "manifestAdMinMs": 1000,
@@ -79,9 +83,19 @@
   "knownAdSourcesMax": 256,
   "sourceSegmentRegex": "/sources/([a-f0-9]+)/",
   "sponsoredPlaylistRegex": "/sponsoredplaylist/v\\d+/sponsored",
-  "manifestDurationFields": ["end_time_millis", "duration_millis", "duration_ms"],
-  "adUrlSignals": ["/ads/", "/ad-logic/", "/gabo-receiver-service/", "/pagead", "doubleclick.net", "adeventtracker"],
-
+  "manifestDurationFields": [
+    "end_time_millis",
+    "duration_millis",
+    "duration_ms"
+  ],
+  "adUrlSignals": [
+    "/ads/",
+    "/ad-logic/",
+    "/gabo-receiver-service/",
+    "/pagead",
+    "doubleclick.net",
+    "adeventtracker"
+  ],
   "blockInstreamSignal": true,
   "enableDomSprayLastResort": false,
   "enableMediaSourceEndOfStream": false,
@@ -89,5 +103,13 @@
   "inspectMode": false,
   "enableInStreamPoll": true,
   "inStreamPollMs": 80,
-  "inStreamSkipLockMs": 300
+  "inStreamSkipLockMs": 300,
+  "adGateKeyPatterns": [
+    "^ad[_-]?enabled$",
+    "^ads?[_-]?enabled$",
+    "^enable[_-]?ads?$"
+  ],
+  "adGateFallbackKeys": [
+    "ad_enabled"
+  ]
 }

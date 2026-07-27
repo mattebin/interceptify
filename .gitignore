@@ -47,3 +47,9 @@ capture_*.json
 netlog_*.jsonl
 sni_log.txt
 *.pcapng
+
+# Local-only self-healing automation (personal; never shipped publicly)
+selfheal.py
+selfheal.state.json
+selfheal.report.json
+selfheal.log
