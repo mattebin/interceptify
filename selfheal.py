@@ -192,11 +192,10 @@ def diagnostic_files() -> list[Path]:
     return out
 
 
-# How many diagnostic artifacts to keep, and for how long. Retention was
-# unbounded: every capture ever taken stayed until someone remembered to run
-# --scrub. Files nobody has looked at for a month are not evidence, they are
-# just an ever-growing pile of detailed records of what the user listened to.
-DIAGNOSTIC_KEEP = 10
+# How long a diagnostic artifact is kept. Retention was unbounded: every capture
+# ever taken stayed until someone remembered to run --scrub. Files nobody has
+# looked at for a month are not evidence, they are an ever-growing pile of
+# detailed records of what the user listened to.
 DIAGNOSTIC_MAX_AGE_S = 30 * 24 * 3600
 
 
@@ -239,9 +238,8 @@ def prune_diagnostics() -> int:
     be - eleven captures taken while chasing one bug would start eating the
     earliest ones, which are usually the informative ones.
 
-    So: unbounded retention is fixed, and the existing decision is not quietly
-    reversed. DIAGNOSTIC_KEEP is still enforced, but only by --scrub, where a
-    human is present.
+    So: unbounded retention is fixed without quietly reversing that decision.
+    Deleting anything newer stays a --scrub, where a human is present.
     """
     removed = []
     now = time.time()
