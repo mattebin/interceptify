@@ -5,34 +5,110 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        # A manual run used to skip the version gate entirely, so it could
+        # produce an artifact whose APP_VERSION and manifest disagreed - the
+        # exact skew the gate exists to catch, available on demand.
+        description: "Version to check against APP_VERSION and the manifest, e.g. v2.0.5"
+        required: true
+        type: string
 
+# Read-only by default. Only the job that publishes a release gets write, and
+# only when it is publishing one. `contents: write` at the top handed every job
+# in the workflow - including the one that runs test code - a token that can
+# rewrite the repository.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  # Gates run as their own job so a tag push cannot produce a release without
+  # them passing. Previously the workflow built and published straight from a
+  # tag with nothing verified: the regression suite existed but CI never ran it,
+  # so "it is tagged" and "it works" were unrelated facts.
+  test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs, not tags. A tag is a movable pointer
+      # in someone else's repository: whoever controls it can change what runs
+      # here, and every one of these steps sees the workflow token and the
+      # artifact about to be signed off as a release.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
+      - name: Payload regression suite
+        run: node tests/test_adblock.mjs
+
+      - name: Config contract (published knobs vs knobs the payload reads)
+        run: python tests/test_config_contract.py
+
+      - name: Python syntax
+        run: python -m compileall -q main.py selfheal.py spotify_patcher.py self_updater.py patch_lock.py install_tasks.py redact.py cdp_capture.py cdp_netlog.py
+
+      - name: Install runtime deps for the state/config tests
+        run: pip install -r requirements.txt
+
+      - name: Patch/unpatch round-trip on a synthetic xpui.spa
+        run: python tests/test_patch_roundtrip.py
+
+      - name: A structural pass must not clear a recorded ad delivery
+        run: python tests/test_delivery_state.py
+
+      - name: A release must be able to correct a build-volatile default
+        run: python tests/test_config_upgrade.py
+
+      # Applies to MANUAL runs too, via the required `version` input.
+      - name: Version consistency (tag/input vs APP_VERSION vs manifest)
+        run: python tests/test_version_consistency.py "${{ github.event.inputs.version || github.ref_name }}"
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write   # only this job publishes, and only on a tag
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt "pyinstaller==6.11.1"
 
+      # Built from the checked-in spec, not from a hand-written command line.
+      # The two had drifted: the spec said uac_admin=True and named the output
+      # Interceptify-v2, while CI passed no --uac-admin and named it
+      # Interceptify. A local build therefore produced an ELEVATED binary that
+      # looked exactly like the release. One build definition, used by both.
       - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller --noconfirm --onefile --windowed `
-            --name "Interceptify" `
-            --manifest interceptify.manifest `
-            --uac-admin `
-            --add-data "extensions;extensions" `
-            main.py
+        run: pyinstaller --noconfirm Interceptify-v2.spec
+
+      # The payload is what actually blocks ads, and the manifest is what
+      # decides whether the thing runs elevated. If either is not what this
+      # commit says, the release describes code that does not exist.
+      - name: Verify the built EXE carries THIS commit's payload and runs as the user
+        run: python tests/test_bundled_payload.py dist/Interceptify.exe
+
+      # The packaged build is a different program from the source tree: its own
+      # root, its own bundled data, its own module graph, no stdout. Two real
+      # defects were found only here.
+      - name: Exercise the packaged build against a disposable Spotify
+        run: python tests/test_frozen_cycle.py dist/Interceptify.exe
 
       - name: Compute SHA-256 checksum
         run: |
@@ -41,7 +117,7 @@ jobs:
           Write-Host "SHA256: $hash"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Interceptify
           path: |
@@ -50,7 +126,7 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/Interceptify.exe
@@ -63,10 +139,13 @@ jobs:
 
             > 🛑 **READ THIS FIRST** — You need the **desktop installer** version of Spotify from [spotify.com/download](https://www.spotify.com/download). The **Microsoft Store version will NOT work** (sandbox prevents file modification). Uninstall the Store version and install from spotify.com before using this.
 
+            > ⚠️ **The .exe is not code-signed.** Windows SmartScreen will warn on first run. Verify the SHA-256 below matches the `.sha256` file before running it. Note that both come from this same release, so they confirm the download was not corrupted in transit; they are not an independent guarantee of who built it.
+
             ### Install
             1. Download **Interceptify.exe** below.
-            2. Double-click. Accept the UAC prompt (needed to write Spotify's `xpui.spa`).
+            2. Double-click. No admin prompt: it runs as you.
             3. Right-click the tray icon → **Patch Spotify**. Spotify will close and relaunch with ad-blocking active.
+            4. Optional: tray → **Run at Windows startup**. That registers the scheduled tasks that keep the patch alive across Spotify updates, pointed at this .exe.
 
             ### How it works
             - Injects a small JS file into Spotify's UI bundle (`%APPDATA%\Spotify\Apps\xpui.spa`)
@@ -74,6 +153,9 @@ jobs:
             - Reactive fallback: if an ad ever slips through, it's skipped (via Spotify's own override-skip) and muted so it's silent.
             - Hides visual ad surfaces with CSS.
             - Supports Spotify's current V8-snapshot desktop build (1.2.93+), where the ad modules are reached at runtime from `__webpack_modules__`.
+
+            ### Settings
+            Tunables live in `extensions/adblock.config.json`, which belongs to the release and is replaced on every update. Put your own changes in `extensions/adblock.config.local.json` — that file is never overwritten and wins over the shipped defaults.
 
             ### Spotify auto-updates
             Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update — original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.

@@ -16,6 +16,8 @@ Usage:  python cdp_capture.py [port]   (default port 9222)
 import json
 import sys
 import time
+
+import redact
 import urllib.request
 
 import websocket  # websocket-client
@@ -28,6 +30,18 @@ SNAP_EXPR = (
     "? window.__interceptify.snapshot() : {err:'no-interceptify'})"
 )
 
+
+
+def redact_snapshot(node):
+    """Walk the snapshot and redact EVERY string in it, not just the URL-shaped
+    ones.
+
+    This used to skip any string without "://" in it, which meant response
+    bodies - the metaLog carries up to 4000 characters of them - were written to
+    disk verbatim by a function named redact_snapshot. An embedded JSON
+    access_token survived the whole "redaction" path untouched.
+    """
+    return redact.redact_any(node)
 
 def list_targets():
     with urllib.request.urlopen("http://127.0.0.1:%d/json" % PORT, timeout=5) as r:
@@ -57,7 +71,20 @@ def eval_expr(ws_url, expr):
     return None, "timeout"
 
 
+def warn_if_piling_up(pattern: str = "capture_*.json", limit: int = 10) -> None:
+    """Say when diagnostics are accumulating. They are redacted, not harmless:
+    a capture still describes what was playing and when. Nothing here deletes
+    anything - `python selfheal.py --scrub` lists them and only removes them
+    when told to."""
+    import pathlib
+    files = sorted(pathlib.Path(__file__).resolve().parent.glob(pattern))
+    if len(files) >= limit:
+        print(f"NOTE: {len(files)} {pattern} files in the project directory. "
+              f"Review and clear them with: python selfheal.py --scrub")
+
+
 def main():
+    warn_if_piling_up()
     try:
         targets = list_targets()
     except Exception as e:
@@ -74,15 +101,24 @@ def main():
                 snap = val
                 break
         except Exception as e:
-            print("  (target %s: %s)" % (t.get("url", "")[:50], e))
+            # Even the error paths print through the redactor. A CDP target URL
+            # is a Spotify renderer URL, and these two lines were the one place
+            # a raw one still reached the terminal.
+            print("  (target %s: %s)" % (redact.redact_url(t.get("url", ""))[:60], e))
 
     if not snap:
         print("No __interceptify.snapshot found on any page target.")
-        print("Targets seen:", [t.get("url", "")[:60] for t in pages])
+        print("Targets seen:", [redact.redact_url(t.get("url", ""))[:60] for t in pages])
         print("Make sure Spotify is patched AND running with Debug capture mode ON.")
         sys.exit(2)
 
-    data = json.loads(snap)
+    # The snapshot is a live dump of Spotify's authenticated renderer: request
+    # URLs and response bodies in it carry access tokens and account
+    # identifiers. Redact ONCE, up front, and print from the redacted copy.
+    # Splitting it - redacted to the file, raw to the terminal - meant the
+    # credentials were still on screen, in the scrollback, and in whatever the
+    # user pasted into a bug report.
+    data = redact_snapshot(json.loads(snap))
     out = "capture_%s.json" % time.strftime("%Y%m%d-%H%M%S")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

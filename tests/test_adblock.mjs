@@ -656,13 +656,18 @@ function wireInStreamProvider(env, fixture) {
     inStreamAd: null,
     skipToNext() { fixture.counts.skipToNext++; },
   };
-  // NB: this factory's SOURCE must not contain BOTH "getInStreamAd" and
-  // "inStreamApi" or the hook takes its require.d fast-path. It exports d()
-  // (api accessor) + m() (ad accessor) so wrapInStreamExports accepts it.
+  // The factory's SOURCE carries both provider signatures ("getInStreamAd" and
+  // "inStreamApi"), because the hook now REQUIRES the module at the fallback id
+  // to look like the provider before it will wrap it - a bundler id existing is
+  // not evidence that the same thing still lives there. The require.d fast-path
+  // those needles also select is unreachable here: this fixture invokes the
+  // factory with `require === undefined`, so `require.d` throws and the hook
+  // falls through to the generic wrapInStreamExports path, which is the path
+  // TEST C is about.
   function providerFactory(module) {
     module.exports = {
-      d: function () { return providerApi; },
-      m: function () { return providerApi.inStreamAd; },
+      d: function () { return providerApi; },              // inStreamApi accessor
+      m: function () { return providerApi.inStreamAd; },   // getInStreamAd accessor
     };
   }
   // 46849 == CFG.instreamModuleFallbackId; the hook replaces it with a wrapper.
@@ -824,6 +829,611 @@ function testD() {
 }
 
 // ===========================================================================
+// TEST F — ONE ADVANCING PRIMITIVE PER DECISION
+// advance() used to fire every primitive it had in a single pass: an override
+// skip, the in-stream skipToNext, a next-track click, a seek burst and an
+// ad-video 'ended'. All five advance the play queue on their own, so one ad
+// decision issued up to five advances and relied on dedupe keys plus timing to
+// avoid running into the next track. This asserts the ladder: one primitive per
+// gated decision, escalating only on a later tick that re-passed the gate.
+// ===========================================================================
+function testF() {
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST F"); };
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("F.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  if (typeof env.checkTick !== "function") { assert("F.capture: check() tick captured", false); return; }
+  const check = env.checkTick;
+  const tick = (ms = 500) => { clock.advance(ms); try { check(); } catch (e) {} };
+
+  // Paint a confirmed ad and hold it there, so the gate keeps passing and the
+  // ladder is free to escalate as far as it wants to.
+  fixture.nowPlayingTitle = "Advertisement";
+  env.sandbox.document.title = "Advertisement";
+  setAdPainted(fixture);
+
+  let maxPerTick = 0;
+  for (let i = 0; i < 6; i++) {
+    const before = totalAdvanceActions(fixture);
+    tick(500);
+    maxPerTick = Math.max(maxPerTick, totalAdvanceActions(fixture) - before);
+  }
+  assert("F1 (ONE PRIMITIVE): a single gated decision never fires more than one advancing action",
+    maxPerTick <= 1, `worst tick fired ${maxPerTick} advancing actions`);
+  assert("F2: the ad still got advanced at least once",
+    totalAdvanceActions(fixture) >= 1, `total=${totalAdvanceActions(fixture)}`);
+}
+
+// ===========================================================================
+// TEST E — L1 LIVENESS IS AN HONEST SIGNAL
+// Spotify migrated webpack -> rspack, so the payload hooked a chunk array the
+// bundle never pushed to: the whole L1 layer was dead while looking installed.
+// The fix hooks every candidate name and arms a watchdog. That watchdog is only
+// worth having if its input cannot be self-satisfied — the first cut bound the
+// push handle AFTER wrapping, so our own bootstrap push set the "alive" flag
+// and the watchdog could never fire on any build, ever.
+//
+// E1 is the regression: with NO bundle push, liveness must read false.
+// ===========================================================================
+function fireL1Watchdog(env) {
+  const w = env.timeouts.find((t) => t.ms === 20000);
+  if (w) w.fn();
+  return !!w;
+}
+
+function testE() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST E"); };
+
+  // ---- E1 + E3: nothing but our own bootstrap push ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    assert("E.load: adblock.js loaded without throwing", env.loadError === null,
+      env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+    const win = env.sandbox.window;
+
+    assert("E1 (SELF-SATISFYING SIGNAL): our own bootstrap push must NOT mark L1 alive",
+      win.__interceptify_l1_fired === false, `l1_fired=${win.__interceptify_l1_fired}`);
+
+    const armed = fireL1Watchdog(env);
+    assert("E2: a dead-hook watchdog was actually armed", armed, "no 20000ms timeout registered");
+    assert("E3: with no bundle push the watchdog declares L1 dead",
+      !!win.__interceptify_l1_dead, JSON.stringify(win.__interceptify_l1_dead));
+    const h = win.__interceptify.health();
+    assert("E4: health() reports the dead hook (this is what selfheal.py reads)",
+      h.l1Hooked === false && !!h.l1Dead, `l1Hooked=${h.l1Hooked} l1Dead=${JSON.stringify(h.l1Dead)}`);
+  }
+
+  // ---- E5 + E6: a real bundle push ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const win = env.sandbox.window;
+    win.webpackChunkclient_web.push([["bundle-chunk"], {}]);
+    assert("E5: a push from the bundle DOES mark L1 alive",
+      win.__interceptify_l1_fired === true, `l1_fired=${win.__interceptify_l1_fired}`);
+
+    fireL1Watchdog(env);
+    assert("E6: the watchdog stays silent once the hook has genuinely fired",
+      !win.__interceptify_l1_dead && win.__interceptify.health().l1Hooked === true,
+      JSON.stringify(win.__interceptify_l1_dead));
+
+    // health().layers must read the world, not a "we called the installer" flag.
+    const layers = win.__interceptify.health().layers;
+    assert("E7: health().layers reports fetch/xhr from actual hook evidence",
+      layers.fetch === (typeof win.fetch === "function" && win.fetch.__interceptify_hooked === true)
+      && layers.xhr === (env.sandbox.XMLHttpRequest.prototype.__interceptify_url_block_hooked === true)
+      && layers.fetch === true,
+      JSON.stringify(layers));
+    assert("E8: health().layerErrors exists and no layer threw on install",
+      Array.isArray(win.__interceptify.health().layerErrors)
+      && win.__interceptify.health().layerErrors.length === 0,
+      JSON.stringify(win.__interceptify.health().layerErrors));
+  }
+}
+
+// ===========================================================================
+// TEST G — A REUSED BUNDLER ID MUST NOT PASS FOR THE AD PROVIDER
+//
+// instreamModuleFallbackId is a fast-path hint, and the hook used to accept it
+// on presence alone: `map[46849]` existing was treated as "the provider is at
+// 46849". Bundler ids are recycled between builds, so a rebuild that moved the
+// provider and left something unrelated at the old id would get that unrelated
+// module wrapped, report a successful hook, and block nothing - while the source
+// scan that would have found the real one only ran when the id was ABSENT.
+//
+// G1: a non-provider sitting at the fallback id is refused.
+// G2: the real provider, at a different id, is found by the source scan anyway.
+// ===========================================================================
+function testG() {
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST G"); };
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("G.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const chunk = env.sandbox.window.webpackChunkclient_web;
+  if (!Array.isArray(chunk)) { assert("G.capture: chunk array present", false); return; }
+
+  // Something else entirely, now living at the id the config remembers.
+  function strangerFactory(module) { module.exports = { hello: function () { return 1; } }; }
+  chunk.push([["test-recycled-id-chunk"], { 46849: strangerFactory }]);
+  const afterPush = chunk[chunk.length - 1][1][46849];
+  assert("G1 (RECYCLED ID): a module that is not the provider is NOT wrapped",
+    afterPush === strangerFactory && !afterPush.__interceptify_wrapped,
+    afterPush && afterPush.__interceptify_wrapped ? "it was wrapped anyway" : "");
+  assert("G2: the stale hint is reported rather than silently trusted",
+    String(env.sandbox.window.__interceptify_fallback_id_stale) === "46849",
+    `flag=${env.sandbox.window.__interceptify_fallback_id_stale}`);
+}
+
+// ===========================================================================
+// TEST H — L1 READINESS IS ABOUT THE PROVIDER, NOT ABOUT ANY PUSH
+//
+// health().layers.l1Chunk means "the bundle is pushing through our wrapper",
+// and ANY chunk push sets it - including a push carrying nothing to do with
+// ads. It was the only L1 signal, so a Spotify bundle-layout change could leave
+// the ad provider completely unwrapped while the layer still reported green and
+// verification still passed.
+//
+// l1Provider is the claim that matters: we found the in-stream provider and
+// wrapped it. The two must be able to disagree.
+// ===========================================================================
+function testH() {
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST H"); };
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("H.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const chunk = env.sandbox.window.webpackChunkclient_web;
+  if (!Array.isArray(chunk)) { assert("H.capture: chunk array present", false); return; }
+  const layers = () => env.sandbox.window.__interceptify.health().layers;
+
+  // A push of something entirely unrelated to ads.
+  function unrelatedFactory(module) { module.exports = { paintTheSidebar: () => 1 }; }
+  chunk.push([["test-unrelated-chunk"], { 12345: unrelatedFactory }]);
+
+  assert("H1: an unrelated bundle push marks the chunk hook alive",
+    layers().l1Chunk === true, `l1Chunk=${layers().l1Chunk}`);
+  assert("H2 (THE POINT): ...but does NOT claim the ad provider is hooked",
+    layers().l1Provider === false, `l1Provider=${layers().l1Provider}`);
+
+  // Now the real provider turns up.
+  const wired = wireInStreamProvider(env, fixture);
+  assert("H3: wiring the real provider is what turns l1Provider green",
+    !!(wired && wired.api) && layers().l1Provider === true,
+    `wired=${!!wired} l1Provider=${layers().l1Provider}`);
+}
+
+// ===========================================================================
+// TEST I — A LATE AUDIO AD OBJECT MUST NOT SKIP THE SONG WE JUST STARTED
+//
+// The pre-paint fast path treats format===AUDIO as self-sufficient evidence, on
+// the reasoning that a fresh audio ad object IS an audio ad. That holds when it
+// arrives at the start of a break. It does not hold for a delayed or prefetched
+// object that turns up AFTER we already advanced past the break, because by
+// then the thing playing is a real song - and this path bypasses the FSM's
+// cooldown entirely, so nothing else was going to stop it.
+//
+// The queue-advance clock is now shared: the L1 skip records it too, so the
+// window after a skip is visible to the guard whether the skip came from
+// advance() or from L1.
+// ===========================================================================
+function testI() {
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST I"); };
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("I.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const wired = wireInStreamProvider(env, fixture);
+  assert("I.wire: in-stream provider hook installed", !!(wired && wired.api));
+  if (!wired || !wired.api) return;
+  const api = wired.api;
+
+  // A genuine break: ad object arrives, we skip it pre-paint. This is the
+  // feature and it must keep working.
+  fixture.nowPlayingTitle = "Advertisement";
+  env.sandbox.document.title = "Advertisement";
+  const before = fixture.counts.skipToNext;
+  api.inStreamAd = { adId: "ad-first", format: 1, clickThroughUrl: "https://x/1" };
+  assert("I1: a fresh AUDIO ad still skips pre-paint (the silent-skip feature)",
+    fixture.counts.skipToNext === before + 1, `skips=${fixture.counts.skipToNext - before}`);
+
+  // The skip lands on a real song. Then a DIFFERENT audio ad object shows up
+  // late - a prefetch, or a re-delivery of the break we already handled.
+  fixture.nowPlayingTitle = "Real Song One";
+  fixture.nowPlayingSubtitle = "Some Artist";
+  env.sandbox.document.title = "Real Song One";
+  fixture.present.delete('[data-testid="ad-controls"]');
+  env.sandbox.window.__interceptify_ad_active = false;
+  clock.advance(600);                       // past the 300ms self-lock, inside the guard window
+
+  const beforeLate = fixture.counts.skipToNext;
+  api.inStreamAd = { adId: "ad-late", format: 1, clickThroughUrl: "https://x/2" };
+  assert("I2 (OVER-SKIP): a late AUDIO object does NOT skip the real song",
+    fixture.counts.skipToNext === beforeLate,
+    `it skipped ${fixture.counts.skipToNext - beforeLate}x onto "${fixture.nowPlayingTitle}"`);
+
+  // Far enough past the advance, a fresh break is authoritative again - the
+  // guard is a window, not a permanent downgrade.
+  clock.advance(5000);
+  const beforeNext = fixture.counts.skipToNext;
+  fixture.nowPlayingTitle = "Advertisement";
+  env.sandbox.document.title = "Advertisement";
+  api.inStreamAd = { adId: "ad-next-break", format: 1, clickThroughUrl: "https://x/3" };
+  assert("I3: a later break is still skipped pre-paint (the guard is a window)",
+    fixture.counts.skipToNext === beforeNext + 1,
+    `skips=${fixture.counts.skipToNext - beforeNext}`);
+}
+
+// ===========================================================================
+// A stub of Spotify's ads core connector, shaped like the real one.
+//
+// `state` starts EMPTY on purpose and `getAdState` resolves asynchronously,
+// because that is what the live client does: measured on 1.2.94, the connector
+// answers ~2.3s after launch with ad_enabled still "true", and the gate first
+// reads closed at ~3.6s. Anything that reports protection has to survive that
+// window honestly.
+// ===========================================================================
+function makeConnectorStub(opts = {}) {
+  const state = {};
+  for (const [k, v] of Object.entries(opts.initialState || {})) state[k] = { value: String(v) };
+  const calls = { clearSlot: [], putState: [], triggerSlot: [] };
+  let adCallback = null;
+  let emptyReadsLeft = opts.emptyReads || 0;
+  return {
+    calls,
+    raw: state,
+    deliver(ad) { if (adCallback) adCallback({ ad }); },
+    getAdState() {
+      if (emptyReadsLeft > 0) { emptyReadsLeft--; return Promise.resolve({ state: {} }); }
+      return Promise.resolve({ state });
+    },
+    putState(k, v) { calls.putState.push([k, v]); state[k] = { value: String(v) }; },
+    clearSlot(slot, reason) {
+      calls.clearSlot.push({ slot, reason });
+      if (opts.clearSlotRejects) return Promise.reject(new Error("clearSlot refused"));
+      if (opts.clearSlotNeverResolves) return new Promise(() => {});
+      return Promise.resolve();
+    },
+    subscribeToInStreamAds(cb) { adCallback = cb; },
+    updateAdStateEndpoint() {},
+    updateAdServerEndpoint() {},
+  };
+}
+
+const flush = () => new Promise((r) => setImmediate(r));
+
+// ===========================================================================
+// TEST J — THE SLOT NAME, AND WHAT "PROTECTED" MEANS
+//
+// Interceptify cleared slot "streaming". Spotify has no such slot: its bundle
+// defines STREAM_SLOT_ID = "stream", and 25/25 delivered in-stream ads in this
+// install's own captures carry slot "stream". So every clearSlot() call for the
+// one slot that reaches the user's ears addressed nothing, and an ad queued
+// before the gate closed was never flushed - it just waited for the next track
+// boundary. `ad_enabled=false` stops NEW scheduling; it cannot un-queue.
+//
+// J1/J2: the canonical slot is used, and discovered rather than trusted.
+// J3-J5: "protected" requires the gate read back closed AND the slot flush
+//        acknowledged - not merely called, because clearSlot is async and this
+//        used to be fire-and-forget.
+// ===========================================================================
+async function testJ() {
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST J"); };
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("J.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const W = env.sandbox.window;
+  const slots = W.__interceptify.health().adSlots || [];
+  assert("J1 (THE BUG): the interruptive audio slot is 'stream', not 'streaming'",
+    slots[0] === "stream" && !slots.includes("streaming"), `slots=${JSON.stringify(slots)}`);
+
+  // A build that renames the slot must be followed, not overridden by our list.
+  W.__webpack_modules__ = {
+    900: function fakeSlotModule() { return 'STREAM_SLOT_ID="audio-stream",HPTO_SLOT_ID="hpto"'; },
+  };
+  delete W.__interceptify_discovered_slots;
+  const env2 = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+  env2.sandbox.window.__webpack_modules__ = W.__webpack_modules__;
+  const found = env2.sandbox.window.__interceptify.health().adSlots || [];
+  assert("J2: slot ids are read from the live bundle, so a rename is followed",
+    found.includes("audio-stream"), `slots=${JSON.stringify(found)}`);
+
+  // ---- readiness ----
+  const env3 = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+  const W3 = env3.sandbox.window;
+  const h3 = () => W3.__interceptify.health();
+  assert("J3: with no connector, protection is NOT reported as ready",
+    h3().protectionReady === false && h3().notReady.includes("connector"),
+    JSON.stringify(h3().notReady));
+
+  const conn = makeConnectorStub({ initialState: { ad_enabled: "true" }, clearSlotNeverResolves: true });
+  W3.__interceptify_ads_connector = conn;
+  W3.__interceptify_instream_api = { adsCoreConnector: conn, skipToNext() {} };
+  W3.__interceptify_l1_provider_wrapped = true;
+  // The total-block maintenance runs on its own interval (CFG.totalBlockIntervalMs),
+  // not on the 500ms FSM tick. Drive every non-FSM interval a few times: the
+  // first pass sees an empty baseline, a later one writes the gate and flushes.
+  const maintenance = env3.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) {
+    for (const fn of maintenance) { try { fn(); } catch {} }
+    await flush();
+  }
+  const cleared = conn.calls.clearSlot.map((c) => c.slot);
+  assert("J4: the flush targets the canonical slot first",
+    cleared[0] === "stream", `cleared=${JSON.stringify(cleared.slice(0, 3))}`);
+  assert("J5 (ASYNC): a clearSlot that never resolves is NOT counted as protected",
+    h3().protectionReady === false && h3().notReady.includes("slotCleared"),
+    `ready=${h3().protectionReady} notReady=${JSON.stringify(h3().notReady)}`);
+
+  // A build whose clearSlot returns nothing to await is UNCONFIRMABLE, not
+  // failed. Treating the two the same would make a structural PASS unreachable
+  // there, and an unreachable PASS turns the self-heal into a permanent repair
+  // loop that restarts Spotify forever - a failure this project has already had
+  // once. Report the gap; do not punish it.
+  const env4 = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+  const W4 = env4.sandbox.window;
+  const syncConn = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  syncConn.clearSlot = function (slot) { syncConn.calls.clearSlot.push({ slot }); };  // no promise
+  W4.__interceptify_ads_connector = syncConn;
+  W4.__interceptify_instream_api = { adsCoreConnector: syncConn, skipToNext() {} };
+  W4.__interceptify_l1_provider_wrapped = true;
+  const maint4 = env4.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint4) { try { fn(); } catch {} } await flush(); }
+  const h4 = W4.__interceptify.health();
+  assert("J6: a clearSlot with nothing to await is unconfirmed, not a failure",
+    !h4.notReady.includes("slotCleared") && h4.slotClearConfirmed === false,
+    `notReady=${JSON.stringify(h4.notReady)} confirmed=${h4.slotClearConfirmed}`);
+}
+
+// ===========================================================================
+// TEST K — THE REAL PRE-PAINT CALLBACK SHAPE
+//
+// Every captured in-stream ad on this install looks like this: no top-level
+// `format`, slot "stream", and the audio classification only in
+// metadata.product_name = "audio_ad" / metadata.format = "audio/ogg". The fast
+// pre-paint path asked ONLY for `ad.format === 1 || "AUDIO"`.
+//
+// If the live object has no top-level format - which the captures cannot settle,
+// because the serializer is a whitelist that never recorded it - then the silent
+// skip never fired on a real ad and every break waited for the DOM instead.
+// Accept either, so the answer stops mattering.
+// ===========================================================================
+function testK() {
+  const clock = makeClock();
+  const fixture = makeFixture();
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST K"); };
+  const env = loadAdblock({ fixture, clock, baseFetch });
+  assert("K.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const wired = wireInStreamProvider(env, fixture);
+  assert("K.wire: in-stream provider hook installed", !!(wired && wired.api));
+  if (!wired || !wired.api) return;
+
+  // Exactly the shape from capture_20260613-210549.json, with NO ad DOM yet.
+  const realAd = {
+    adId: "dc55a42182f44e2b89a2593b969d19f1",
+    requestId: "ec2b0d42-fc90-483d-afe2-be57588315dd",
+    slot: "stream",
+    clickthroughUrl: "spotify:playlist:37i9dQZF1DWTh5RC6ek3nb",
+    advertiser: "La Roche-Posay",
+    metadata: { product_name: "audio_ad", format: "audio/ogg", advertiser: "La Roche-Posay" },
+  };
+  fixture.present.delete('[data-testid="ad-controls"]');   // pre-paint: no ad UI
+  env.sandbox.document.title = "Spotify";                  // and no ad-ish title
+  const before = fixture.counts.skipToNext;
+  wired.api.inStreamAd = realAd;
+  assert("K1 (PRE-PAINT): the real callback shape is treated as an audio ad and skipped",
+    fixture.counts.skipToNext === before + 1,
+    `skips=${fixture.counts.skipToNext - before} (no top-level format; audio_ad is in metadata)`);
+}
+
+// ===========================================================================
+// TEST L — A DELIVERED AD IS CONTAINED, BEFORE AND AFTER READINESS
+//
+// The tripwire observed deliveries and did essentially nothing with them.
+// Before readiness it called armMute() alone: ad_active was never set, so the
+// ~2s watchdog saw "no ad" and un-muted while the ad was still playing - mute,
+// then unmute, then the ad. After readiness it did not even mute; it left
+// everything to the DOM FSM's 500ms poll plus two-tick confirmation, in the one
+// case where a layer has already provably failed.
+//
+// L1/L2: pre-readiness delivery mutes AND survives a watchdog pass.
+// L3:    post-readiness delivery is contained too (readiness is not a licence
+//        to do nothing - a delivery means something already failed).
+// L4:    the hold is bounded, so containment can never pin a real song silent.
+// ===========================================================================
+async function testL() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST L"); };
+
+  // ---- pre-readiness: no connector resolved, no gate, no slot flush ----
+  const clock = makeClock();
+  const env = loadAdblock({ fixture: makeFixture(), clock, baseFetch });
+  assert("L.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const W = env.sandbox.window;
+  const conn = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  // Reachable connector so the tripwire arms, but the L1 provider is NOT wrapped
+  // - so this stays genuinely pre-readiness, which is the whole point of L1/L2.
+  W.__interceptify_ads_connector = conn;
+  W.__interceptify_instream_api = { adsCoreConnector: conn };
+  const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+  const h0 = W.__interceptify.health();
+  assert("L0: the fixture really is pre-readiness (otherwise L1/L2 prove nothing)",
+    h0.protectionReady === false && W.__interceptify_tripwire === true,
+    `notReady=${JSON.stringify(h0.notReady)} tripwire=${W.__interceptify_tripwire}`);
+
+  // The observable is the MUTE BUTTON's real state, not our own hold timer. An
+  // assertion on the timer would pass even with the watchdog fix reverted -
+  // it would be measuring our intent instead of the audio the user hears.
+  const muteBtn = env.nodes.muteNode;
+  conn.deliver({ adId: "pre-ready-1", slot: "stream",
+                 metadata: { product_name: "audio_ad", format: "audio/ogg" } });
+  await flush();
+  assert("L1: an ad delivered before readiness is muted at once",
+    muteBtn._muted === true,
+    `muted=${muteBtn._muted} clicks=${env.sandbox.window.__interceptify ? "" : ""}`);
+
+  // THE REGRESSION: the watchdog is what used to undo that mute two seconds
+  // later, because the tripwire never set ad_active and the watchdog reads
+  // "no ad in progress" as "restore the audio".
+  const watchdog = env.intervals.filter((i) => i.ms === 2000).map((i) => i.fn);
+  clock.advance(2000);
+  for (const fn of watchdog) { try { fn(); } catch {} }
+  assert("L2 (THE REGRESSION): the watchdog does NOT un-mute an ad that is still playing",
+    muteBtn._muted === true,
+    `muted=${muteBtn._muted} (was: watchdog saw ad_active=false and restored audio mid-ad)`);
+
+  // ...and it DOES restore once the bounded hold expires, so a stuck hold can
+  // never leave the user silent.
+  clock.advance(40000);
+  for (const fn of watchdog) { try { fn(); } catch {} }
+  assert("L2b: once the hold expires the watchdog restores audio as before",
+    muteBtn._muted === false, `muted=${muteBtn._muted}`);
+
+  // ---- post-readiness delivery ----
+  const clock3 = makeClock();
+  const env3 = loadAdblock({ fixture: makeFixture(), clock: clock3, baseFetch });
+  const W3 = env3.sandbox.window;
+  const conn3 = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  W3.__interceptify_ads_connector = conn3;
+  W3.__interceptify_instream_api = { adsCoreConnector: conn3, skipToNext() {} };
+  W3.__interceptify_l1_provider_wrapped = true;
+  const maint3 = env3.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint3) { try { fn(); } catch {} } await flush(); }
+  const ready = W3.__interceptify.health();
+  assert("L3.setup: this fixture IS ready (otherwise L3 tests the wrong branch)",
+    ready.protectionReady === true, JSON.stringify(ready.notReady));
+
+  const clearsBefore = conn3.calls.clearSlot.length;
+  conn3.deliver({ adId: "post-ready-1", slot: "stream",
+                  metadata: { product_name: "audio_ad", format: "audio/ogg" } });
+  await flush();
+  const h3 = W3.__interceptify.health();
+  assert("L3: a delivery through an ESTABLISHED block is contained, not just logged",
+    h3.containHeldMs > 0 && conn3.calls.clearSlot.length > clearsBefore,
+    `held=${h3.containHeldMs} clears=${conn3.calls.clearSlot.length - clearsBefore}`);
+
+  // ---- the hold is bounded ----
+  clock3.advance(40000);                       // past tripwireHoldMaxMs
+  const h4 = W3.__interceptify.health();
+  assert("L4: the containment hold expires, so it can never silence a real song",
+    h4.containHeldMs <= 0, `heldMs=${h4.containHeldMs}`);
+}
+
+// ===========================================================================
+// TEST M — STALE EVIDENCE IS NOT EVIDENCE
+//
+// Readiness is built entirely on answers that arrive asynchronously over a live
+// RPC, and every one of them was a latched boolean with no expiry:
+//   M1  a gate read that succeeded once stayed authoritative even after every
+//       later getAdState() rejected;
+//   M2  a reading nobody has refreshed for a long time still counted as "the
+//       gate is closed" - it describes a client that may no longer exist;
+//   M3  a slot clear acknowledged once stayed acknowledged even when the NEXT
+//       attempt never resolved (the old result was never invalidated).
+//   M4  discovery could not correct the one value that matters: a renamed
+//       primary slot was appended to the list while the dead configured name
+//       stayed primary, cleared first and driving readiness.
+// ===========================================================================
+async function testM() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST M"); };
+  const clock = makeClock();
+  const env = loadAdblock({ fixture: makeFixture(), clock, baseFetch });
+  assert("M.load: adblock.js loaded without throwing", env.loadError === null,
+    env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+  const W = env.sandbox.window;
+  const conn = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  W.__interceptify_ads_connector = conn;
+  W.__interceptify_instream_api = { adsCoreConnector: conn, skipToNext() {} };
+  W.__interceptify_l1_provider_wrapped = true;
+  const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+  assert("M.setup: the gate reads closed and protection is ready",
+    W.__interceptify.health().protectionReady === true,
+    JSON.stringify(W.__interceptify.health().notReady));
+
+  // M1 — the channel the gate lives on starts failing.
+  conn.getAdState = () => Promise.reject(new Error("core disconnected"));
+  for (const fn of maint) { try { fn(); } catch {} }
+  await flush();
+  const h1 = W.__interceptify.health();
+  assert("M1: a REJECTED gate read invalidates the old 'closed', it is not ignored",
+    h1.protectionReady === false && h1.notReady.includes("gateClosed"),
+    `ready=${h1.protectionReady} notReady=${JSON.stringify(h1.notReady)} err=${h1.gateError}`);
+
+  // M2 — a reading that simply stops being refreshed goes stale.
+  const clock2 = makeClock();
+  const env2 = loadAdblock({ fixture: makeFixture(), clock: clock2, baseFetch });
+  const W2 = env2.sandbox.window;
+  const conn2 = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  W2.__interceptify_ads_connector = conn2;
+  W2.__interceptify_instream_api = { adsCoreConnector: conn2, skipToNext() {} };
+  W2.__interceptify_l1_provider_wrapped = true;
+  const maint2 = env2.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint2) { try { fn(); } catch {} } await flush(); }
+  assert("M2.setup: ready before the clock moves",
+    W2.__interceptify.health().protectionReady === true);
+  clock2.advance(60000);                       // past gateMaxAgeMs, no refresh runs
+  const h2 = W2.__interceptify.health();
+  assert("M2: a gate reading nobody refreshed stops counting as evidence",
+    h2.protectionReady === false && h2.notReady.includes("gateStale"),
+    `ageMs=${h2.gateReadAgeMs} notReady=${JSON.stringify(h2.notReady)}`);
+
+  // M3 — one acknowledged clear, then a clear that never resolves.
+  const clock3 = makeClock();
+  const env3 = loadAdblock({ fixture: makeFixture(), clock: clock3, baseFetch });
+  const W3 = env3.sandbox.window;
+  const conn3 = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  W3.__interceptify_ads_connector = conn3;
+  W3.__interceptify_instream_api = { adsCoreConnector: conn3, skipToNext() {} };
+  W3.__interceptify_l1_provider_wrapped = true;
+  const maint3 = env3.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint3) { try { fn(); } catch {} } await flush(); }
+  assert("M3.setup: the first flush was acknowledged",
+    W3.__interceptify.health().slotClearConfirmed === true,
+    JSON.stringify(W3.__interceptify.health().slotClear));
+  conn3.clearSlot = function (slot) { conn3.calls.clearSlot.push({ slot }); return new Promise(() => {}); };
+  for (const fn of maint3) { try { fn(); } catch {} }
+  await flush();
+  clock3.advance(10000);                       // past slotClearPendingMs
+  const h3 = W3.__interceptify.health();
+  assert("M3: a superseding clear that never resolves invalidates the old acknowledgement",
+    h3.protectionReady === false && h3.notReady.includes("slotCleared"),
+    `confirmed=${h3.slotClearConfirmed} notReady=${JSON.stringify(h3.notReady)}`);
+
+  // M4 — Spotify renames the interruptive audio slot.
+  const env4 = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+  const W4 = env4.sandbox.window;
+  W4.__webpack_modules__ = {
+    900: function fakeSlotModule() {
+      return 'STREAM_SLOT_ID="audio-stream",HPTO_SLOT_ID="hpto",PODCAST_MIDROLL_SLOT_ID="podcast-midroll-1"';
+    },
+  };
+  const conn4 = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+  W4.__interceptify_ads_connector = conn4;
+  W4.__interceptify_instream_api = { adsCoreConnector: conn4, skipToNext() {} };
+  W4.__interceptify_l1_provider_wrapped = true;
+  const maint4 = env4.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+  for (let i = 0; i < 4; i++) { for (const fn of maint4) { try { fn(); } catch {} } await flush(); }
+  const h4 = W4.__interceptify.health();
+  const cleared4 = conn4.calls.clearSlot.map((c) => c.slot);
+  assert("M4: a RENAMED primary slot is promoted, cleared first, and drives readiness",
+    h4.primarySlot === "audio-stream" && cleared4[0] === "audio-stream"
+      && h4.slotClear.slot === "audio-stream",
+    `primary=${h4.primarySlot} firstCleared=${cleared4[0]} ackFor=${h4.slotClear.slot}`);
+  assert("M4b: the promotion does not pick a podcast slot",
+    h4.primarySlot !== "podcast-midroll-1", `primary=${h4.primarySlot}`);
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -838,6 +1448,33 @@ async function main() {
   }
   try { testD(); } catch (e) {
     assert("TEST D crashed", false, String(e && e.stack || e));
+  }
+  try { testE(); } catch (e) {
+    assert("TEST E crashed", false, String(e && e.stack || e));
+  }
+  try { testF(); } catch (e) {
+    assert("TEST F crashed", false, String(e && e.stack || e));
+  }
+  try { testG(); } catch (e) {
+    assert("TEST G crashed", false, String(e && e.stack || e));
+  }
+  try { testH(); } catch (e) {
+    assert("TEST H crashed", false, String(e && e.stack || e));
+  }
+  try { testI(); } catch (e) {
+    assert("TEST I crashed", false, String(e && e.stack || e));
+  }
+  try { await testJ(); } catch (e) {
+    assert("TEST J crashed", false, String(e && e.stack || e));
+  }
+  try { testK(); } catch (e) {
+    assert("TEST K crashed", false, String(e && e.stack || e));
+  }
+  try { await testL(); } catch (e) {
+    assert("TEST L crashed", false, String(e && e.stack || e));
+  }
+  try { await testM(); } catch (e) {
+    assert("TEST M crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

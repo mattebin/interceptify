@@ -1,2 +1,7 @@
 pystray>=0.19.5
 Pillow>=10.0.0
+# CDP client. Not optional: the packaged app runs its own self-heal
+# (`Interceptify.exe --selfheal`), and that verifies over the DevTools protocol.
+# It used to live in requirements-dev.txt, so a clean source install worked right
+# up until the first scheduled self-heal, then failed on an import.
+websocket-client>=1.7.0

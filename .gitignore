@@ -5,7 +5,6 @@ __pycache__/
 venv/
 build/
 dist/
-*.spec
 *.exe.new
 _interceptify_update.bat
 
@@ -17,6 +16,13 @@ _interceptify_update.bat
 config.json
 proxy_snapshot.json
 blocked.log
+# Per-machine overrides + whatever self-heal discovered on this install. The
+# SHIPPED defaults (extensions/adblock.config.json) ARE tracked; this is the
+# file that must survive an update, so it can never be part of one.
+extensions/adblock.config.local.json
+# Marker recording that WE turned Spotify's developer-mode flag on, so we only
+# ever turn off our own change.
+.interceptify-devtools-owned
 
 # --- Legacy network-proxy code ---
 # Spotify 1.2.88+ ignores the Windows system proxy, so the mitmproxy
@@ -48,8 +54,12 @@ netlog_*.jsonl
 sni_log.txt
 *.pcapng
 
-# Local-only self-healing automation (personal; never shipped publicly)
-selfheal.py
+# Self-healing automation. selfheal.py is now TRACKED: it is executed by three
+# scheduled tasks, and code that runs on a schedule with no version control has
+# no history and no rollback. It became shareable once the incident-log
+# destination moved out of the source and into config.json / an env var, so the
+# file no longer contains anything personal.
+# Its OUTPUTS stay ignored - they are machine state, not source.
 selfheal.state.json
 selfheal.report.json
 selfheal.log

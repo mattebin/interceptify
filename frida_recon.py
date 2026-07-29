@@ -1,7 +1,16 @@
 """Frida reconnaissance on Spotify: list processes, try to attach, enumerate
 modules + look for a TLS library / SSL_read/SSL_write exports. Tells us whether
 we can instrument Spotify from here and where the crypto lives."""
-import frida, sys
+import sys
+
+try:
+    import frida
+except ImportError:
+    # An undeclared dependency that is not in requirements.txt, because this is
+    # a research tool rather than part of the product. Saying so beats a raw
+    # ImportError traceback that looks like the script is broken.
+    sys.exit("frida is not installed. This is a diagnostic tool, not part of "
+             "Interceptify itself:\n    pip install -r requirements-dev.txt")
 
 JS = r"""
 const mods = Process.enumerateModules();

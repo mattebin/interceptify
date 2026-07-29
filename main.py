@@ -27,7 +27,7 @@ self-update from GitHub releases.
 from __future__ import annotations
 
 import atexit
-import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -35,7 +35,6 @@ import subprocess
 import sys
 import threading
 import time
-from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
 
@@ -57,7 +56,7 @@ except ImportError:
 
 
 APP_NAME = "Interceptify"
-APP_VERSION = "2.0.4"  # bump in lockstep with the GitHub tag
+APP_VERSION = "2.0.5"  # bump in lockstep with the GitHub tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("interceptify")
@@ -82,54 +81,178 @@ def bundled_root() -> Path:
     return Path(getattr(sys, "_MEIPASS", str(app_root())))
 
 
-def ensure_bundled_default(name: str) -> None:
-    target = ROOT / name
-    if target.exists():
-        return
-    src = bundled_root() / name
-    if not src.exists() or src == target:
-        return
+def sync_bundled_extensions() -> Optional[str]:
+    """Keep the injected payload in step with this executable.
+
+    Returns None on success, or a message describing why the on-disk payload is
+    NOT the one this build ships.
+
+    The old behaviour copied ``extensions/`` out of the bundle only when the
+    directory did not already exist. Combined with an updater that replaces just
+    the .exe, that meant a successful update could leave the app permanently
+    injecting the *previous* release's JavaScript - the version string moved, the
+    thing doing the actual work did not.
+
+    Three files, three different owners:
+
+      adblock.js               code. Belongs to the release; overwritten.
+      adblock.config.json      SHIPPED defaults. Also belongs to the release, so
+                               it is overwritten too. It holds Spotify-build
+                               specific module ids, selectors and regexes, and
+                               those are the values a release exists to fix. The
+                               previous "merge new keys, never touch existing
+                               ones" rule meant a corrected `instreamModuleFallbackId`
+                               could never reach anyone who already had the file.
+      adblock.config.local.json  the USER's overrides, and the machine-specific
+                               keys self-heal discovers. Never overwritten, and
+                               merged on top of the shipped defaults at patch
+                               time, so a release fix lands without discarding
+                               local knowledge.
+
+    The shipped file's sha is stamped in `.shipped-config.sha256` when we write
+    it, which is what makes "the user edited this" distinguishable from "this is
+    just the last release's copy". Content alone cannot tell those apart, and the
+    first attempt at this migration guessed - it treated every difference as a
+    user override, so a release correcting a build-volatile key recorded that
+    correction as a local override of itself and the fix never took effect.
+    """
+    src_dir = bundled_root() / "extensions"
+    dst_dir = ROOT / "extensions"
+    if not src_dir.is_dir() or src_dir == dst_dir:
+        return None
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    src_js, dst_js = src_dir / "adblock.js", dst_dir / "adblock.js"
     try:
-        if src.is_dir():
-            import shutil
-            shutil.copytree(src, target)
-        else:
-            target.write_bytes(src.read_bytes())
-        log.info("Seeded %s from bundle", name)
+        if src_js.is_file():
+            new = src_js.read_bytes()
+            if (not dst_js.exists()) or dst_js.read_bytes() != new:
+                dst_js.write_bytes(new)
+                log.info("Payload updated from bundle (%s)", APP_VERSION)
     except Exception as e:
-        log.warning("Could not seed %s: %s", name, e)
+        # This is not a warning. Every downstream integrity check compares the
+        # live patch against this external file, so a failed sync leaves the
+        # patcher and the self-heal agreeing with each other about a payload that
+        # is not the one in the build. Refusing to patch is the honest outcome.
+        log.error("Could not sync adblock.js: %s", e)
+        return (f"The payload on disk could not be updated to this build ({APP_VERSION}): {e}. "
+                f"Patching is disabled until {dst_js} is writable.")
+
+    src_cfg = src_dir / "adblock.config.json"
+    dst_cfg = dst_dir / "adblock.config.json"
+    local_cfg = dst_dir / "adblock.config.local.json"
+    # Records the sha of the shipped config THIS install last wrote. It is what
+    # makes "the user edited it" distinguishable from "it is simply the previous
+    # release's file", which is a distinction the content alone cannot make.
+    stamp = dst_dir / ".shipped-config.sha256"
+    try:
+        if not src_cfg.is_file():
+            return None
+        new_bytes = src_cfg.read_bytes()
+        new_sha = hashlib.sha256(new_bytes).hexdigest()
+
+        if not dst_cfg.exists():
+            dst_cfg.write_bytes(new_bytes)
+            stamp.write_text(new_sha, encoding="utf-8")
+            log.info("Seeded adblock.config.json from bundle")
+            return None
+
+        # An unparseable shipped config is quarantined and replaced rather than
+        # tolerated. It used to warn and continue, and the patcher would then
+        # inject an effectively empty config while everything reported success.
+        try:
+            json.loads(dst_cfg.read_text(encoding="utf-8"))
+        except Exception as e:
+            bad = dst_dir / f"adblock.config.corrupt-{time.strftime('%Y%m%d-%H%M%S')}.json"
+            dst_cfg.replace(bad)
+            dst_cfg.write_bytes(new_bytes)
+            stamp.write_text(new_sha, encoding="utf-8")
+            log.error("adblock.config.json was not valid JSON (%s). Quarantined as %s and "
+                      "restored the shipped defaults.", e, bad.name)
+            return None
+
+        cur_bytes = dst_cfg.read_bytes()
+        cur_sha = hashlib.sha256(cur_bytes).hexdigest()
+        if cur_sha == new_sha:
+            stamp.write_text(new_sha, encoding="utf-8")
+            return None
+
+        known = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else None
+        if known == cur_sha:
+            # Untouched since we wrote it. Nothing to preserve, so take the new
+            # defaults wholesale. The previous code diffed the two files and
+            # treated EVERY difference as a user override, which meant a release
+            # that corrected a module id, a selector or a gate key was recorded
+            # as a local override of itself and could never take effect.
+            dst_cfg.write_bytes(new_bytes)
+            stamp.write_text(new_sha, encoding="utf-8")
+            log.info("Shipped adblock.config.json updated from bundle")
+            return None
+
+        # Modified, or from before this install started stamping. We cannot tell
+        # a deliberate edit from a stale release's file, and guessing in either
+        # direction is a way to be wrong silently - keep the old values and the
+        # fix never lands; drop them and the user's work disappears. So: install
+        # the new defaults (the fix lands), and set the old file aside intact
+        # under a name that says what it is.
+        keep = dst_dir / f"adblock.config.superseded-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        keep.write_bytes(cur_bytes)
+        dst_cfg.write_bytes(new_bytes)
+        stamp.write_text(new_sha, encoding="utf-8")
+        log.warning("adblock.config.json had been modified. The new shipped defaults are now "
+                    "active and your previous file is kept at %s — copy anything you meant to "
+                    "change into adblock.config.local.json, which is never overwritten.",
+                    keep.name)
+    except Exception as e:
+        log.warning("Could not update adblock.config.json: %s", e)
+    return None
 
 
 ROOT = app_root()
 CONFIG_PATH = ROOT / "config.json"
 
-# First-run: copy editable defaults out of the PyInstaller bundle
-ensure_bundled_default("extensions")
+# Every start, not just the first: an update that changes the payload has to
+# reach the payload on disk, because that is the file the patcher injects. A
+# failure here is fatal to patching rather than advisory - see the docstring.
+spotify_patcher.PAYLOAD_SYNC_ERROR = sync_bundled_extensions()
 
 
 # ---------------------------------------------------------------------------
-# Elevation
+# Privileges
+#
+# Interceptify runs as the invoking user. It used to demand Administrator and
+# self-elevate on launch, which was both unnecessary and actively harmful:
+# Spotify's xpui.spa, its prefs and our own config are all owned by the logged-in
+# user with full control, so elevation bought no capability at all. What it did
+# buy was a privilege-escalation shape - a high-integrity process launched from a
+# directory that grants BUILTIN\Users:(M), so anything able to write there gets
+# its code run elevated.
+#
+# The honest replacement is a writability preflight: check the one file we
+# actually need to modify and say precisely what is wrong when we cannot.
 # ---------------------------------------------------------------------------
 
-def is_admin() -> bool:
+def xpui_write_problem() -> Optional[str]:
+    """Why we could not patch, or None if the path is writable.
+
+    Opening for append is the real test. Checking an ACL, or checking whether we
+    happen to be admin, answers a different question than "can this process
+    modify this file" - which is the only question that matters here.
+    """
+    xpui = spotify_patcher.spotify_xpui_path()
+    if not xpui.exists():
+        return None                      # not installed is a separate condition
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def relaunch_as_admin() -> None:
-    rc = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, f'"{sys.argv[0]}"', None, 1
-    )
-    if rc <= 32:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            f"{APP_NAME} requires Administrator privileges to write Spotify's xpui.spa.",
-            APP_NAME,
-            0x10,
-        )
-    sys.exit(0)
+        with open(xpui, "ab"):
+            pass
+        return None
+    except PermissionError:
+        if spotify_patcher.is_spotify_running():
+            return "Spotify has xpui.spa open. Close Spotify and try again."
+        return (f"No write access to {xpui}. Interceptify runs as you, not as "
+                f"Administrator, so this file must be writable by your account.")
+    except OSError as e:
+        return f"Cannot open {xpui}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +316,7 @@ class InterceptifyApp:
         self.icon: Optional[pystray.Icon] = None
         self._latest_release: Optional[self_updater.Release] = None
         self._update_in_progress = False
+        self._autostart_cache: Optional[tuple[bool, float]] = None
 
         # Optional personal feature: Spotify-update watcher that re-applies the
         # patch after a Spotify auto-update. Activates only if the local
@@ -268,6 +392,16 @@ class InterceptifyApp:
                 self.notify("Closing Spotify to apply patch...")
                 spotify_patcher.kill_spotify()
                 time.sleep(2)
+            # The writability preflight that replaced the admin gate. It was
+            # written and documented and then never actually called, so the
+            # honest error it exists to produce ("Spotify has xpui.spa open",
+            # "this file is not writable by your account") had no way to reach
+            # anyone - they got whatever the failing write happened to raise.
+            problem = xpui_write_problem()
+            if problem:
+                log.warning("patch_spotify: refused, %s", problem)
+                self.notify(problem)
+                return
             ok, msg = spotify_patcher.patch(
                 show_badge=self._current_show_badge(),
                 debug_capture=self._current_debug_capture(),
@@ -397,6 +531,16 @@ class InterceptifyApp:
         if not rel.exe_asset_url:
             self.notify(f"Latest release {rel.tag} has no Interceptify.exe asset.")
             return
+        # Refuse to update into a split deployment. The updater replaces this
+        # .exe and nothing else, so if autostart still launches a source
+        # checkout, the update lands here while the OTHER install keeps
+        # re-patching Spotify with its own older payload at every logon. Moving
+        # one of two halves forward is worse than not updating: the version
+        # string advances and the code that runs does not.
+        warn = self._deployment_warning()
+        if warn:
+            self.notify("Update blocked. " + warn)
+            return
         self._update_in_progress = True
         self.notify(f"Installing {rel.tag}...")
         threading.Thread(target=self._perform_update, args=(rel,), daemon=True).start()
@@ -420,6 +564,7 @@ class InterceptifyApp:
                 self_updater.write_updater_bat(
                     bat, current_pid=os.getpid(),
                     new_exe=new_exe.resolve(), target_exe=target_exe,
+                    expected_sha256=rel.exe_asset_sha256,
                 )
             except Exception as e:
                 self.notify(f"Updater script failed: {e}")
@@ -479,48 +624,68 @@ class InterceptifyApp:
         self.notify(f"Auto re-patch after Spotify updates: {'ON' if new_val else 'OFF'}")
 
     # ---- Run at Windows startup ----------------------------------------
+    #
+    # This used to write an HKCU\...\Run value while install_tasks.py registered
+    # a scheduled task for the same thing. Both switched on meant two trays and
+    # two self-heals, each patching xpui.spa with whatever payload its own copy
+    # of the tree held, and the survivor was whichever finished last. There is
+    # one autostart mechanism now, and this menu item drives it.
 
-    _RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    _RUN_VALUE_NAME = "Interceptify"
+    # pystray evaluates every `checked=` callback each time the menu is drawn,
+    # and answering this honestly costs four `schtasks /query` subprocesses. Read
+    # straight through, right-clicking the tray icon would stall for a
+    # noticeable fraction of a second. Cached briefly and invalidated whenever
+    # we are the ones who changed it, so the menu stays instant without ever
+    # showing a state we know to be stale.
+    _AUTOSTART_TTL = 10.0
 
-    def _autostart_command(self) -> str:
-        if getattr(sys, "frozen", False):
-            return f'"{sys.executable}"'
-        py = sys.executable
-        if py.lower().endswith("python.exe"):
-            pyw = py[:-10] + "pythonw.exe"
-            if Path(pyw).exists():
-                py = pyw
-        return f'"{py}" "{Path(__file__).resolve()}"'
-
-    def _is_autostart_enabled(self) -> bool:
+    def _is_autostart_enabled(self, fresh: bool = False) -> bool:
+        now = time.monotonic()
+        if not fresh and self._autostart_cache is not None:
+            value, at = self._autostart_cache
+            if now - at < self._AUTOSTART_TTL:
+                return value
         try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._RUN_REG_PATH, 0, winreg.KEY_READ) as k:
-                val, _ = winreg.QueryValueEx(k, self._RUN_VALUE_NAME)
-                return bool(val)
-        except (FileNotFoundError, OSError):
-            return False
+            import install_tasks
+            value = all(not install_tasks.wrong_with(install_tasks.describe(n), cmd, trg)
+                        for n, cmd, _, trg in install_tasks.tasks())
+        except Exception:
+            value = False
+        self._autostart_cache = (value, now)
+        return value
 
     def toggle_autostart(self, *_args) -> None:
-        import winreg
-        currently_on = self._is_autostart_enabled()
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._RUN_REG_PATH, 0,
-                                winreg.KEY_SET_VALUE) as k:
-                if currently_on:
-                    try:
-                        winreg.DeleteValue(k, self._RUN_VALUE_NAME)
-                    except FileNotFoundError:
-                        pass
-                    self.notify("Auto-start at Windows login: OFF")
-                else:
-                    winreg.SetValueEx(k, self._RUN_VALUE_NAME, 0, winreg.REG_SZ,
-                                      self._autostart_command())
-                    self.notify("Auto-start at Windows login: ON")
+            import install_tasks
+            if self._is_autostart_enabled(fresh=True):
+                install_tasks.remove()
+                self.notify("Auto-start at Windows login: OFF")
+            else:
+                rc = install_tasks.install()
+                self.notify("Auto-start at Windows login: ON" if rc == 0 else
+                            "Auto-start could not be fully registered - see the log.")
         except Exception as e:
             self.notify(f"Auto-start toggle failed: {e}")
+        self._autostart_cache = None       # we just changed it; never serve the old answer
         self.refresh_icon()
+
+    def _deployment_warning(self) -> Optional[str]:
+        """Autostart entries that belong to the other deployment model.
+
+        A packaged .exe that self-updates while a source checkout still owns the
+        logon tasks leaves the old source re-patching Spotify with its own
+        payload, forever. The updater only moves one of the two forward.
+        """
+        try:
+            import install_tasks
+            foreign = install_tasks.foreign_deployment_tasks()
+        except Exception:
+            return None
+        if not foreign:
+            return None
+        return ("Autostart is registered for a different Interceptify install "
+                f"({', '.join(n for n, _ in foreign)}). It can re-patch Spotify with an "
+                "older payload. Use 'Run at Windows startup' to re-register it for this one.")
 
     # ---- Exit ----------------------------------------------------------
 
@@ -603,19 +768,72 @@ class InterceptifyApp:
                 log.warning("Could not start Spotify-update watcher: %s", e)
         # Refresh tooltip once icon exists
         threading.Thread(target=lambda: (time.sleep(0.5), self.refresh_icon()), daemon=True).start()
+
+        # Say the two things that make this build lie about itself, at the one
+        # moment someone is looking at it.
+        def _startup_warnings() -> None:
+            time.sleep(2.0)
+            if spotify_patcher.PAYLOAD_SYNC_ERROR:
+                self.notify(spotify_patcher.PAYLOAD_SYNC_ERROR)
+            warn = self._deployment_warning()
+            if warn:
+                log.warning("%s", warn)
+                self.notify(warn)
+        threading.Thread(target=_startup_warnings, daemon=True).start()
         self.icon.run()
 
 
 # ---------------------------------------------------------------------------
 # Entry point
+#
+# The packaged build is the whole application, not just the tray: it carries the
+# self-heal and the scheduler too, reached as subcommands. Before this, the .exe
+# contained neither, so a packaged install could only get autostart by pointing
+# scheduled tasks at a source checkout - two deployments, two payloads, and an
+# updater that moves only one of them.
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    if not is_admin():
-        relaunch_as_admin()
+def _attach_parent_console() -> None:
+    """Give a subcommand somewhere to print.
+
+    The .exe is built windowed, which is right for a tray app and for the silent
+    scheduled runs - but it also means every `print()` in --selfheal and
+    --install-tasks went nowhere. `Interceptify.exe --install-tasks --status`
+    produced no output at all and looked like it had done nothing. Attaching to
+    the console that launched us costs nothing when there isn't one.
+    """
+    if not getattr(sys, "frozen", False):
         return
+    try:
+        import ctypes
+        ATTACH_PARENT_PROCESS = -1
+        if not ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+            return
+        for stream, mode in (("stdout", "w"), ("stderr", "w")):
+            try:
+                setattr(sys, stream, open("CONOUT$", mode, encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv:
+        _attach_parent_console()
+    if argv and argv[0] == "--selfheal":
+        import selfheal
+        return selfheal.main(argv[1:])
+    if argv and argv[0] == "--install-tasks":
+        import install_tasks
+        return install_tasks.main(argv[1:])
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"{APP_NAME} {APP_VERSION}")
+        return 0
     InterceptifyApp().run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

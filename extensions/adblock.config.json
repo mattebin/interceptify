@@ -1,19 +1,17 @@
 {
-  "_comment": "Interceptify v2 ad-block tunables. The patcher injects this as window.__INTERCEPTIFY_CONFIG and adblock.js shallow-merges it over its built-in defaults. After a Spotify update that breaks blocking, fix it HERE (selectors / module signatures / regexes / threshold) and re-patch -- no JS edit or rebuild needed. Regexes are strings compiled with new RegExp() at use sites; escape backslashes for JSON.",
+  "_comment": "Interceptify v2 SHIPPED ad-block defaults. This file belongs to the release and is REPLACED on every update -- it holds the Spotify-build-specific module ids, selectors and regexes that a release exists to correct. Put your own overrides in adblock.config.local.json instead; that file is never overwritten and is merged on top of this one at patch time. The patcher injects the merged result as window.__INTERCEPTIFY_CONFIG and adblock.js shallow-merges it over its built-in defaults. Regexes are strings compiled with new RegExp() at use sites; escape backslashes for JSON.",
   "tickMs": 500,
   "cooldownMs": 1500,
-  "suspectClearTicks": 2,
   "confirmTicks": 2,
   "suspectMaxMs": 8000,
   "skipRetryMs": 900,
   "maxSkipRetries": 3,
   "minAdvanceIntervalMs": 700,
+  "authoritativeAfterAdvanceMs": 2500,
   "forceRestoreMs": 4000,
   "maxAdMs": 90000,
-  "instreamWindowMs": 3000,
   "seek15Burst": 4,
-  "seek15BurstSpacingMs": 150,
-  "adTextMarkers": "advert|annons|reklam|reclame|werb|anunci|publici|annonce|mainos|reklaam|\u0440\u0435\u043a\u043b\u0430\u043c\u0430|sponsor",
+  "adTextMarkers": "advert|annons|reklam|reclame|werb|anunci|publici|annonce|mainos|reklaam|реклама|sponsor",
   "strongAdSelectors": [
     "[data-testid=\"ad-controls\"]",
     "[data-testid=\"ad-countdown-timer\"]",
@@ -24,12 +22,6 @@
     "[data-testid=\"video-takeover-link\"]"
   ],
   "fuzzyAdTestIdRegex": "^(ad-controls|ad-countdown[\\w-]*|ads?-video[\\w-]*|standalone-video-ad[\\w-]*|canvas-ad-(player|container)|video-takeover[\\w-]*)$",
-  "weakOnlySelectors": [
-    "[data-testid=\"ad-companion-card\"]",
-    "[data-testid=\"leavebehind-advertiser\"]",
-    "[data-testid=\"context-item-info-ad-title\"]",
-    "[data-testid=\"context-item-info-ad-subtitle\"]"
-  ],
   "visualHideSelectors": [
     "[data-testid=\"context-item-info-ad-title\"]",
     "[data-testid=\"context-item-info-ad-subtitle\"]",
@@ -51,6 +43,7 @@
   "skipForwardTestId": "control-button-skip-forward",
   "seekForward15TestId": "control-button-seek-forward-15",
   "muteButtonTestId": "volume-bar-toggle-mute-button",
+  "playPauseTestId": "control-button-playpause",
   "progressInputSelector": "[data-testid=\"playback-progressbar\"] input[type=\"range\"]",
   "nowPlayingTitleSelectors": [
     "[data-testid=\"context-item-link\"]",
@@ -73,11 +66,16 @@
   "playerStateFallbackId": 5563,
   "instreamModuleFallbackId": 46849,
   "enableInstreamHook": true,
-  "webpackChunkGlobal": "webpackChunkclient_web",
+  "webpackChunkGlobals": [
+    "rspackChunkclient_web",
+    "webpackChunkclient_web"
+  ],
+  "l1WatchdogMs": 20000,
   "manifestRegex": "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
   "manifestAdMaxMs": 60000,
   "manifestAdMinMs": 1000,
   "manifestRequireCorroboration": true,
+  "_manifestDurationBlock_note": "OFF by default: blocking on duration alone can 404 a short REAL track. Turn on only if ads are getting through L1 and the gate.",
   "manifestDurationBlock": false,
   "adBodyMarkerRegex": "audio_ad|creative_id|lineitem_id|advertisement|\"file_type\"\\s*:\\s*\"AD",
   "knownAdSourcesMax": 256,
@@ -111,5 +109,39 @@
   ],
   "adGateFallbackKeys": [
     "ad_enabled"
-  ]
+  ],
+  "adSlots": [
+    "stream",
+    "preroll",
+    "sponsored-playlist",
+    "leaderboard",
+    "hpto",
+    "embedded-npv",
+    "embedded-playlist",
+    "embedded-playlist-leavebehind",
+    "podcast-preroll",
+    "podcast-postroll",
+    "podcast-midroll-1",
+    "podcast-midroll-2",
+    "podcast-midroll-3",
+    "podcast-midroll-4",
+    "podcast-midroll-5"
+  ],
+  "primaryAdSlot": "stream",
+  "adSlotDiscovery": true,
+  "adSlotIdRegex": "([A-Z_]*SLOT[A-Z_]*)\\s*[:=]\\s*[\"']([^\"']+)[\"']",
+  "_primarySlotRegex": "Which discovered slot to promote when Spotify renames the interruptive audio slot and the configured primaryAdSlot no longer exists. Podcast slots are excluded: they carry episode-scoped ads, not the between-track break.",
+  "primarySlotRegex": "^(?!podcast)[a-z-]*stream[a-z-]*$",
+  "adSlotDiscoveryIntervalMs": 2000,
+
+  "_containment": "Tripwire containment. A delivered ad object is the ads core telling us an ad exists right now; these bound how long the resulting mute may hold audio down.",
+  "tripwireContain": true,
+  "tripwireHoldMs": 8000,
+  "tripwireHoldMaxMs": 35000,
+  "tripwireMinHoldMs": 1200,
+
+  "_freshness": "How long an asynchronously-read answer stays evidence. Everything readiness depends on arrives over a live RPC, so a latched yes with no expiry outlives the connector it describes.",
+  "gateMaxAgeMs": 30000,
+  "gateRefreshTimeoutMs": 8000,
+  "slotClearPendingMs": 6000
 }

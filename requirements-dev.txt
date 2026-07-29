@@ -1,0 +1,4 @@
+# Extra reconnaissance tooling. NOT needed to run Interceptify or its self-heal
+# - both are covered by requirements.txt.
+
+frida>=16.0.0             # frida_recon.py (process/TLS reconnaissance)

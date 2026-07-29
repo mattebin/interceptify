@@ -27,21 +27,31 @@
   // The old window flags are folded in for back-compat (they seed the
   // defaults, then config/defaults can override).
   // ===================================================================
-  const CFG = Object.assign({
+  // Named, so the defaults are a thing code and tests can refer to. They used
+  // to be an anonymous literal inside Object.assign(), which meant a use site
+  // wanting "the default for X" had to restate the value and drift from it.
+  const DEFAULTS = {
     // ---- timing ----
     tickMs: 500,
     cooldownMs: 1500,            // post-ad/post-skip advancing lockout
-    suspectClearTicks: 2,
     confirmTicks: 2,             // a strong ad marker must persist >= this many ticks before CONFIRM+mute (kills 1-tick flickers)
     suspectMaxMs: 8000,          // force un-mute if weak-only never escalates
     skipRetryMs: 900,
     maxSkipRetries: 3,
     minAdvanceIntervalMs: 700,   // global anti-spin
+    // How long after ANY queue advance a bare format===AUDIO in-stream object
+    // stops counting as self-sufficient proof and has to be corroborated. Guards
+    // the one over-skip case the pre-paint fast path could not see: a late or
+    // prefetched read of the break we just handled, arriving while a real song
+    // has already started.
+    authoritativeAfterAdvanceMs: 2500,
     forceRestoreMs: 4000,        // watchdog: force gain/mute restore if ad_active but no strong
     maxAdMs: 90000,              // hard ceiling: force-release if an "ad" persists longer than any real ad
-    instreamWindowMs: 3000,
     seek15Burst: 4,
-    seek15BurstSpacingMs: 150,
+    // (seek15BurstSpacingMs is gone: the burst became synchronous inside one
+    // advance() tick, because a deferred click could land after the ad ended and
+    // seek a real track. There is no spacing left to configure, and a knob that
+    // does nothing reads as tried-and-didn't-help when the truth is never-applied.)
     // Locale-agnostic ad-text markers matched against now-playing
     // title/subtitle/documentTitle to recognize "still on an ad" when the
     // language isn't English. Build/locale-volatile -> externalized.
@@ -59,11 +69,11 @@
     ],
     // Anchored (^...$) so a prefix can't bleed into a non-ad id; no context-item-info-ad here.
     fuzzyAdTestIdRegex: "^(ad-controls|ad-countdown[\\w-]*|ads?-video[\\w-]*|standalone-video-ad[\\w-]*|canvas-ad-(player|container)|video-takeover[\\w-]*)$",
-    // arm mute/CSS but NEVER advance (lingering nodes — the v1 over-skip leftovers)
-    weakOnlySelectors: [
-      '[data-testid="ad-companion-card"]', '[data-testid="leavebehind-advertiser"]',
-      '[data-testid="context-item-info-ad-title"]', '[data-testid="context-item-info-ad-subtitle"]',
-    ],
+    // (weakOnlySelectors is gone. Weak signals are derived from fuzzyAdTestIdRegex
+    // matching with no strong selector present, so the list was never read - it
+    // published four selectors that looked like they controlled the mute-only
+    // path and controlled nothing. The lingering companion/leavebehind nodes it
+    // named are covered by visualHideSelectors below.)
     visualHideSelectors: [
       '[data-testid="context-item-info-ad-title"]',
       '[data-testid="context-item-info-ad-subtitle"]',
@@ -90,6 +100,7 @@
     skipForwardTestId: "control-button-skip-forward",
     seekForward15TestId: "control-button-seek-forward-15",
     muteButtonTestId: "volume-bar-toggle-mute-button",
+    playPauseTestId: "control-button-playpause",   // used by selftest to establish playback
     progressInputSelector: '[data-testid="playback-progressbar"] input[type="range"]',
     nowPlayingTitleSelectors: [
       '[data-testid="context-item-link"]',
@@ -119,7 +130,44 @@
     streamTimeKillValue: -100000000000, // -1e11: pushes core stream-time so the ad-break threshold is never crossed
     killAdEndpoints: true,              // point the ad-STATE pusher + per-slot ad-SERVER at a dead URL so the client can't be told to play / can't fetch an ad (live-tested stable). This is the real prevention lever (stream-time didn't prevent server-scheduled ads).
     deadAdEndpoint: "https://localhost.invalid/no-ads",
-    adSlots: ["streaming", "watchnow", "mobile-screensaver", "sponsored-playlist", "homepage-takeover", "hpto", "billboard"],
+    // Spotify's OWN slot ids, read off the live bundle's *_SLOT_ID constants
+    // (2026-07-29, 1.2.94): stream, preroll, sponsored-playlist, leaderboard,
+    // hpto, embedded-npv, embedded-playlist, embedded-playlist-leavebehind,
+    // podcast-preroll, podcast-postroll, podcast-midroll-1..5.
+    //
+    // The audio slot is "stream". This list used to lead with "streaming",
+    // which is not a slot Spotify has - so every clearSlot() call for the one
+    // slot that matters addressed nothing, and an ad already queued when the
+    // gate closed was never flushed. Confirmed twice: 25/25 delivered in-stream
+    // ads in this install's captures carry slot "stream", and the live bundle
+    // defines STREAM_SLOT_ID = "stream" with no "streaming" anywhere.
+    //
+    // adSlotDiscovery below re-reads these from the bundle at runtime, so the
+    // list is a fallback rather than the source of truth. A hard-coded alias is
+    // exactly what went stale here.
+    adSlots: ["stream", "preroll", "sponsored-playlist", "leaderboard", "hpto",
+              "embedded-npv", "embedded-playlist", "embedded-playlist-leavebehind",
+              "podcast-preroll", "podcast-postroll",
+              "podcast-midroll-1", "podcast-midroll-2", "podcast-midroll-3",
+              "podcast-midroll-4", "podcast-midroll-5"],
+    // The slot that carries interruptive audio between tracks. Cleared first and
+    // confirmed; the rest are best-effort.
+    primaryAdSlot: "stream",
+    adSlotDiscovery: true,              // re-read *_SLOT_ID constants from the live bundle
+    adSlotIdRegex: "([A-Z_]*SLOT[A-Z_]*)\\s*[:=]\\s*[\"']([^\"']+)[\"']",
+    adSlotDiscoveryIntervalMs: 2000,    // floor between full module sweeps while no usable primary slot has been found
+    // Discovery only helped for slots we DIDN'T already name. If Spotify renames
+    // the interruptive audio slot itself - the "streaming" -> "stream" failure
+    // again, in the other direction - the new name was merely appended to the
+    // list while the dead configured name stayed primary: cleared first,
+    // acknowledged first, and the only one readiness keyed off. Discovery that
+    // cannot correct the one value that actually matters is not dynamic.
+    //
+    // So: when the configured primary is absent from a non-empty discovered set,
+    // promote the discovered slot that matches this pattern. Podcast slots are
+    // excluded because they carry episode-scoped ads, not the between-track
+    // audio break, and one of them would otherwise win on a plain /stream/ test.
+    primarySlotRegex: "^(?!podcast)[a-z-]*stream[a-z-]*$",
     // ---- snapshot-build ads-connector resurrection (Spotify 1.2.93+ V8 snapshot) ----
     snapshotConnector: true,            // rebuild ads-connector access from window.__webpack_modules__ when the closure require is trapped (chunk.push no longer threads it). Powers adEnabledKill + killAdEndpoints + overrideSkip on snapshot builds.
     adEnabledKill: true,                // THE MASTER PREVENTION LEVER. putState('ad_enabled','false') on the core ad-scheduler state stops ad breaks from being SCHEDULED at all (not reactively skipped). Live-proven on 1.2.93: 10 forced skips that previously triggered an ad -> 0 ads. Re-applied fast to survive product-state refreshes re-pushing ad_enabled:true.
@@ -131,11 +179,41 @@
     // We read the LIVE ad state and match its key names against these patterns,
     // so a rename is auto-discovered instead of silently disabling the block.
     adGateKeyPatterns: ["^ad[_-]?enabled$", "^ads?[_-]?enabled$", "^enable[_-]?ads?$"],
+    // Used only when discovery finds nothing. Written here rather than as a
+    // literal at the use site so every knob has exactly one declared default.
+    adGateFallbackKeys: ["ad_enabled"],
     adGateVerify: true,                 // read the state back and confirm every gate key really reads "false" (a write that doesn't stick = drift -> logged as ad-gate-FAILED)
+    // ---- freshness of the evidence readiness is built on ----
+    // "verified" and "acknowledged" were both latched booleans with no expiry.
+    // A gate read that succeeded once stayed authoritative even if every later
+    // getAdState() rejected or hung, and a slot clear acknowledged once stayed
+    // acknowledged even when the next clear never resolved. Both are read
+    // asynchronously off a live RPC, so a stale yes is exactly how a green
+    // status survives the connector dying underneath it.
+    gateMaxAgeMs: 30000,                // a gate reading older than this stops counting as evidence (re-read cadence is 1s)
+    gateRefreshTimeoutMs: 8000,         // a getAdState() that never settles must not block all future refreshes
+    slotClearPendingMs: 6000,           // a clearSlot() promise outstanding longer than this is treated as failed, not pending
     adTripwire: true,                   // permanently observe the core's in-stream ad channel; ANY delivery while the block is on is a hard failure signal (this is what "no load at all" is measured on)
+    // ---- tripwire CONTAINMENT ----
+    // The tripwire used to observe and do nothing but log. Before readiness it
+    // called armMute() alone, which the ~2s watchdog then undid because
+    // ad_active was never set - so the ad was muted and un-muted while still
+    // playing. After readiness it did not even mute: it left everything to the
+    // DOM FSM's 500ms poll and two-tick confirmation, which is ~1s of audible ad
+    // in the one case where a layer has already demonstrably failed.
+    tripwireContain: true,
+    // Bounded mute hold, so containment can never pin a real song silent. The
+    // watchdog still owns the ceiling; this only asks it to wait.
+    tripwireHoldMs: 8000,
+    tripwireHoldMaxMs: 35000,           // absolute cap even when the ad declares a longer duration
+    tripwireMinHoldMs: 1200,            // floor before DOM evidence is allowed to release early
     overrideSkip: true,                 // reactive belt ONLY: skipToNextWithOverride() bypasses the Free "skip disabled during ad" lock for any ad that slips the ad_enabled prevention (e.g. the startup window before the connector resolves, or SSAI). Gated ONLY via advance().
     totalBlockIntervalMs: 3000,         // re-apply connector-capture + endpoint-kill on this cadence (faster than the 10s stream-time interval so the kill lands before the first ad once the lazy ads chunk loads)
-    webpackChunkGlobal: "webpackChunkclient_web",
+    // Spotify moved webpack -> rspack; hooking one name silently lost the
+    // whole L1 layer. All candidates are hooked and a watchdog reports if
+    // none of them ever fires.
+    webpackChunkGlobals: ["rspackChunkclient_web", "webpackChunkclient_web"],
+    l1WatchdogMs: 20000,                // how long to wait before calling the hook dead
     // ---- network classifier ----
     manifestRegex: "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
     manifestAdMaxMs: 60000,
@@ -156,7 +234,10 @@
     diagnosticOverlay: false,           // show load state + uncaught errors in-page (Spotify gates DevTools)
     debugCapture: window.__INTERCEPTIFY_DEBUG_CAPTURE === true,
     showBadge: window.__INTERCEPTIFY_SHOW_BADGE !== false,
-  }, (window.__INTERCEPTIFY_CONFIG && typeof window.__INTERCEPTIFY_CONFIG === "object") ? window.__INTERCEPTIFY_CONFIG : {});
+  };
+  const CFG = Object.assign({}, DEFAULTS,
+    (window.__INTERCEPTIFY_CONFIG && typeof window.__INTERCEPTIFY_CONFIG === "object")
+      ? window.__INTERCEPTIFY_CONFIG : {});
 
   // Compiled-regex cache: CFG stores regex SOURCES as strings; compile once.
   const _reCache = {};
@@ -320,10 +401,15 @@
 
   function nowPlayingSnapshot() {
     try {
-      const title =
-        document.querySelector('[data-testid="context-item-link"]') ||
-        document.querySelector('[data-testid="context-item-info-title"]') ||
-        document.querySelector('[data-testid="now-playing-widget"] a');
+      // Selectors come from config. They were hard-coded here while the config
+      // advertised a nowPlayingTitleSelectors key that nothing read - so the one
+      // knob most likely to need turning after a Spotify UI change did nothing.
+      const sels = CFG.nowPlayingTitleSelectors || [];
+      let title = null;
+      for (const s of sels) {
+        try { title = document.querySelector(s); } catch { title = null; }
+        if (title) break;
+      }
       const subtitle =
         document.querySelector('[data-testid="context-item-info-subtitle"]') ||
         document.querySelector('[data-testid="context-item-info-ad-subtitle"]');
@@ -454,6 +540,24 @@
     return String(value).slice(0, 200);
   }
 
+  // Is this an INTERRUPTIVE AUDIO ad? The fast pre-paint path used to ask only
+  // `ad.format === 1 || ad.format === "AUDIO"`, and every real captured ad
+  // object on this install carries its audio classification somewhere else
+  // entirely: metadata.product_name = "audio_ad", metadata.format = "audio/ogg".
+  // Whether the live object ALSO had a top-level format is unknown - the capture
+  // serializer is a whitelist and never recorded it - so this accepts either
+  // rather than betting on the answer. Getting it wrong means the silent
+  // pre-paint skip never fires and every ad waits for the DOM.
+  function isAudioAd(ad) {
+    if (!ad || typeof ad !== "object") return false;
+    if (ad.format === 1 || ad.format === "AUDIO") return true;
+    const md = ad.metadata || {};
+    if (String(md.product_name || "").toLowerCase() === "audio_ad") return true;
+    if (/^audio\//i.test(String(md.format || ""))) return true;
+    if (String(ad.mediaType || "").toLowerCase() === "audio") return true;
+    return false;
+  }
+
   function summarizeAdObject(ad) {
     if (!ad || typeof ad !== "object") return null;
     const metadata = ad.metadata || {};
@@ -463,6 +567,13 @@
       requestId: ad.requestId,
       uri: ad.uri,
       slot: ad.slot,
+      // Recorded explicitly so the next capture can answer what this one could
+      // not: whether the live object carries a top-level format at all.
+      format: ad.format,
+      formatType: typeof ad.format,
+      productName: metadata.product_name,
+      metadataFormat: metadata.format,
+      classifiedAudio: isAudioAd(ad),
       mediaType: ad.mediaType,
       isPodcastAd: ad.isPodcastAd,
       isDsaEligible: ad.isDsaEligible,
@@ -601,6 +712,17 @@
   //       track (mirror of advance()'s keystone gate (b2)).
   function inStreamSkipSafe(authoritative) {
     if (Date.now() < inStreamSkipLockUntil) return false;  // (1) short post-skip self-lock (~300ms, NOT the 1500ms FSM cooldown)
+    // (1b) An AUDIO object that turns up shortly AFTER we advanced the queue may
+    //      be a late or prefetched read of the break we already dealt with,
+    //      while the thing now playing is a real song. Inside that window
+    //      "format says AUDIO" stops being self-sufficient evidence and has to
+    //      be corroborated like any other object. Outside it, the pre-paint
+    //      silent skip is untouched - that is the whole point of the layer - and
+    //      a genuine multi-ad break still corroborates, because the previous
+    //      ad's controls are still painted and ad_active is still set.
+    if (authoritative && (Date.now() - lastAdvanceAt) < (CFG.authoritativeAfterAdvanceMs | 0)) {
+      authoritative = false;
+    }
     // (2) corroboration. An AUTHORITATIVE signal — a FRESH AUDIO ad object
     //     (format===AUDIO, first sighting of this adId) — is itself proof an
     //     audio ad is here, so we skip PRE-PAINT (no DOM wait). A non-audio /
@@ -757,6 +879,167 @@
     }
     return null;
   }
+  // ---------------------------------------------------------------------
+  // DURABLE INCIDENT RECORD — the single place an ad-experience is written.
+  //
+  // Every path that means "an ad got to the user" funnels through here:
+  //   delivered  the core handed us an ad on its in-stream channel (tripwire)
+  //   muted      the reactive belt muted audio, i.e. an ad reached playback
+  //   skipped    the override skip fired, same meaning
+  //
+  // Wiring this to the tripwire alone was the earlier mistake: the tripwire
+  // watches one channel, and an ad that arrives another way was invisible while
+  // still being audible. The mute is the ground truth for "the user heard it".
+  //
+  // Each record carries the gate state AT THAT MOMENT, because that is the only
+  // time it is knowable, and a record that cannot be diagnosed later is not
+  // worth keeping.
+  const _INCIDENT_KEY = "__interceptify_ad_incidents";
+  // Always-on, bounded counters.
+  //
+  // These deliberately do NOT go through snifferLog(): that function returns
+  // immediately unless DEBUG_CAPTURE is set, and self-heal always patches with
+  // debug capture OFF. So every signal derived from the sniffer read zero in
+  // production no matter what actually happened, and "reactiveActions === 0"
+  // was true by construction. A counter that cannot be non-zero is not
+  // evidence, it is decoration.
+  //
+  // Integers only, fixed set of keys, so this cannot grow without bound.
+  const _counters = window.__interceptify_counters = window.__interceptify_counters || {
+    delivered: 0,        // core handed us an ad object (the block let one through)
+    muted: 0,            // reactive mute fired: an ad was already playing
+    skipped: 0,          // reactive skip fired: an ad was already playing
+    speculativeMute: 0,  // weak/pre-paint mute: NOT proof the user heard anything
+    l1Skip: 0,           // pre-paint L1 skip: the silent path working as intended
+    contained: 0,        // tripwire containment skip: a delivery the block failed to prevent, cut short
+    since: Date.now(),
+  };
+
+  // Install failures that were caught and would otherwise vanish.
+  const _layerErrors = window.__interceptify_layer_errors = window.__interceptify_layer_errors || [];
+
+  let _lastIncidentAt = 0;
+  // ---- Startup readiness -------------------------------------------------
+  // Measured on 1.2.94 (2026-07-29): after a Spotify start the ads connector is
+  // reachable at ~2.3s with ad_enabled still "true", and the gate first reads
+  // closed at ~3.6s. That is a real ~1.3s window in which the payload is loaded,
+  // every hook reports attached, and NOTHING is preventing an ad - and an ad
+  // queued in it survives, because ad_enabled=false only stops NEW scheduling.
+  //
+  // Being loaded is not the same as being protective. Anything that reports
+  // health has to be able to say which one it means.
+  // Readiness is built entirely on answers that arrive asynchronously from a
+  // live RPC, and every one of them used to be a latched boolean with no expiry.
+  // A gate read that succeeded once stayed authoritative even if every later
+  // getAdState() rejected or hung; an acknowledged slot clear stayed acknowledged
+  // even when the next attempt never resolved. Both are how a green status
+  // outlives the connector it describes - which matters most at track
+  // boundaries, exactly where a queued ad gets promoted.
+  function protectionReady() {
+    const g = window.__interceptify_ad_gate || null;
+    const missing = [];
+    if (!window.__interceptify_ads_connector) missing.push("connector");
+    if (_baselineKeys === null) missing.push("baseline");          // no populated ad-state seen
+    if (!(g && g.verified)) missing.push("gateClosed");            // written AND read back false
+    // A reading is evidence for as long as it is fresh. The re-read cadence is
+    // 1s, so anything older than gateMaxAgeMs means refreshes have stopped
+    // landing - the connector died, the promise hung, or the page is frozen -
+    // and the last "closed" describes a client that no longer exists.
+    else if (_adGateReadAt && Date.now() - _adGateReadAt > (CFG.gateMaxAgeMs | 0))
+      missing.push("gateStale");
+    // ok === false is a definite failure, and so is a promise that never
+    // settled (see slotClearState). ok === null means clearSlot returned
+    // nothing to await, so completion is UNCONFIRMABLE - and treating
+    // unconfirmable as "never ready" would make a structural PASS unreachable on
+    // such a build, which turns the self-heal into a permanent repair loop. That
+    // failure mode has already cost this project once. Unconfirmable is reported
+    // rather than punished; only a real failure blocks readiness.
+    const sc = slotClearState();
+    if (sc.ok === false || sc.t === 0) missing.push("slotCleared");
+    else if (sc.ok === "pending") missing.push("slotClearPending");
+    if (!window.__interceptify_l1_provider_wrapped) missing.push("l1Provider");
+    return { ok: missing.length === 0, missing: missing };
+  }
+
+  function recordIncident(kind, info) {
+    try {
+      const now = Date.now();
+      // Count before de-duplicating. The 4s collapse below exists to stop one ad
+      // producing three log lines; applying it to the counters would make them
+      // undercount real events instead of merely logging them once.
+      const key = { delivered: "delivered", muted: "muted", skipped: "skipped",
+                    "speculative-mute": "speculativeMute", "l1-skip": "l1Skip" }[kind];
+      if (key) _counters[key]++;
+
+      // Collapse a burst: one ad trips several detectors within a second or two,
+      // and three records for one ad makes the log lie about frequency.
+      //
+      // Collapsing used to DISCARD the later ones, which threw away the lifecycle
+      // - "delivered" survived and the mute and skip that followed it vanished,
+      // so no record could ever answer whether a delivery was contained. Now the
+      // burst is merged into the record it belongs to: one line per ad, with
+      // every outcome it produced, in order.
+      if (kind !== "delivered" && now - _lastIncidentAt < 4000) {
+        try {
+          const arr = JSON.parse(localStorage.getItem(_INCIDENT_KEY) || "[]");
+          const last = arr[arr.length - 1];
+          if (last) {
+            last.also = last.also || [];
+            if (last.also.length < 8) last.also.push({ kind: kind, dt: now - (last.t || now) });
+            localStorage.setItem(_INCIDENT_KEY, JSON.stringify(arr));
+          }
+        } catch {}
+        return;
+      }
+      _lastIncidentAt = now;
+      const g = window.__interceptify_ad_gate || null;
+      const ready = protectionReady();
+      const rec = {
+        t: now,
+        kind: kind,
+        id: (info && info.id) || null,
+        format: info && info.format,
+        // The fields that would have made the earlier incidents diagnosable.
+        // Every record so far said only "an ad happened, gate closed" - which
+        // slot it came through, whether we classified it as audio, and how stale
+        // our gate reading was are exactly the things needed to tell a queued-ad
+        // leak from a scheduling failure, and none of them were kept.
+        slot: (info && info.slot) || null,
+        audio: info ? info.audio : null,
+        outcome: (info && info.outcome) || kind,
+        // What containment actually managed to do about this delivery. Without
+        // it "delivered" records could not distinguish an ad the user heard in
+        // full from one cut off in under a second.
+        contained: (info && info.contained) || null,
+        v: window.__interceptify && window.__interceptify.version,
+        ready: ready.ok,
+        notReady: ready.ok ? null : ready.missing,
+        slotClear: { slot: _slotClear.slot, ok: _slotClear.ok,
+                     ageMs: _slotClear.t ? now - _slotClear.t : null,
+                     error: _slotClear.error },
+        gate: {
+          closed: !!(g && g.verified),
+          keys: (g && g.keys) || null,
+          connector: !!window.__interceptify_ads_connector,
+          // How old the "closed" reading is. refreshAdGate() is asynchronous and
+          // cached, so `closed: true` has always meant "true when we last
+          // looked", not "true now" - and without the age nobody could tell the
+          // difference.
+          readAgeMs: _adGateReadAt ? now - _adGateReadAt : null,
+          // true only while selftest deliberately opens the gate to prove its
+          // own trigger fires, so such a record is EXPECTED, not a failure
+          suspended: window.__interceptify_suspend_block === true,
+          uptimeMs: Math.round(
+            (typeof performance !== "undefined" && performance.now) ? performance.now() : 0)
+        }
+      };
+      const arr = JSON.parse(localStorage.getItem(_INCIDENT_KEY) || "[]");
+      arr.push(rec);
+      localStorage.setItem(_INCIDENT_KEY, JSON.stringify(arr.slice(-100)));
+      snifferLog("incident-" + kind, rec);
+    } catch {}
+  }
+
   // Reactive OVERRIDE skip. skipToNextWithOverride() -> skipNext({overrideRestrictions:
   // true}), which bypasses the Free "skip disabled during ad" lock. Gated ONLY
   // through advance() (fully song-safe); pairs with armMute() so the ~1s core
@@ -769,6 +1052,7 @@
       if (ac && typeof ac.skipToNextWithOverride === "function") {
         try { armMute(); } catch {}
         ac.skipToNextWithOverride();
+        recordIncident("skipped", { id: (window.__interceptify_last_delivered || {}).id || null });
         snifferLog("override-skip", { reason });
         return true;
       }
@@ -794,6 +1078,182 @@
   // at a dead URL, so the client can't be told to play an ad and can't fetch ad
   // media. Live-tested stable (no playback stall). Re-applied on the interval (the
   // server may reset it on reconnect). FSM skip+mute stays as the fallback.
+  // ---- Ad slots: read Spotify's own ids, do not trust a hard-coded list ----
+  let _discoveredSlots = null;
+
+  function discoverAdSlots() {
+    // Spotify declares its slots as *_SLOT_ID constants. Reading them means a
+    // renamed or added slot is picked up without a release, which is the whole
+    // reason the stale "streaming" alias went unnoticed for so long: nothing
+    // ever compared our list against theirs.
+    const out = [];
+    try {
+      const M = window.__webpack_modules__ || {};
+      const re = rx(CFG.adSlotIdRegex, "g");
+      if (!re) return out;
+      for (const id of Object.keys(M)) {
+        let s = "";
+        try { s = Function.prototype.toString.call(M[id].__intc_orig || M[id]); } catch { continue; }
+        if (s.indexOf("SLOT") < 0) continue;
+        let m;
+        re.lastIndex = 0;
+        while ((m = re.exec(s))) {
+          const v = m[2];
+          // Slot ids are lowercase kebab tokens; the constant NAME is not one.
+          if (/^[a-z][a-z0-9-]*$/.test(v) && out.indexOf(v) === -1) out.push(v);
+        }
+      }
+    } catch {}
+    return out;
+  }
+
+  // The slot readiness is measured on. Normally the configured one; but if
+  // discovery produced a real list and the configured name is NOT in it, that
+  // name is dead and clearing it is the "streaming" bug repeating. Promote the
+  // discovered slot that looks like the interruptive audio slot instead.
+  function primarySlot() {
+    const configured = CFG.primaryAdSlot || DEFAULTS.primaryAdSlot;
+    const found = _discoveredSlots || [];
+    if (!found.length || found.indexOf(configured) !== -1) return configured;
+    const re = rx(CFG.primarySlotRegex || DEFAULTS.primarySlotRegex, "");
+    const promoted = re ? found.filter((s) => re.test(s))[0] : null;
+    if (!promoted) return configured;      // nothing better: keep the known name
+    if (window.__interceptify_primary_slot !== promoted) {
+      window.__interceptify_primary_slot = promoted;
+      snifferLog("primary-slot-promoted", { configured, promoted, live: found });
+    }
+    return promoted;
+  }
+
+  // Has discovery yielded a primary we can actually use - either the configured
+  // name, or a promotable rename? This is the termination condition, and it has
+  // to accept BOTH: keying it on the configured name alone means a renamed slot
+  // re-scans the whole module graph on every call, forever.
+  function haveUsablePrimary() {
+    const found = _discoveredSlots;
+    if (found === null || !found.length) return false;
+    if (found.indexOf(CFG.primaryAdSlot || DEFAULTS.primaryAdSlot) !== -1) return true;
+    const re = rx(CFG.primarySlotRegex || DEFAULTS.primarySlotRegex, "");
+    return !!(re && found.some((s) => re.test(s)));
+  }
+
+  let _lastSlotDiscoveryAt = 0;
+
+  function adSlots() {
+    // Keep re-discovering until the bundle yields a usable primary. Caching the
+    // first answer would freeze whatever the module graph happened to hold at
+    // the moment of the first call - and the first call happens ~1s after load,
+    // from the pre-baseline slot flush, when the ads chunk is usually still
+    // lazy. That is the same shape as the empty-first-read that poisoned the
+    // ad-gate baseline: a snapshot taken too early, kept forever.
+    //
+    // Rate-limited because the alternative is a full toString() sweep of every
+    // module on a 1s cadence for as long as the bundle has no recognisable slot
+    // constant at all - a real state on a future rebuild, and one where the
+    // remedy must not be a permanent CPU cost.
+    if (CFG.adSlotDiscovery !== false && !haveUsablePrimary() &&
+        Date.now() - _lastSlotDiscoveryAt >= (CFG.adSlotDiscoveryIntervalMs | 0)) {
+      _lastSlotDiscoveryAt = Date.now();
+      _discoveredSlots = discoverAdSlots();
+      if (_discoveredSlots.length) {
+        window.__interceptify_discovered_slots = _discoveredSlots.slice();
+        const configured = CFG.adSlots || DEFAULTS.adSlots;
+        const missing = _discoveredSlots.filter((s) => configured.indexOf(s) === -1);
+        const stale = configured.filter((s) => _discoveredSlots.indexOf(s) === -1);
+        if (missing.length || stale.length)
+          snifferLog("ad-slots-drifted", { missing, stale, live: _discoveredSlots });
+      }
+    }
+    const found = (_discoveredSlots && _discoveredSlots.length) ? _discoveredSlots : [];
+    // Union, not replacement. Discovery running early can return a partial graph,
+    // and a partial list that silently REPLACED the configured one would drop
+    // slots we know about to gain ones we just found.
+    const configured = CFG.adSlots || DEFAULTS.adSlots;
+    const base = found.concat(configured.filter((s) => found.indexOf(s) === -1));
+    // Resolved AFTER discovery, so a rename found on this very call takes effect
+    // now rather than one call later. The interruptive audio slot goes first and
+    // is always present even if discovery missed it: it is the one that actually
+    // reaches the user's ears.
+    const primary = primarySlot();
+    return [primary].concat(base.filter((s) => s !== primary));
+  }
+
+  // The result of the LAST attempt to flush the primary slot. clearSlot() is
+  // asynchronous in Spotify's own code and this used to be fire-and-forget, so
+  // "we cleared the slot" was never a fact anyone had checked - a rejected call,
+  // or one that never resolved, looked exactly like success.
+  //
+  // `ok` is four-valued, and the distinctions are the whole point:
+  //   true      resolved - the core acknowledged this attempt
+  //   false     rejected, threw, or a promise that never settled in time
+  //   null      clearSlot returned no thenable: UNCONFIRMABLE on this build, and
+  //             punishing that would make a structural PASS unreachable, which
+  //             is a permanent Spotify-restarting repair loop
+  //   "pending" a thenable is outstanding for the CURRENT attempt
+  //
+  // The pending state exists because the old code latched: once one clear
+  // resolved, a later clear that never resolved left the stale `true` in place
+  // and readiness kept reporting green off an acknowledgement for an attempt
+  // that had already been superseded.
+  const _slotClear = window.__interceptify_slot_clear = {
+    slot: null, ok: null, t: 0, error: null, epoch: 0, startedAt: 0 };
+
+  function clearAdSlots(ac, reason) {
+    if (CFG.clearAdSlots === false || !ac || typeof ac.clearSlot !== "function") return;
+    const code = CFG.clearSlotReason != null ? CFG.clearSlotReason : 1;
+    const slots = adSlots();
+    const primary = slots[0];
+    // Every round is a new attempt, and the previous round's answer stops being
+    // evidence the moment this one starts. Late settlements from an older epoch
+    // are ignored below rather than overwriting a newer result.
+    const epoch = ++_slotClear.epoch;
+    for (const s of slots) {
+      try {
+        const p = ac.clearSlot(s, code);
+        if (s !== primary) continue;
+        if (p && typeof p.then === "function") {
+          _slotClear.slot = s; _slotClear.ok = "pending"; _slotClear.startedAt = Date.now();
+          _slotClear.error = null;
+          p.then(function () {
+            if (_slotClear.epoch !== epoch) return;       // superseded
+            _slotClear.ok = true; _slotClear.t = Date.now(); _slotClear.error = null;
+          }, function (e) {
+            if (_slotClear.epoch !== epoch) return;
+            _slotClear.ok = false; _slotClear.t = Date.now();
+            _slotClear.error = String((e && e.message) || e);
+            snifferLog("slot-clear-failed", { slot: s, error: _slotClear.error });
+          });
+        } else {
+          // Synchronous return: nothing to await, so record that it was called
+          // and that we have no acknowledgement, rather than implying one.
+          _slotClear.slot = s; _slotClear.ok = null; _slotClear.t = Date.now();
+          _slotClear.startedAt = 0;
+          _slotClear.error = "clearSlot returned no promise; completion unconfirmed";
+        }
+      } catch (e) {
+        if (s === primary) {
+          _slotClear.slot = s; _slotClear.ok = false; _slotClear.startedAt = 0;
+          _slotClear.t = Date.now(); _slotClear.error = String((e && e.message) || e);
+        }
+      }
+    }
+  }
+
+  // A thenable that never settles is a hung RPC into the ads core, not an
+  // unconfirmable build. Time it out into a definite failure so it surfaces as
+  // FAIL instead of sitting "pending" forever, and so it can never be confused
+  // with the sync-return escape hatch above.
+  function slotClearState() {
+    if (_slotClear.ok === "pending" && _slotClear.startedAt &&
+        Date.now() - _slotClear.startedAt > (CFG.slotClearPendingMs | 0)) {
+      _slotClear.ok = false;
+      _slotClear.t = Date.now();
+      _slotClear.error = "clearSlot promise never settled within slotClearPendingMs";
+      snifferLog("slot-clear-stuck", { slot: _slotClear.slot });
+    }
+    return _slotClear;
+  }
+
   function killAdEndpoints(reason) {
     if (CFG.killAdEndpoints === false) return false;
     try {
@@ -803,14 +1263,35 @@
       const acc = (api && api.adsCoreConnector) || resolveAdsConnector();
       if (!acc) return false;
       const DEAD = CFG.deadAdEndpoint || "https://localhost.invalid/no-ads";
-      try { if (typeof acc.updateAdStateEndpoint === "function") acc.updateAdStateEndpoint(DEAD); } catch {}
+      // Per-method acknowledgement. This returned true whenever a connector
+      // existed, so a build that renamed or dropped BOTH endpoint methods
+      // reported the endpoint kill as applied while nothing had been called -
+      // the same shape of false green as a config that is published but never
+      // injected. Only a method that exists AND did not throw counts.
+      const applied = [];
+      const failed = [];
+      if (typeof acc.updateAdStateEndpoint === "function") {
+        try { acc.updateAdStateEndpoint(DEAD); applied.push("updateAdStateEndpoint"); }
+        catch (e) { failed.push("updateAdStateEndpoint:" + String((e && e.message) || e)); }
+      }
       if (typeof acc.updateAdServerEndpoint === "function") {
-        const slots = CFG.adSlots || ["streaming"];
-        for (const sid of slots) { try { acc.updateAdServerEndpoint([sid], DEAD); } catch {} }
+        let ok = 0;
+        for (const sid of adSlots()) {
+          try { acc.updateAdServerEndpoint([sid], DEAD); ok++; } catch {}
+        }
+        if (ok) applied.push("updateAdServerEndpoint x" + ok);
+        else failed.push("updateAdServerEndpoint: every slot threw");
+      }
+      window.__interceptify_ad_endpoints = { applied, failed, t: Date.now() };
+      if (!applied.length) {
+        window.__interceptify_ad_endpoints_killed = false;
+        snifferLog("ad-endpoint-MISSING", { reason, failed,
+                                            methods: Object.keys(acc || {}).slice(0, 60) });
+        return false;
       }
       if (!window.__interceptify_ad_endpoints_killed) {
         window.__interceptify_ad_endpoints_killed = true;
-        snifferLog("ad-endpoint-killed", { reason });
+        snifferLog("ad-endpoint-killed", { reason, applied });
       }
       return true;
     } catch (e) { snifferLog("ad-endpoint-error", { reason, error: String(e && e.message || e) }); }
@@ -832,6 +1313,11 @@
   // automated repair loop escalates on (silent no-op was the old failure mode).
   let _adGateKeys = null;          // discovered gate key names
   let _adGateVerified = false;     // read-back confirmed every gate reads "false"
+  // When that read-back happened. refreshAdGate() is asynchronous and cached, so
+  // "verified" has always meant "true when we last looked". Incidents now carry
+  // the age, because a gate that read closed eight seconds ago and a gate that
+  // read closed 200ms ago are different claims.
+  let _adGateReadAt = 0;
   let _adGateRefreshing = false;
   // BASELINE of the key names Spotify's own state had BEFORE we ever wrote to it.
   // Critical: putState() CREATES any key you name, so "write a key then read it
@@ -840,12 +1326,26 @@
   let _baselineKeys = null;
   function adGateFallbackKeys() {
     const f = CFG.adGateFallbackKeys;
-    return Array.isArray(f) ? f : ["ad_enabled"];
+    return Array.isArray(f) && f.length ? f : DEFAULTS.adGateFallbackKeys;
   }
   function adGateKeys() { return _adGateKeys && _adGateKeys.length ? _adGateKeys : adGateFallbackKeys(); }
+  let _adGateRefreshStartedAt = 0;
   function refreshAdGate(ac) {
+    // A getAdState() that never settles used to pin _adGateRefreshing true
+    // forever, so no later refresh could ever run and the last "verified"
+    // reading stayed frozen as the answer for the rest of the page's life.
+    if (_adGateRefreshing && _adGateRefreshStartedAt &&
+        Date.now() - _adGateRefreshStartedAt > (CFG.gateRefreshTimeoutMs | 0)) {
+      _adGateRefreshing = false;
+      _adGateVerified = false;
+      window.__interceptify_ad_gate = { keys: _adGateKeys || [], verified: false,
+                                        readAt: _adGateReadAt,
+                                        error: "getAdState never settled" };
+      snifferLog("ad-gate-read-stuck", { sinceMs: Date.now() - _adGateRefreshStartedAt });
+    }
     if (_adGateRefreshing || !ac || typeof ac.getAdState !== "function") return;
     _adGateRefreshing = true;
+    _adGateRefreshStartedAt = Date.now();
     try {
       const p = ac.getAdState();
       if (!p || !p.then) { _adGateRefreshing = false; return; }
@@ -853,7 +1353,16 @@
         _adGateRefreshing = false;
         const st = (s && s.state) || {};
         const keys = Object.keys(st);
-        if (_baselineKeys === null) {                     // first read = Spotify's own key set
+        // Freeze the baseline ONLY from a real, populated snapshot. The ads
+        // connector can answer before the core has published anything, and an
+        // empty first read used to be frozen as "Spotify's key set is {}". Every
+        // genuine key that arrived afterwards was then rejected as one we
+        // invented, the gate fell back to writing CFG.adGateFallbackKeys into a
+        // baseline that could never contain them, and the poisoning was
+        // permanent for the life of the page.
+        if (_baselineKeys === null) {
+          if (!keys.length) { window.__interceptify_baseline_empty_reads =
+            (window.__interceptify_baseline_empty_reads || 0) + 1; return; }
           _baselineKeys = {};
           for (const k of keys) _baselineKeys[k] = true;
           window.__interceptify_baseline_keys = keys.slice();
@@ -871,13 +1380,111 @@
           _adGateKeys = null; _adGateVerified = false;
           snifferLog("ad-gate-MISSING", { keys: keys.slice(0, 60) });   // <- drift: key was renamed
         }
-        window.__interceptify_ad_gate = { keys: found, verified: _adGateVerified };
-      }).catch(() => { _adGateRefreshing = false; });
-    } catch { _adGateRefreshing = false; }
+        _adGateReadAt = Date.now();
+        window.__interceptify_ad_gate = { keys: found, verified: _adGateVerified,
+                                          readAt: _adGateReadAt };
+      }).catch((e) => {
+        // A REJECTED read is not "no new information", it is evidence the
+        // channel the gate lives on is broken. Swallowing it left the previous
+        // `verified: true` standing as the current answer indefinitely.
+        _adGateRefreshing = false;
+        _adGateVerified = false;
+        window.__interceptify_ad_gate = { keys: _adGateKeys || [], verified: false,
+                                          readAt: _adGateReadAt,
+                                          error: String((e && e.message) || e) };
+        snifferLog("ad-gate-read-failed", { error: String((e && e.message) || e) });
+      });
+    } catch (e) {
+      _adGateRefreshing = false;
+      _adGateVerified = false;
+      snifferLog("ad-gate-read-threw", { error: String((e && e.message) || e) });
+    }
   }
   // TRIPWIRE: watch the core's in-stream ad delivery channel forever. This is the
   // ground truth for "no load at all" — if the core hands us an ad while the block
   // is on, the block failed (a skipped/muted ad still counts as a failure here).
+  // ---- tripwire CONTAINMENT ------------------------------------------------
+  // A delivered ad object is the strongest evidence this payload ever receives:
+  // Spotify's own ads core is telling us an ad exists, right now, with an id.
+  // It drove nothing but a log line. Before readiness the tripwire called
+  // armMute() and nothing else, so the ~2s watchdog un-muted it again (ad_active
+  // was never set) and the ad played on; after readiness it did not even mute,
+  // and waited for the DOM FSM's 500ms poll plus two-tick confirmation in the
+  // one situation where a layer has already provably failed.
+  let _containUntil = 0;
+  let _containSince = 0;
+
+  function adDurationMs(ad) {
+    const md = (ad && ad.metadata) || {};
+    for (const v of [ad && ad.duration, md.duration, md.duration_ms, md.duration_seconds]) {
+      const n = Number(v);
+      // Ads are never under a second, so a small number is seconds, not ms.
+      if (isFinite(n) && n > 0) return n < 1000 ? n * 1000 : n;
+    }
+    return 0;
+  }
+
+  function holdContainment(ad) {
+    const cap = CFG.tripwireHoldMaxMs | 0;
+    const d = adDurationMs(ad);
+    const ms = Math.min(d ? d + 1000 : (CFG.tripwireHoldMs | 0), cap);
+    _containUntil = Math.max(_containUntil, Date.now() + ms);
+    if (!_containSince) _containSince = Date.now();
+    window.__interceptify_contain_until = _containUntil;
+  }
+
+  function containmentHeld() { return Date.now() < _containUntil; }
+  function containmentAgeMs() { return _containSince ? Date.now() - _containSince : 0; }
+
+  function releaseContainment(reason) {
+    if (!_containUntil && !_containSince) return;
+    _containUntil = 0; _containSince = 0;
+    window.__interceptify_contain_until = 0;
+    snifferLog("contain-released", { reason });
+  }
+
+  function containDeliveredAd(ac, ad, ready) {
+    const out = { muted: false, cleared: false, skipped: false, held: 0 };
+    if (CFG.tripwireContain === false) return out;
+    // 1. MUTE FIRST, always, ready or not. It is the cheapest step, the only
+    //    reversible one, and the only one that still helps if the rest fail.
+    //    Held so the watchdog waits instead of undoing it two seconds later.
+    try { armMute(); holdContainment(ad); out.muted = true; out.held = _containUntil - Date.now(); } catch {}
+    // 2. Flush the slot, so the remainder of the break does not follow this ad
+    //    in. Uses the RESOLVED primary rather than a configured guess.
+    try { if (ac) { clearAdSlots(ac, "tripwire-contain"); out.cleared = true; } } catch {}
+    // 3. Advance past it - through the SAME over-skip envelope the L1 path uses.
+    //    A fresh audio ad object is authoritative in precisely the way
+    //    inStreamSkipSafe() already models, so this reuses that gate rather than
+    //    inventing a second, less-tested one, and shares the dedup set so this
+    //    path and L1 can never both skip the same ad onto a real song.
+    try {
+      const stableKey = inStreamAdKey(ad);
+      if (!stableKey) return out;              // thin object: never authorize a skip
+      window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
+      if (window.__interceptify_neutralized_ads.has(stableKey)) return out;
+      if (!inStreamSkipSafe(isAudioAd(ad))) {
+        snifferLog("contain-skip-suppressed", { id: stableKey, ready: ready && ready.ok });
+        return out;
+      }
+      window.__interceptify_neutralized_ads.add(stableKey);
+      const api = window.__interceptify_instream_api;
+      // The in-stream api first (it is keyed to the ad object), then the
+      // connector's override skip - which is the only lever that exists at all
+      // on snapshot builds, where the L1 in-stream hook is dead.
+      if (api && typeof api.skipToNext === "function") { api.skipToNext(); out.skipped = "instream"; }
+      else if (overrideSkip("tripwire-contain")) { out.skipped = "override"; }
+      if (out.skipped) {
+        // Same shared advance clock the L1 path uses, so the guard that stops a
+        // late ad object from skipping the song this skip started can see it.
+        lastAdvanceAt = Date.now();
+        inStreamSkipLockUntil = Date.now() + (CFG.inStreamSkipLockMs || 300);
+        _counters.contained++;
+      }
+    } catch (e) { snifferLog("contain-error", { error: String((e && e.message) || e) }); }
+    return out;
+  }
+
   function installAdTripwire(ac) {
     if (CFG.adTripwire === false || window.__interceptify_tripwire || !ac) return;
     try {
@@ -888,14 +1495,21 @@
           window.__interceptify_ads_delivered = (window.__interceptify_ads_delivered || 0) + 1;
           window.__interceptify_last_delivered = { t: Date.now(), id: (ad && (ad.adId || ad.id)) || null, format: ad && ad.format };
           snifferLog("TRIPWIRE-ad-delivered", { id: (ad && (ad.adId || ad.id)) || null, format: ad && ad.format });
-          // Persist the incident so it survives a restart and can be reviewed
-          // later. localStorage only — the payload never touches the filesystem.
-          try {
-            const K = "__interceptify_ad_incidents";
-            const arr = JSON.parse(localStorage.getItem(K) || "[]");
-            arr.push({ t: Date.now(), id: (ad && (ad.adId || ad.id)) || null, format: ad && ad.format, v: window.__interceptify && window.__interceptify.version });
-            localStorage.setItem(K, JSON.stringify(arr.slice(-100)));
-          } catch {}
+          const ready = protectionReady();
+          // CONTAIN FIRST, RECORD SECOND. Both branches contain: an ad arriving
+          // before protection is established and one arriving through an
+          // established block are different FAILURES to report, but they are the
+          // same emergency to handle, and only one of them used to be handled at
+          // all (with a mute the watchdog then undid).
+          const contained = containDeliveredAd(ac, ad, ready);
+          recordIncident("delivered", {
+            id: (ad && (ad.adId || ad.id)) || null,
+            format: ad && ad.format,
+            slot: (ad && ad.slot) || null,
+            audio: isAudioAd(ad),
+            contained: contained,
+          });
+          if (!ready.ok) snifferLog("ad-before-protection-ready", { missing: ready.missing, contained });
         } catch {}
       });
       window.__interceptify_tripwire = true;
@@ -915,11 +1529,7 @@
         if (window.__interceptify_suspend_block === true) return false;
         // Never write before we've seen Spotify's own key set (see _baselineKeys).
         if (_baselineKeys === null) {
-          if (CFG.clearAdSlots !== false && typeof ac.clearSlot === "function") {
-            for (const s of (CFG.adSlots || ["streaming"])) {
-              try { ac.clearSlot(s, CFG.clearSlotReason != null ? CFG.clearSlotReason : 1); } catch {}
-            }
-          }
+          clearAdSlots(ac, "pre-baseline");
           return false;
         }
         for (const k of adGateKeys()) { try { ac.putState(k, "false"); } catch {} }
@@ -927,10 +1537,7 @@
         // only stops NEW scheduling; a pre-queued ad — e.g. one queued at startup —
         // still plays on the next transition unless cleared). No-op when no ad is
         // queued, so it's cheap to run every cycle.
-        if (CFG.clearAdSlots !== false && typeof ac.clearSlot === "function") {
-          const slots = CFG.adSlots || ["streaming"];
-          for (const s of slots) { try { ac.clearSlot(s, CFG.clearSlotReason != null ? CFG.clearSlotReason : 1); } catch {} }
-        }
+        clearAdSlots(ac, reason);
         if (!window.__interceptify_ad_enabled_killed) {
           window.__interceptify_ad_enabled_killed = true;
           snifferLog("ad-enabled-killed", { reason });
@@ -956,7 +1563,7 @@
       // FRESH AUDIO ad object (format===AUDIO; first sighting of this adId since
       // we're inside the not-yet-skipped dedup block) -> authoritative -> skip
       // PRE-PAINT. Other/unknown format falls back to DOM-corroborated skipping.
-      const audioAdAuthoritative = !!(ad && (ad.format === 1 || ad.format === "AUDIO"));
+      const audioAdAuthoritative = isAudioAd(ad);
       window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
       if (!window.__interceptify_neutralized_ads.has(key)) {
         window.__interceptify_neutralized_ads.add(key);
@@ -981,6 +1588,12 @@
               // The FSM unmutes on verified-advance when the real song starts.
               try { armMute(); } catch {}
               api.skipToNext();
+              // ONE queue-advance clock for the whole payload. This skip
+              // advances the queue exactly as advance() does, so it has to be
+              // visible to everything that reasons about "we just advanced" -
+              // otherwise the L1 path is invisible to the very guard that stops
+              // a late ad object from skipping the song that skip started.
+              lastAdvanceAt = Date.now();
               // Short SELF-lock (decoupled from the FSM's 1500ms cooldown) so the
               // NEXT ad of a multi-ad break skips almost immediately, while a
               // re-read of THIS ad is still blocked (dedup) + a real song that
@@ -1323,8 +1936,39 @@
     if (CFG.enableInstreamHook === false) { window.__interceptify_webpack_ad_hooked = true; log("L1 in-stream hook disabled via config"); return; }
     window.__interceptify_webpack_ad_hooked = true;
     try {
-      const chunkGlobal = CFG.webpackChunkGlobal || "webpackChunkclient_web";
-      const chunk = window[chunkGlobal] = window[chunkGlobal] || [];
+      // Every plausible name, plus anything already on window with the right
+      // shape. Seeding is deliberate: this payload runs before the bundle, so
+      // the array must exist for the bundle to push into.
+      const names = (CFG.webpackChunkGlobals || ["rspackChunkclient_web"]).slice();
+      try {
+        for (const k of Object.keys(window)) {
+          if (/Chunk[a-z_]*client_web$/i.test(k) && names.indexOf(k) < 0) names.push(k);
+        }
+      } catch {}
+      window.__interceptify_chunk_globals = names;
+      window.__interceptify_l1_fired = false;
+
+      // If nothing ever pushes, the layer is dead and the old code had no way to
+      // say so - the only diagnostic lived inside the callback that never ran.
+      try {
+        setTimeout(function () {
+          if (window.__interceptify_l1_fired) return;
+          const live = [];
+          try {
+            for (const k of Object.keys(window)) {
+              if (/Chunk[a-z_]*client_web$/i.test(k) && (window[k] || []).length) live.push(k);
+            }
+          } catch {}
+          window.__interceptify_l1_dead = { hooked: names, populated: live };
+          recordIncident("l1-hook-dead", { id: "l1", format: null });
+          log("L1 HOOK DEAD — hooked " + names.join(",") + " but the bundle used " +
+              (live.join(",") || "none of them") + "; the fast in-stream layer is NOT running");
+        }, CFG.l1WatchdogMs || 20000);
+      } catch {}
+
+      const chunkGlobal = names[0];
+      const chunks = names.map(function (n) { return (window[n] = window[n] || []); });
+      const chunk = window[chunkGlobal];
       const makeWrappedFactory = (originalFactory) => {
         const wrappedFactory = function (module, exports, require) {
           try {
@@ -1362,7 +2006,17 @@
             }
           } catch {}
           const result = originalFactory.apply(this, arguments);
-          try { wrapInStreamExports(module && module.exports || exports); } catch {}
+          // The factory has now RUN. "We replaced a factory" and "that factory
+          // executed and produced something we could wrap" are different claims,
+          // and only the first was ever reported - so a provider that was
+          // swapped in but never instantiated (a lazy chunk nobody loaded)
+          // reported the layer as installed.
+          try {
+            window.__interceptify_l1_provider_ran = true;
+            const ex = (module && module.exports) || exports;
+            wrapInStreamExports(ex);
+            if (window.__interceptify_instream_api) window.__interceptify_l1_provider_active = true;
+          } catch {}
           return result;
         };
         wrappedFactory.__interceptify_wrapped = true;
@@ -1372,10 +2026,16 @@
       // the literal modules[46849] lookup). Falls back to the literal hint id
       // only when the scan finds nothing.
       // Record what we ACTUALLY wrap (the diagnostic overlay reads this).
+      // Recording that we wrapped the INTENDED provider is a different claim
+      // from "the bundle pushed something through our wrapper", and health used
+      // to report only the second one. Any unrelated chunk push set the L1-fired
+      // flag, so a bundle-layout change could leave the ad provider completely
+      // unwrapped while the layer still reported green.
       const _recordWrapped = (key) => {
         try {
           if (window.__interceptify_instream_module_ids.indexOf(String(key)) === -1)
             window.__interceptify_instream_module_ids.push(String(key));
+          window.__interceptify_l1_provider_wrapped = true;
         } catch {}
       };
       // The known-good provider id present in `map`, else null. getInStreamAd+
@@ -1383,12 +2043,39 @@
       // decoy 80755), and wrapping a non-provider destructively blanks the UI —
       // so per-chunk we wrap ONLY the fallback provider id. The source scan is a
       // whole-graph fallback used at bootstrap when that id is genuinely gone.
+      // The hint id is only accepted if the module SITTING at it still looks like
+      // the in-stream provider. Bundler ids are reused across builds, so "46849
+      // exists" was never evidence that 46849 is still the provider - and because
+      // the source scan only ran when the id was absent, a rebuild that moved the
+      // provider and left something unrelated at the old id would wrap the wrong
+      // module, report success, and block nothing.
+      const providerKeyIn = (map, want) => {
+        if (want == null || !map) return null;
+        const key = map[want] ? want : (map[String(want)] ? String(want) : null);
+        if (key == null) return null;
+        const fn = map[key];
+        if (typeof fn !== "function") return null;
+        if (fn.__interceptify_wrapped) return key;      // already ours: it matched once
+        try {
+          if (!_factoryMatchesInstream(fn.__intc_orig || fn)) return null;
+        } catch { return null; }
+        return key;
+      };
       const fbKeyIn = (map) => {
+        // Whatever the whole-graph scan settled on wins, so chunks pushed after
+        // bootstrap get the provider this build actually has rather than the one
+        // the config remembers.
+        const resolved = providerKeyIn(map, window.__interceptify_instream_id);
+        if (resolved != null) return resolved;
         const fb = CFG.instreamModuleFallbackId;
-        if (fb == null || !map) return null;
-        if (map[fb]) return fb;
-        if (map[String(fb)]) return String(fb);
-        return null;
+        const key = providerKeyIn(map, fb);
+        if (key == null && map && fb != null && (map[fb] || map[String(fb)])
+            && !window.__interceptify_fallback_id_stale) {
+          window.__interceptify_fallback_id_stale = String(fb);
+          log("instreamModuleFallbackId " + fb + " is present but no longer looks like the ad " +
+              "provider — using the source scan instead");
+        }
+        return key;
       };
       const patchModules = (modules) => {
         if (!modules) return;
@@ -1413,17 +2100,46 @@
           }
         } catch {}
       };
-      chunk.forEach((payload) => patchModules(payload && payload[1]));
-      const originalPush = chunk.push.bind(chunk);
-      chunk.push = function () {
-        for (let i = 0; i < arguments.length; i++) {
-          patchModules(arguments[i] && arguments[i][1]);
-        }
-        return originalPush.apply(this, arguments);
-      };
-      originalPush([[`interceptify-${Date.now()}`], {}, function (require) {
+      // Sweep the modules ALREADY in every candidate array, not just the first.
+      // Only chunks[0] used to be swept, so on a build where the provider had
+      // arrived through a second chunk global it was never seen.
+      chunks.forEach(function (arr) {
+        try { arr.forEach((payload) => patchModules(payload && payload[1])); } catch {}
+      });
+      // Wrap EVERY candidate array. Wrapping only the first would leave the
+      // fallbacks decorative, which is the same silent-miss the rename caused.
+      // __interceptify_l1_fired is what tells the watchdog the layer is alive,
+      // so it must only ever be set by a push the BUNDLE made. The raw push is
+      // captured here, before wrapping, precisely so our own injection below
+      // cannot trip our own liveness flag - a self-satisfying signal would make
+      // the watchdog unable to fire and health permanently, falsely green.
+      const rawPush = new Map();
+      chunks.forEach(function (arr) {
+        if (!arr || arr.__interceptify_wrapped_push) return;
+        const push = arr.push.bind(arr);
+        rawPush.set(arr, push);
+        arr.push = function () {
+          window.__interceptify_l1_fired = true;
+          for (let i = 0; i < arguments.length; i++) {
+            patchModules(arguments[i] && arguments[i][1]);
+          }
+          return push.apply(this, arguments);
+        };
+        try { Object.defineProperty(arr, "__interceptify_wrapped_push", { value: true }); } catch {}
+      });
+      // Bootstrap through EVERY candidate array, not only the first. Each chunk
+      // global has its own webpack runtime and therefore its own module graph;
+      // injecting into one of them left the others unreached, so a build that
+      // moved the provider into a second runtime went unhooked while the layer
+      // still reported alive.
+      const bootstrapInto = (arr) => {
+        // Falls back to the live push only for an array someone else already
+        // wrapped, where no raw handle exists to take.
+        const originalPush = rawPush.get(arr) || arr.push.bind(arr);
+        originalPush([[`interceptify-${Date.now()}-${Math.round(performance.now())}`], {},
+          function (require) {
         try {
-          window.__interceptify_webpack_require = require;
+          window.__interceptify_webpack_require = window.__interceptify_webpack_require || require;
           patchRequire(require);
           // Whole-graph view of require.m: prefer the known provider id; only if
           // it is genuinely absent (renamed build) wrap the SINGLE best source
@@ -1433,6 +2149,9 @@
             const matched = discoverInStreamModuleIds(require.m || {});
             id = matched.length ? matched[0] : null;
           }
+          // Remember it, so later chunk pushes wrap this build's provider and
+          // not whichever id the config was last told about.
+          if (id != null) window.__interceptify_instream_id = id;
           let wrappedAny = false;
           if (id != null) {
             try {
@@ -1447,11 +2166,29 @@
           }
           if (!wrappedAny) log("L1 in-stream module not found — relying on DOM/manifest layers");
         } catch {}
-      }]);
+          }]);
+      };
+      chunks.forEach(function (arr) { try { bootstrapInto(arr); } catch {} });
     } catch {}
   }
 
-  installWebpackAdProviderHook();
+  // Hook installers are wrapped in try/catch so one failing layer cannot take
+  // the rest of the payload down with it. That is right, but a bare `catch {}`
+  // also means a layer can stop installing after a Spotify change and nothing
+  // anywhere says so - which is how L1 stayed dead through the rspack rename.
+  // The exception is kept out of the way AND kept.
+  function tryInstall(name, fn) {
+    try {
+      fn();
+      return true;
+    } catch (e) {
+      _layerErrors.push({ layer: name, error: String((e && e.message) || e), t: Date.now() });
+      log("LAYER FAILED TO INSTALL: " + name + " — " + String((e && e.message) || e));
+      return false;
+    }
+  }
+
+  tryInstall("webpack-ad-provider", installWebpackAdProviderHook);
 
   // TOTAL BLOCK: proactively point the ad-state/ad-server endpoints at a dead URL
   // so ad breaks are never scheduled/fetched (not just reactively skipped). On
@@ -1487,9 +2224,19 @@
   }
 
   // ---- fetch hook (sniffer + ad-CDN blocker + metadata capture) ----
-  // EXACTLY ONE window.fetch wrapper (v1's duplicate second reassignment is
-  // gone; its looksLikeAdUrl 403 layer is folded in below as BLOCK 0).
-  if (window.fetch && !window.fetch.__interceptify_hooked) {
+  // EXACTLY ONE window.fetch wrapper at a time (v1's duplicate second
+  // reassignment is gone; its looksLikeAdUrl 403 layer is folded in below as
+  // BLOCK 0).
+  //
+  // Re-assertable, not one-shot. This used to run once at bootstrap and install
+  // only if window.fetch existed at that instant. Spotify's runtime replaces
+  // window.fetch after our payload has run, which silently threw the wrapper
+  // away - and health reported `fetch: false` for exactly that reason while the
+  // self-heal still returned PASS. installFetchHook() re-wraps whatever fetch is
+  // current, so a later replacement is repaired on the next maintenance tick
+  // instead of ending the layer permanently.
+  function installFetchHook() {
+    if (!window.fetch || window.fetch.__interceptify_hooked) return false;
     const _f = window.fetch;
     window.fetch = function (input, init) {
       let url = "";
@@ -1683,7 +2430,23 @@
       return promise;
     };
     window.fetch.__interceptify_hooked = true;
+    return true;
   }
+
+  tryInstall("fetch", installFetchHook);
+  // Spotify's own runtime finishes booting well after we do, and whatever it
+  // installs over window.fetch wins. Re-check on a short cadence early (when the
+  // replacement happens) and then keep a slow watch running, because a lazily
+  // loaded chunk can do it much later. Cheap: one property read per tick.
+  (function watchFetchHook() {
+    let fast = 0;
+    const tick = () => {
+      if (installFetchHook()) log("re-installed the fetch hook (Spotify had replaced window.fetch)");
+      fast++;
+      setTimeout(tick, fast < 40 ? 250 : 5000);
+    };
+    setTimeout(tick, 250);
+  })();
 
   // ---- XMLHttpRequest sniffer ----
   if (DEBUG_CAPTURE && XMLHttpRequest && !XMLHttpRequest.prototype.__interceptify_hooked) {
@@ -2062,8 +2825,25 @@
       if (looksLikeAdUrl(this.__interceptify_url)) {
         log("blocked xhr:", this.__interceptify_url);
         try { stats.xhrBlocked++; } catch {}
-        // Simulate a dead request — fire error after a microtask
-        setTimeout(() => this.dispatchEvent(new Event("error")), 0);
+        // Present a COMPLETE failed request, not just an error event.
+        //
+        // Firing "error" alone leaves readyState at OPENED forever. A caller
+        // written against readyState/onreadystatechange - which is most XHR
+        // code, including anything transpiled from an older library - never
+        // observes the request finishing, so its promise never settles and
+        // whatever it guards hangs. Blocking a request should look like a
+        // network failure, and a real network failure still reaches DONE.
+        const self = this;
+        setTimeout(function () {
+          try {
+            Object.defineProperty(self, "readyState", { value: 4, configurable: true });
+            Object.defineProperty(self, "status", { value: 0, configurable: true });
+            Object.defineProperty(self, "responseText", { value: "", configurable: true });
+          } catch {}
+          for (const type of ["readystatechange", "error", "loadend"]) {
+            try { self.dispatchEvent(new Event(type)); } catch {}
+          }
+        }, 0);
         return;
       }
       return _xhrSend.apply(this, arguments);
@@ -2076,8 +2856,8 @@
 
   // STRONG = the audio/video-ad subset that may drive the ADVANCING gate.
   // Sourced from CFG.strongAdSelectors (companion/leavebehind NOT here — they
-  // linger past audio end and are the v1 over-skip leftovers; they live in
-  // CFG.weakOnlySelectors + CFG.visualHideSelectors instead).
+  // linger past audio end and are the v1 over-skip leftovers; they are hidden
+  // via CFG.visualHideSelectors and can only ever arm the mute path).
   const STRONG_AD_SELECTORS = (CFG.strongAdSelectors || []).slice();
   // Visual-only ad surfaces — hidden via CSS, never used to skip/mute.
   const VISUAL_AD_SELECTORS = (CFG.visualHideSelectors || []).slice();
@@ -2370,7 +3150,7 @@
 
   // 2. seek-forward-15 sparse burst (drains a drainable preroll). The button
   //    is ABSENT on songs, so it self-gates. ONE burst inside ONE advance()
-  //    call (CFG.seek15Burst clicks @ CFG.seek15BurstSpacingMs) — not a
+  //    call (CFG.seek15Burst clicks, all in this tick) — not a
   //    per-tick spray.
   function spamSeekForward() {
     const btn = document.querySelector('[data-testid="' + CFG.seekForward15TestId + '"]');
@@ -2473,6 +3253,17 @@
       if (uiMuted === false || (uiMuted === null && !_weMuted)) {
         btn.click();
         _weMuted = true;
+        // Two very different events used to be recorded identically as "the user
+        // heard an ad". armMute() is called from the CONFIRMED path (an ad is
+        // genuinely painted and audible until this click lands) AND from the
+        // SUSPECTED / pre-paint L1 paths, where muting is a cheap precaution
+        // against something that may never have made a sound. Reporting the
+        // second as a delivery failure is what drove the repair loop to "fix"
+        // a system that was working, so the FSM's own confidence decides which
+        // one this is.
+        const confirmed = (adState === "CONFIRMED" || adState === "SKIPPING");
+        recordIncident(confirmed ? "muted" : "speculative-mute",
+                       { id: (window.__interceptify_last_delivered || {}).id || null });
       }
     } else {
       // Un-mute only if WE muted (don't fight the user's manual mute)
@@ -2519,6 +3310,7 @@
   let confirmedSinceAt = 0;   // when CONFIRMED was first entered (maxAdMs ceiling)
   const _satisfiedAdKeys = new Set();      // adKeys whose skip was verified done
   const _adKeyRetries = Object.create(null); // adKey -> remaining retry budget
+  const _adKeyPrimitives = Object.create(null); // adKey -> Set of primitives already used
   let lastSkipIssueAt = 0;    // when the last skip was issued (skipRetryMs gate)
 
   function fpEqual(a, b) {
@@ -2607,44 +3399,59 @@
         return false;
       }
       // (d) actions — reached ONLY after CONFIRMED + strong + now-playing==ad.
-      let acted = false;
-      // PRIMARY on snapshot builds (1.2.93+): override-skip bypasses the Free
-      // skip-lock. Once per unique ad key (the connector's skip is not self-
-      // gating, so it leans entirely on the advance() gate above + this dedupe).
-      try {
-        window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
-        const ovKey = "override:" + key;
-        if (!window.__interceptify_neutralized_ads.has(ovKey)) {
-          if (overrideSkip("advance:" + key)) { window.__interceptify_neutralized_ads.add(ovKey); acted = true; }
+      //
+      // EXACTLY ONE primitive per call. Every one of these advances the play
+      // queue on its own, and they all used to fire in the same pass: a single
+      // ad decision could issue an override-skip, an in-stream skip, a next
+      // click, a seek burst and a video-end before anything checked whether the
+      // first had already worked. The dedupe keys made that survivable rather
+      // than correct - the moment one of them landed a fraction later than
+      // expected, the rest were operating on the next track.
+      //
+      // Now it is a ladder: fire the most reliable primitive that has not been
+      // tried for this ad, then stop. If the ad is still there on the next tick,
+      // the retry path re-runs the whole gate (still CONFIRMED, still strong,
+      // now-playing still the ad) and only then escalates one rung. Retrying is
+      // therefore always preceded by fresh confirmation, never assumed.
+      const tried = _adKeyPrimitives[key] || (_adKeyPrimitives[key] = new Set());
+      const ladder = [
+        // PRIMARY on snapshot builds (1.2.93+): bypasses the Free skip-lock.
+        ["override", () => overrideSkip("advance:" + key)],
+        // PREFERRED on older builds: the in-stream API's own skip.
+        ["instream", () => {
+          const api = window.__interceptify_instream_api;
+          if (!api || typeof api.skipToNext !== "function") return false;
+          api.skipToNext();
+          return true;
+        }],
+        // Native skip-forward click (self-gates: disabled/absent on songs).
+        ["click", () => clickNextTrack()],
+        // seek-forward-15 synchronous burst (absent on songs -> no-op).
+        ["seek", () => spamSeekForward()],
+        // ad-video-scoped 'ended' (blob src + strong marker this tick).
+        ["video", () => killVideoAd()],
+        // OFF by default; last resorts, still behind the full gate above.
+        ["mediasource", () => CFG.enableMediaSourceEndOfStream && killCurrentMediaSources()],
+        ["domspray", () => {
+          if (!CFG.enableDomSprayLastResort) return false;
+          domSprayLastResort();
+          return true;
+        }],
+      ];
+
+      let acted = false, usedPrimitive = null;
+      for (const [name, fire] of ladder) {
+        if (tried.has(name)) continue;
+        tried.add(name);
+        try {
+          if (fire()) { acted = true; usedPrimitive = name; }
+        } catch (e) {
+          snifferLog("advance-primitive-error", { source, primitive: name, error: String(e && e.message || e) });
         }
-      } catch {}
-      // PREFERRED (old builds): in-stream skipToNext() once per unique ad key. The
-      // L1 wrap also fires it on neutralize; this is a belt. Song-safe: gated above.
-      try {
-        const api = window.__interceptify_instream_api;
-        if (api && typeof api.skipToNext === "function") {
-          window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
-          const skKey = "advance:" + key;
-          if (!window.__interceptify_neutralized_ads.has(skKey)) {
-            window.__interceptify_neutralized_ads.add(skKey);
-            api.skipToNext();
-            acted = true;
-          }
-        }
-      } catch {}
-      // Native skip-forward click (self-gates: disabled/absent on songs).
-      if (clickNextTrack()) acted = true;
-      // seek-forward-15 synchronous burst (absent on songs -> no-op).
-      if (spamSeekForward()) acted = true;
-      // ad-video-scoped 'ended' (blob src + strong marker this tick).
-      if (killVideoAd()) acted = true;
-      // MediaSource endOfStream — OFF by default last resort.
-      if (!acted && CFG.enableMediaSourceEndOfStream) {
-        if (killCurrentMediaSources()) acted = true;
-      }
-      // DOM-spray last resort — DELETED family, only behind the flag + gate.
-      if (!acted && CFG.enableDomSprayLastResort) {
-        try { domSprayLastResort(); acted = true; } catch {}
+        if (acted) break;
+        // A primitive that reported "not applicable" (no button, no api, flag
+        // off) has not touched playback, so moving to the next rung in the same
+        // pass is safe - that is a selection step, not a second advance.
       }
 
       if (!acted) {
@@ -2707,6 +3514,10 @@
   }
   function releaseAdState(reason) {
     try { _diagLog("release", { reason: reason }); } catch {}
+    // The FSM finished the ad, so the tripwire's provisional hold has been
+    // superseded by a real lifecycle. Leaving it up would silence the song the
+    // release is happening for.
+    try { releaseContainment("ad-state-released:" + reason); } catch {}
     try { log("ad cleanup:", reason); } catch {}
     try { setBadgeState("idle"); } catch {}
     // ORDER MATTERS: raise gains to 1 FIRST (audio audible before we disarm the
@@ -2751,8 +3562,26 @@
           Date.now() - confirmedSinceAt > CFG.maxAdMs) {
         log("watchdog force-restore (ad_active longer than maxAdMs)");
         adState = "IDLE"; cooldownUntil = 0;
+        // The ceiling outranks a containment hold too. Nothing may keep audio
+        // down past maxAdMs, whatever asked for it.
+        releaseContainment("watchdog-maxad");
         releaseAdState("watchdog-maxad:" + reason);
         return;
+      }
+      // A containment hold is the tripwire asking the watchdog to WAIT: the ads
+      // core handed us a real ad object and we muted before any UI existed to
+      // corroborate it. Released early once the DOM can actually be consulted
+      // and says the ad is gone - but never on a DOM that has not painted, which
+      // is exactly the startup case the hold exists for.
+      if (containmentHeld() && !window.__interceptify_ad_active) {
+        let over = false;
+        try {
+          const fp = nowPlayingSnapshot();
+          const painted = !!(fp && fp.title);
+          over = painted && !STRONG_PRESENT() && !fpLooksLikeAd(fp)
+                 && containmentAgeMs() > (CFG.tripwireMinHoldMs | 0);
+        } catch {}
+        if (over) releaseContainment("now-playing-is-not-an-ad");
       }
       if (window.__interceptify_ad_active && !strong) {
         if (!runWatchdog._noStrongSince) runWatchdog._noStrongSince = Date.now();
@@ -2769,7 +3598,10 @@
       // Second clause: ad_active is false but a tracked master gain is still 0
       // OR our click-mute is still engaged -> restore BOTH so a real song can
       // never stay silent (closes the watchdog-restores-gain-but-not-mute gap).
-      if (!window.__interceptify_ad_active) {
+      // ...unless a containment hold is live. This is the clause that made the
+      // pre-readiness mute useless: it saw ad_active === false (the tripwire
+      // never set it) and un-muted an ad that was still playing.
+      if (!window.__interceptify_ad_active && !containmentHeld()) {
         let forced = false;
         if (window.__interceptify_audioContexts) {
           for (const ctx of window.__interceptify_audioContexts) {
@@ -2922,18 +3754,17 @@
           preAdNowPlaying = null;
           // Break fully over -> RESET per-break skip bookkeeping. adKeys are
           // DOM-fingerprint based and COLLIDE across breaks (subtitle "Annons N
-          // av M" / "1 av 2" recurs), so a satisfied / "advance:"-deduped key
-          // from a prior break would permanently suppress an identical-looking
-          // future ad (advance-suppressed: adKey-satisfied — the observed bug).
+          // av M" / "1 av 2" recurs), so a satisfied key from a prior break
+          // would permanently suppress an identical-looking future ad
+          // (advance-suppressed: adKey-satisfied — the observed bug).
+          //
+          // The escalation ladder is per-break state for the same reason: a key
+          // that had exhausted every primitive last time must start again from
+          // the top, or the second identical break gets no skip at all.
           // Per-ad in-stream neutralize keys (unique ad ids) are kept.
           _satisfiedAdKeys.clear();
           for (const k in _adKeyRetries) delete _adKeyRetries[k];
-          try {
-            const s = window.__interceptify_neutralized_ads;
-            if (s && s.forEach) Array.from(s).forEach((k) => {
-              if (typeof k === "string" && k.indexOf("advance:") === 0) s.delete(k);
-            });
-          } catch {}
+          for (const k in _adKeyPrimitives) delete _adKeyPrimitives[k];
         }
         break;
       }
@@ -2992,12 +3823,13 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-07-27-selfheal",
+    version: "2026-07-29-honest-verify",
     debugCapture: DEBUG_CAPTURE,
     // Machine-readable health, for the automated repair loop (selfheal.py) and
     // for a human over CDP. Cheap, no side effects.
     health() {
       const gate = window.__interceptify_ad_gate || null;
+      const _ready = protectionReady();
       return {
         version: window.__interceptify.version,
         connector: !!window.__interceptify_ads_connector,
@@ -3005,17 +3837,91 @@
         gateVerified: !!(gate && gate.verified),
         adsDelivered: window.__interceptify_ads_delivered || 0,
         lastDelivered: window.__interceptify_last_delivered || null,
+        // Always-on since page load, independent of debug capture. This is the
+        // only ad-outcome record that exists in a production patch.
+        counters: { ..._counters },
+        debugCaptureOn: DEBUG_CAPTURE,   // says whether the sniffer-based views mean anything
         webpackModules: (() => { try { return Object.keys(window.__webpack_modules__ || {}).length; } catch { return 0; } })(),
+        // L1 = the fast in-stream skip layer. It hangs off the bundler chunk
+        // array, and when Spotify renamed that (webpack -> rspack) the layer
+        // died silently for weeks. Surfaced here so the repair loop can fail on
+        // it instead of only the in-page log knowing.
+        l1Hooked: !!window.__interceptify_l1_fired,
+        l1Dead: window.__interceptify_l1_dead || null,
+        // Per-layer attachment, read from EVIDENCE that the hook is in place -
+        // not from "the installer ran without throwing". Those are different
+        // claims, and only the first one survives a Spotify rebuild.
+        layers: {
+          fetch: !!(window.fetch && window.fetch.__interceptify_hooked),
+          xhr: !!(typeof XMLHttpRequest !== "undefined"
+                  && XMLHttpRequest.prototype.__interceptify_url_block_hooked),
+          // The bundle is pushing through our wrapper. Necessary for L1, and on
+          // its own it says nothing about the ad provider: ANY chunk push sets
+          // it, so a bundle-layout change could leave the provider unwrapped
+          // with this still green. l1Provider is the claim that matters.
+          l1Chunk: !!window.__interceptify_l1_fired,
+          // The provider factory was REPLACED. Necessary, and deliberately still
+          // what readiness requires: on a build where nothing ever loads the ads
+          // chunk the factory legitimately never runs, and demanding execution
+          // would make readiness depend on the user encountering an ad path.
+          // l1ProviderRan / l1ProviderActive below are the stronger claims, and
+          // they are reported separately rather than folded into this one.
+          l1Provider: !!window.__interceptify_l1_provider_wrapped,
+          instreamApi: !!window.__interceptify_instream_api,
+          adsConnector: !!window.__interceptify_ads_connector,
+          adGate: !!(gate && gate.verified),
+        },
+        l1ProviderRan: !!window.__interceptify_l1_provider_ran,
+        l1ProviderActive: !!window.__interceptify_l1_provider_active,
+        instreamModuleIds: (window.__interceptify_instream_module_ids || []).slice(),
+        baselineEmptyReads: window.__interceptify_baseline_empty_reads || 0,
+        // Loaded is not protective. See protectionReady().
+        protectionReady: _ready.ok,
+        notReady: _ready.missing,
+        slotClearConfirmed: window.__interceptify_slot_clear.ok === true,
+        slotClear: { ...slotClearState() },
+        adSlots: (function () { try { return adSlots(); } catch { return null; } })(),
+        discoveredSlots: window.__interceptify_discovered_slots || null,
+        primarySlot: (function () { try { return primarySlot(); } catch { return null; } })(),
+        primarySlotPromoted: window.__interceptify_primary_slot || null,
+        gateReadAgeMs: (function () { const g = window.__interceptify_ad_gate;
+          return (g && g.readAt) ? Date.now() - g.readAt : null; })(),
+        gateError: (window.__interceptify_ad_gate || {}).error || null,
+        adEndpoints: window.__interceptify_ad_endpoints || null,
+        containHeldMs: (function () { try {
+          return containmentHeld() ? window.__interceptify_contain_until - Date.now() : 0; } catch { return 0; } })(),
+        layerErrors: _layerErrors.slice(-20),
+        chunkGlobals: window.__interceptify_chunk_globals || null,
         liveRequire: !!window.__interceptify_webpack_require,
       };
     },
-    // STRICT verification of "the user never experiences an ad — not even a flash".
-    // Forces ad breaks to become DUE (the real scheduler trigger, validated to
-    // deliver ads when the block is off), then requires ALL of:
-    //   adsDelivered === 0   -> the core never even handed us an ad (no load)
-    //   adUiFrames   === 0   -> no ad UI/title in 50ms sampling (no visual flash)
-    //   reactiveActions === 0-> the skip/mute fallback never had to fire
-    // Any reactive action means an ad reached playback => FAIL, by design.
+    // STRUCTURAL self-test. Named for what it actually establishes.
+    //
+    // WHAT IT PROVES: the block's machinery is present and under our control.
+    // Spotify's own ad-state switch moves both ways when we write it, the core
+    // echoes the value back, the maintenance loop re-closes the gate unaided
+    // after we reopen it, the delivery tripwire is armed, and every layer is
+    // attached. That is state plumbing, and it is worth proving.
+    //
+    // WHAT IT DOES NOT PROVE: that closing the gate PREVENTS an ad. There is no
+    // controlled positive control here - we cannot make the server schedule an
+    // ad on demand, so "the gate was open and an ad arrived / the gate was
+    // closed and it did not" is not a comparison this test can make. Ads are
+    // server-scheduled; a fresh client delivers none whatever the gate says.
+    //
+    // So a pass here must NEVER be used to clear a RECORDED delivery: the
+    // tripwire logging an ad that reached the user is direct evidence about the
+    // thing this test can only approach indirectly. selfheal.py keeps an
+    // unresolved-delivery flag that a structural pass cannot clear.
+    // Three-valued on purpose:
+    //   FAIL    -> the gate proof broke, OR something ad-shaped was observed
+    //              (delivery, ad UI, or a reactive skip/mute: an ad reached
+    //              playback). A positive observation is always meaningful.
+    //   UNKNOWN -> the gate proof held, but no audio streamed during the window.
+    //              "No ads appeared" while nothing was playing is entailed by the
+    //              silence, not by the block, so it is not a pass.
+    //   PASS    -> the gate proof held AND the window actually exercised playback
+    //              AND nothing ad-shaped occurred.
     // ======================================================================
     // VERIFICATION — deterministic, end to end, and independent of where the
     // user happens to be in the app. It follows Spotify's OWN ad path in code:
@@ -3036,7 +3942,7 @@
     //  * the ad detector might be dead (0 forever)   -> the tripwire must be armed.
     // Nothing here depends on navigation, playback position, or the current page.
     // ======================================================================
-    selftest(opts) {
+    structuralSelftest(opts) {
       opts = opts || {};
       const observeMs = opts.durationMs || 12000;
       const sampleMs = opts.sampleMs || 50;
@@ -3092,11 +3998,37 @@
           if (!reassertProven) reasons.push("block did not re-assert itself after the gate was reopened");
         }
 
+        // ---- ESTABLISH THE CONTROL ----------------------------------------
+        // The observation window is only meaningful while audio is streaming,
+        // and verification necessarily restarts Spotify, which leaves it
+        // paused. Without this the run can only ever return UNKNOWN, the state
+        // file never records a pass, and every scheduled run restarts Spotify
+        // again chasing a verdict it structurally cannot reach.
+        //
+        // So the test starts playback itself rather than hoping. If it cannot,
+        // it says so and the verdict stays UNKNOWN - the honest outcome, not a
+        // silent downgrade.
+        const streamTime = async () => parseInt((await readState()).elapsed_stream_time, 10) || 0;
+        let startedByTest = false;
+        {
+          const a = await streamTime();
+          await sleep(1200);
+          if ((await streamTime()) === a) {           // nothing is streaming
+            try {
+              const btn = document.querySelector(
+                '[data-testid="' + (CFG.playPauseTestId || "control-button-playpause") + '"]');
+              if (btn) { btn.click(); startedByTest = true; }
+            } catch (e) {}
+            await sleep(2500);                        // let the stream spin up
+          }
+        }
+
         // ---- OBSERVATION WINDOW -------------------------------------------
         // Opportunistic provocation while watching for ANY ad-shaped event.
         // Absence of ads here is corroboration, never the proof.
         const t0 = Date.now();
         const adsBefore = window.__interceptify_ads_delivered || 0;
+        const c0 = { ..._counters };          // snapshot: deltas, not lifetime totals
         const s0 = await readState();
         let adUiFrames = 0, firstAdUiAt = null;
         const sampler = setInterval(function () {
@@ -3113,13 +4045,32 @@
         clearInterval(sampler); clearInterval(driver);
         const s1 = await readState();
 
+        // Leave the client as we found it. The user did not ask for music to
+        // start; a check that quietly leaves playback running has changed the
+        // thing it was supposed to observe.
+        if (startedByTest) {
+          try {
+            const btn = document.querySelector(
+              '[data-testid="' + (CFG.playPauseTestId || "control-button-playpause") + '"]');
+            if (btn) btn.click();
+          } catch (e) {}
+        }
+
         const adsDelivered = (window.__interceptify_ads_delivered || 0) - adsBefore;
-        const reactiveActions = (window.__interceptify_sniffer || []).filter(function (e) {
-          return e && e.ts >= t0 && /override-skip|^advance$|skipToNext\.forAd|TRIPWIRE-ad-delivered|armMute/.test(e.kind || "");
-        }).length;
-        // elapsed_stream_time advances only while audio actually streams — used as
-        // INFORMATION about the window, never as a pass/fail gate.
-        const streamedMs = (parseInt(s1.elapsed_stream_time, 10) || 0) - (parseInt(s0.elapsed_stream_time, 10) || 0);
+        // Reactive actions come from the always-on counters. They used to be
+        // counted by filtering the sniffer buffer, which snifferLog() only fills
+        // when DEBUG_CAPTURE is on - and self-heal always patches with it off.
+        // So this term was structurally zero in every automated run: the check
+        // could not fail, which made its contribution to PASS worth nothing.
+        const reactiveActions = (_counters.muted - c0.muted) + (_counters.skipped - c0.skipped);
+        const speculativeMutes = _counters.speculativeMute - c0.speculativeMute;
+
+        // Spotify's own counter for how much audio actually streamed. The UNIT
+        // here is Spotify's and is NOT assumed to be milliseconds, so the test
+        // is "did it move at all", which is true regardless of unit. A magnitude
+        // threshold would silently encode a guess about the unit.
+        const streamedDelta = (parseInt(s1.elapsed_stream_time, 10) || 0) - (parseInt(s0.elapsed_stream_time, 10) || 0);
+        const playbackObserved = streamedDelta > 0;
         const gateClosed = keys.length > 0 && keys.every(function (k) { return String(s1[k]).toLowerCase() === "false"; });
 
         if (adsDelivered) reasons.push("core delivered " + adsDelivered + " ad(s) during the window");
@@ -3127,10 +4078,59 @@
         if (reactiveActions) reasons.push("reactive skip/mute fired " + reactiveActions + "x (an ad reached playback)");
         if (!gateClosed) reasons.push("ad gate is not closed at end of window");
 
-        const pass = tripwireArmed && fromBaseline && toggleProven && reassertProven &&
-                     gateClosed && adsDelivered === 0 && adUiFrames === 0 && reactiveActions === 0;
+        // ---- ARE THE LAYERS ACTUALLY THERE ---------------------------------
+        // Read at the END of the window, when every lazily-loaded chunk has had
+        // time to arrive. A run once reported PASS while its own health said
+        // fetch, l1Chunk and adGate were all missing: the gate toggle was being
+        // proven through a connector reached by one route, and nothing required
+        // the rest of the advertised block to exist. The toggle proof is real,
+        // but it is a proof about one layer, not about the product.
+        //
+        // instreamApi is NOT required: it only exists once Spotify hands over an
+        // in-stream ad object, so requiring it would make an ad-free session -
+        // the outcome we are testing for - impossible to pass.
+        const liveLayers = window.__interceptify.health().layers || {};
+        const missingLayers = ["fetch", "xhr", "l1Chunk", "l1Provider", "adsConnector", "adGate"]
+          .filter(function (k) { return !liveLayers[k]; });
+        if (missingLayers.length)
+          reasons.push("block layers not installed: " + missingLayers.join(", "));
+
+        // Hooks attached is not the same as protection established. The gate has
+        // to have been written AND read back closed, and the interruptive audio
+        // slot has to have been flushed with an acknowledgement - measured, that
+        // takes ~3.6s after a Spotify start, during which every layer already
+        // reports attached.
+        const ready = protectionReady();
+        if (!ready.ok)
+          reasons.push("protection not established: " + ready.missing.join(", "));
+
+        // The block is PROVEN by the causal toggle: we move Spotify's own switch
+        // both ways, the core echoes it, and our maintenance loop re-closes it
+        // unaided. None of that depends on what is playing. It is necessary, not
+        // sufficient - every layer has to be attached as well.
+        const proven = tripwireArmed && fromBaseline && toggleProven && reassertProven
+                       && gateClosed && missingLayers.length === 0 && ready.ok;
+        // A positive observation is always meaningful, whatever was playing.
+        const observedFailure = adsDelivered > 0 || adUiFrames > 0 || reactiveActions > 0;
+
+        // ...but the ABSENCE of ads only means something if the window actually
+        // exercised the thing under test. With nothing streaming, "no ads
+        // appeared" is guaranteed by the silence, not by the block, so calling
+        // that PASS reports a fact the run never established.
+        let verdict;
+        if (observedFailure || !proven) verdict = "FAIL";
+        else if (!playbackObserved) {
+          verdict = "UNKNOWN";
+          reasons.push("no audio streamed during the window, so 'no ads appeared' " +
+                       "is not evidence: the gate proof passed but nothing exercised it");
+        } else verdict = "PASS";
+
         return {
-          verdict: pass ? "PASS" : "FAIL",
+          verdict: verdict,
+          // Says plainly what a PASS covers, so no caller can read it as "no ad
+          // reached the user". It cannot: nothing here schedules an ad.
+          scope: "structural",
+          provesAdPrevention: false,
           reasons: reasons,
           version: window.__interceptify.version,
           connector: true,
@@ -3141,15 +4141,28 @@
           toggleProven: toggleProven,       // we can move Spotify's real switch both ways
           reassertProven: reassertProven,   // the block re-closes it by itself
           gateClosed: gateClosed,
+          layers: liveLayers,
+          missingLayers: missingLayers,
+          protectionReady: ready.ok,
+          notReady: ready.missing,
+          slotClear: { ...window.__interceptify_slot_clear },
+          adSlots: (function () { try { return adSlots(); } catch { return null; } })(),
+          proven: proven,
           adsDelivered: adsDelivered,
           adUiFrames: adUiFrames,
           firstAdUiAt: firstAdUiAt,
           reactiveActions: reactiveActions,
-          streamedMs: streamedMs,           // informational only
+          speculativeMutes: speculativeMutes,   // precautionary, NOT a delivery
+          streamedDelta: streamedDelta,         // Spotify's unit, not assumed to be ms
+          playbackObserved: playbackObserved,
+          startedByTest: startedByTest,   // did the check have to start playback itself
           observeMs: observeMs,
         };
       })();
     },
+    // Old name, kept so an older self-heal or a hand-typed console call still
+    // works. It was always the structural test; only the name was flattering.
+    selftest(opts) { return window.__interceptify.structuralSelftest(opts); },
     stats: () => ({ ...stats }),
     state: () => adState,
     instreamModuleIds: () => (window.__interceptify_instream_module_ids || []).slice(),

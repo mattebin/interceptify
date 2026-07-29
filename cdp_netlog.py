@@ -17,6 +17,8 @@ import json
 import re
 import sys
 import time
+
+import redact
 import urllib.request
 
 import websocket  # websocket-client
@@ -54,23 +56,30 @@ def main():
         while True:
             msg = json.loads(ws.recv())
             m = msg.get("method")
+            # The RAW url is only ever used to decide whether a request is
+            # interesting. Everything that leaves this process - file or
+            # terminal - is the redacted form. Printing the raw one meant the
+            # file was clean while the access token sat in the scrollback and in
+            # whatever got pasted into a bug report.
             if m == "Network.requestWillBeSent":
                 p = msg["params"]
                 url = p.get("request", {}).get("url", "")
-                rec = {"t": round(time.time(), 2), "ev": "req", "type": p.get("type"), "url": url}
+                safe = redact.redact_url(url)
+                rec = {"t": round(time.time(), 2), "ev": "req", "type": p.get("type"), "url": safe}
                 f.write(json.dumps(rec) + "\n"); f.flush()
                 n += 1
                 if FLAG.search(url):
-                    print("  REQ [%s] %s" % (p.get("type"), url[:170]), flush=True)
+                    print("  REQ [%s] %s" % (p.get("type"), safe[:170]), flush=True)
             elif m == "Network.responseReceived":
                 p = msg["params"]
                 resp = p.get("response", {})
                 url = resp.get("url", "")
                 if FLAG.search(url):
+                    safe = redact.redact_url(url)
                     rec = {"t": round(time.time(), 2), "ev": "resp", "status": resp.get("status"),
-                           "mime": resp.get("mimeType"), "type": p.get("type"), "url": url}
+                           "mime": resp.get("mimeType"), "type": p.get("type"), "url": safe}
                     f.write(json.dumps(rec) + "\n"); f.flush()
-                    print("  RESP %s %s %s" % (resp.get("status"), resp.get("mimeType"), url[:150]), flush=True)
+                    print("  RESP %s %s %s" % (resp.get("status"), resp.get("mimeType"), safe[:150]), flush=True)
     except KeyboardInterrupt:
         pass
     except Exception as e:

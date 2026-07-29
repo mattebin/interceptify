@@ -13,8 +13,11 @@ Integrity (v2): the downloaded exe is verified before it is ever executed:
   - if the release publishes a SHA-256 (an ``Interceptify.exe.sha256`` /
     ``SHA256SUMS.txt`` asset, or a ``SHA256: <hex>`` line in the release body),
     the download must match it or the update is refused (fail closed).
-Because the swapped binary is relaunched with Administrator rights, skipping
-this check would mean any tampered/MITM'd asset becomes admin-level RCE.
+The binary runs as the invoking user, not elevated - that changed in 2.0.5 and
+this note used to still say "relaunched with Administrator rights". The check
+matters regardless: the swapped exe is launched automatically, from a directory
+any process running as this user can write to, so a tampered or MITM'd asset is
+code execution as the user whether or not a UAC prompt was ever involved.
 """
 
 from __future__ import annotations
@@ -152,8 +155,8 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
 
     Raises (and removes the partial file) on an untrusted host, a size
     mismatch, a SHA-256 mismatch, or when no SHA-256 can be resolved at all
-    (fail-closed — an admin-level exe must be integrity-verified before it is
-    swapped in). Returns the file's SHA-256 hex.
+    (fail-closed — an exe that gets launched automatically must be
+    integrity-verified before it is swapped in). Returns the file's SHA-256 hex.
     """
     if not _host_allowed(url):
         raise ValueError(f"Refusing to download update from untrusted host: {url}")
@@ -184,7 +187,7 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
         tmp.unlink(missing_ok=True)
         raise ValueError(
             "No published SHA-256 for this release -- refusing to install. "
-            "An admin-level exe must be integrity-verified; publish an "
+            "An auto-launched exe must be integrity-verified; publish an "
             "Interceptify.exe.sha256 asset (or a SHA-256 in the release body) "
             "to enable updates."
         )
@@ -193,16 +196,41 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
 
 
 def write_updater_bat(bat_path: Path, current_pid: int, new_exe: Path,
-                      target_exe: Path) -> None:
+                      target_exe: Path, expected_sha256: str | None = None) -> None:
     """
     Write a small batch script that:
       1. Waits for the running Interceptify PID to exit (so the exe unlocks)
-      2. Moves the new exe over the current one
-      3. Relaunches Interceptify
-      4. Deletes itself
+      2. Re-checks the downloaded exe's SHA-256
+      3. Moves the new exe over the current one
+      4. Relaunches Interceptify
+      5. Deletes itself
+
+    The re-check matters because of the gap. The download is verified while the
+    app is still running, but the swap happens seconds later, after we have
+    exited, from a script sitting in a directory the user (and anything running
+    as the user) can write to. Verifying once at download time says nothing
+    about the bytes that actually get installed. certutil is used because it is
+    present on every supported Windows and this runs after our process is gone.
     """
+    guard = ""
+    if expected_sha256:
+        want = expected_sha256.lower()
+        guard = f"""
+set "WANT={want}"
+set "GOT="
+for /f "skip=1 tokens=* delims=" %%H in ('certutil -hashfile "{new_exe}" SHA256') do (
+    if not defined GOT set "GOT=%%H"
+)
+set "GOT=%GOT: =%"
+if /I not "%GOT%"=="%WANT%" (
+    echo Refusing to install: SHA-256 of the downloaded build does not match.
+    del "{new_exe}" >NUL 2>&1
+    pause
+    exit /b 1
+)
+"""
     script = f"""@echo off
-setlocal
+setlocal enabledelayedexpansion
 set PID={current_pid}
 :waitloop
 tasklist /FI "PID eq %PID%" 2>NUL | findstr %PID% >NUL
@@ -210,6 +238,7 @@ if not errorlevel 1 (
     ping -n 2 127.0.0.1 >NUL
     goto waitloop
 )
+{guard}
 move /Y "{new_exe}" "{target_exe}" >NUL 2>&1
 if errorlevel 1 (
     echo Failed to replace exe -- new build left at "{new_exe}"

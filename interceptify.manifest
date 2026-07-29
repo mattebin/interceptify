@@ -1,11 +1,16 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="2.0.0.0" processorArchitecture="*" name="Interceptify" type="win32"/>
+  <assemblyIdentity version="2.0.5.0" processorArchitecture="*" name="Interceptify" type="win32"/>
   <description>Interceptify tray app</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <!-- asInvoker, deliberately. Everything Interceptify writes (xpui.spa,
+             Spotify's prefs, our own config) is owned by the logged-in user, so
+             admin buys nothing. It also cost something real: running elevated
+             out of a user-writable directory means any code that can write
+             there gets executed at high integrity. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
