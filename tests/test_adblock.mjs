@@ -1434,6 +1434,172 @@ async function testM() {
 }
 
 // ===========================================================================
+// TEST N — THE FOUR FAIL-OPEN PATHS AT CONNECTOR CHURN AND TRACK TRANSITIONS
+//
+// Every one of these was green while broken, and all four sit at the two places
+// ads actually leak: a track boundary, and a connector being replaced.
+//
+// N1  A skip suppressed by the over-skip guard produced NO mute either. Mute
+//     lived only in the successful-skip branch, and L1 never sets ad_active, so
+//     the watchdog had already restored sound ~2s after the previous skip. A
+//     second ad at t+2.1s therefore got nothing at all - audible in full.
+// N2  The tripwire was armed by a global boolean, not per connector. After
+//     Spotify replaced connector A with B, B's deliveries were uncounted,
+//     unmuted and uncleared while health still said armed.
+// N3  A SYNCHRONOUS getAdState() throw cleared the private flag but not the
+//     public gate record - which is the one readiness reads.
+// N4  Losing clearSlot from the connector returned early, preserving the last
+//     successful acknowledgement forever.
+// ===========================================================================
+async function testN() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST N"); };
+
+  // ---- N1: the multi-ad track-boundary sequence -----------------------
+  {
+    const clock = makeClock();
+    const fixture = makeFixture();
+    const env = loadAdblock({ fixture, clock, baseFetch });
+    assert("N.load: adblock.js loaded without throwing", env.loadError === null,
+      env.loadError ? String(env.loadError && env.loadError.stack || env.loadError) : "");
+    const wired = wireInStreamProvider(env, fixture);
+    assert("N1.wire: in-stream provider hook installed", !!(wired && wired.api));
+    if (wired && wired.api) {
+      const muteBtn = env.nodes.muteNode;
+      fixture.present.delete('[data-testid="ad-controls"]');
+      env.sandbox.document.title = "Spotify";
+
+      // 1. first audio ad: skips and mutes.
+      wired.api.inStreamAd = { adId: "break-ad-1", slot: "stream",
+                               metadata: { product_name: "audio_ad", format: "audio/ogg" } };
+      const afterFirst = fixture.counts.skipToNext;
+      assert("N1a: the first ad of the break is skipped and muted",
+        afterFirst >= 1 && muteBtn._muted === true,
+        `skips=${afterFirst} muted=${muteBtn._muted}`);
+
+      // 2. the watchdog restores sound, because L1 never sets ad_active. This
+      //    is correct on its own - a real song is playing by now.
+      const watchdog = env.intervals.filter((i) => i.ms === 2000).map((i) => i.fn);
+      clock.advance(2000);
+      for (const fn of watchdog) { try { fn(); } catch {} }
+      assert("N1b: ...and 2s later the watchdog has restored audio",
+        muteBtn._muted === false, `muted=${muteBtn._muted}`);
+
+      // 3. a SECOND, distinct audio ad arrives inside the recent-advance guard.
+      //    The skip is deliberately suppressed. Containment must not be.
+      clock.advance(100);                       // t+2.1s, inside the guard window
+      const before2 = fixture.counts.skipToNext;
+      wired.api.inStreamAd = { adId: "break-ad-2", slot: "stream",
+                               metadata: { product_name: "audio_ad", format: "audio/ogg" } };
+      assert("N1c: the second ad's skip is still suppressed (the guard is right)",
+        fixture.counts.skipToNext === before2,
+        `skips went ${before2} -> ${fixture.counts.skipToNext}`);
+      assert("N1d (THE LEAK): ...but it IS muted, instead of getting nothing at all",
+        muteBtn._muted === true,
+        `muted=${muteBtn._muted} - zero skip AND zero mute is an audible ad`);
+    }
+  }
+
+  // ---- N2: connector replacement --------------------------------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const connA = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_ads_connector = connA;
+    W.__interceptify_instream_api = { adsCoreConnector: connA, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("N2.setup: covering connector A, and ready",
+      W.__interceptify.health().tripwireCoversLive === true
+        && W.__interceptify.health().protectionReady === true,
+      JSON.stringify(W.__interceptify.health().notReady));
+
+    // Spotify swaps the connector underneath us.
+    const connB = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_ads_connector = connB;
+    W.__interceptify_instream_api = { adsCoreConnector: connB, skipToNext() {} };
+    const h = W.__interceptify.health();
+    assert("N2a (THE BUG): a replaced connector is NOT reported as covered",
+      h.tripwireCoversLive === false && h.protectionReady === false,
+      `covers=${h.tripwireCoversLive} ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)}`);
+
+    // ...and the maintenance loop re-subscribes to the live one.
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    const before = W.__interceptify_ads_delivered || 0;
+    connB.deliver({ adId: "on-connector-b", slot: "stream",
+                    metadata: { product_name: "audio_ad", format: "audio/ogg" } });
+    await flush();
+    assert("N2b: after re-subscribing, connector B's deliveries ARE observed",
+      (W.__interceptify_ads_delivered || 0) === before + 1,
+      `delivered ${before} -> ${W.__interceptify_ads_delivered}`);
+    assert("N2c: ...and contained, not merely counted",
+      env.nodes.muteNode._muted === true, `muted=${env.nodes.muteNode._muted}`);
+  }
+
+  // ---- N3: a SYNCHRONOUS gate failure ---------------------------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const conn = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_ads_connector = conn;
+    W.__interceptify_instream_api = { adsCoreConnector: conn, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("N3.setup: ready before the gate breaks",
+      W.__interceptify.health().protectionReady === true);
+
+    conn.getAdState = () => { throw new Error("core gone"); };   // synchronous throw
+    for (const fn of maint) { try { fn(); } catch {} }
+    await flush();
+    const h = W.__interceptify.health();
+    assert("N3 (THE BUG): a synchronous getAdState throw is not left reporting green",
+      h.protectionReady === false && h.notReady.includes("gateClosed"),
+      `ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)} err=${h.gateError}`);
+
+    // A non-Promise RETURN is the same class of failure.
+    const env2 = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W2 = env2.sandbox.window;
+    const maint2 = env2.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const conn2 = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W2.__interceptify_ads_connector = conn2;
+    W2.__interceptify_instream_api = { adsCoreConnector: conn2, skipToNext() {} };
+    W2.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint2) { try { fn(); } catch {} } await flush(); }
+    conn2.getAdState = () => ({ state: { ad_enabled: { value: "false" } } });   // not a promise
+    for (const fn of maint2) { try { fn(); } catch {} }
+    await flush();
+    assert("N3b: ...and so is a getAdState that returns no promise",
+      W2.__interceptify.health().protectionReady === false,
+      JSON.stringify(W2.__interceptify.health().notReady));
+  }
+
+  // ---- N4: clearSlot disappears ---------------------------------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const conn = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_ads_connector = conn;
+    W.__interceptify_instream_api = { adsCoreConnector: conn, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("N4.setup: the stream clear was acknowledged",
+      W.__interceptify.health().slotClearConfirmed === true,
+      JSON.stringify(W.__interceptify.health().slotClear));
+
+    delete conn.clearSlot;                       // the method goes away
+    for (const fn of maint) { try { fn(); } catch {} }
+    await flush();
+    const h = W.__interceptify.health();
+    assert("N4 (THE BUG): losing clearSlot invalidates the old acknowledgement",
+      h.slotClearConfirmed === false && h.protectionReady === false
+        && h.notReady.includes("slotCleared"),
+      `confirmed=${h.slotClearConfirmed} notReady=${JSON.stringify(h.notReady)}`);
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -1475,6 +1641,9 @@ async function main() {
   }
   try { await testM(); } catch (e) {
     assert("TEST M crashed", false, String(e && e.stack || e));
+  }
+  try { await testN(); } catch (e) {
+    assert("TEST N crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

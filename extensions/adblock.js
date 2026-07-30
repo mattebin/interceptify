@@ -857,8 +857,27 @@
   // LAZY chunk, so it appears only once the ads subsystem has loaded — hence the
   // retry loop on the interval). Cached once found.
   let _adsConnector = null;
+  // Is the cached connector still the one the bundle would hand us? A connector
+  // whose RPC methods have gone is a dead object, and caching it forever meant
+  // every later call quietly targeted a corpse while health reported a
+  // connector present.
+  function connectorUsable(ac) {
+    return !!(ac && typeof ac.skipToNextWithOverride === "function"
+              && typeof ac.putState === "function");
+  }
+
   function resolveAdsConnector() {
-    if (_adsConnector) return _adsConnector;
+    if (_adsConnector && connectorUsable(_adsConnector)) return _adsConnector;
+    if (_adsConnector) {
+      // Was usable, is not any more: Spotify replaced or tore it down. Drop it
+      // so the scan below can find the live one, and make everything keyed to
+      // the old identity re-establish itself (tripwire subscription, slot-clear
+      // acknowledgement, gate reading).
+      snifferLog("ads-connector-stale", {});
+      _adsConnector = null;
+      window.__interceptify_ads_connector = null;
+      invalidateConnectorState("connector-stale");
+    }
     if (CFG.snapshotConnector === false) return null;
     const M = window.__webpack_modules__;
     const req = anyAdsRequire();
@@ -939,6 +958,8 @@
     const g = window.__interceptify_ad_gate || null;
     const missing = [];
     if (!window.__interceptify_ads_connector) missing.push("connector");
+    // Subscribed to the connector that is live NOW, not merely subscribed once.
+    else if (!tripwireCoversLiveConnector() && CFG.adTripwire !== false) missing.push("tripwire");
     if (_baselineKeys === null) missing.push("baseline");          // no populated ad-state seen
     if (!(g && g.verified)) missing.push("gateClosed");            // written AND read back false
     // A reading is evidence for as long as it is fresh. The re-read cadence is
@@ -1199,7 +1220,25 @@
     slot: null, ok: null, t: 0, error: null, epoch: 0, startedAt: 0 };
 
   function clearAdSlots(ac, reason) {
-    if (CFG.clearAdSlots === false || !ac || typeof ac.clearSlot !== "function") return;
+    if (CFG.clearAdSlots === false) return;
+    // Returning early here left the LAST successful acknowledgement standing as
+    // the current answer. So removing clearSlot from the live connector - or
+    // losing the connector entirely - reported protectionReady: true and
+    // slotClearConfirmed: true indefinitely, while a queued stream ad had
+    // nothing left that could flush it at the next track boundary. The
+    // acknowledgement described an object that was no longer being used.
+    if (!ac || typeof ac.clearSlot !== "function") {
+      if (_slotClear.ok !== false) {
+        _slotClear.epoch++;
+        _slotClear.ok = false;
+        _slotClear.t = Date.now();
+        _slotClear.startedAt = 0;
+        _slotClear.error = ac ? "the live connector has no clearSlot"
+                              : "no connector to flush the slot through";
+        snifferLog("slot-clear-unavailable", { error: _slotClear.error });
+      }
+      return;
+    }
     const code = CFG.clearSlotReason != null ? CFG.clearSlotReason : 1;
     const slots = adSlots();
     const primary = slots[0];
@@ -1343,12 +1382,24 @@
                                         error: "getAdState never settled" };
       snifferLog("ad-gate-read-stuck", { sinceMs: Date.now() - _adGateRefreshStartedAt });
     }
-    if (_adGateRefreshing || !ac || typeof ac.getAdState !== "function") return;
+    if (_adGateRefreshing) return;
+    if (!ac || typeof ac.getAdState !== "function") {
+      // The method itself is gone. Every previous reading was taken through it,
+      // so none of them describes anything that still exists.
+      markGateUnreadable("getAdState is not available on the live connector");
+      return;
+    }
     _adGateRefreshing = true;
     _adGateRefreshStartedAt = Date.now();
     try {
       const p = ac.getAdState();
-      if (!p || !p.then) { _adGateRefreshing = false; return; }
+      if (!p || !p.then) {
+        // A synchronous return is not a reading. It used to leave the previous
+        // `verified: true` standing as the current answer forever.
+        _adGateRefreshing = false;
+        markGateUnreadable("getAdState returned no promise");
+        return;
+      }
       p.then((s) => {
         _adGateRefreshing = false;
         const st = (s && s.state) || {};
@@ -1395,10 +1446,23 @@
         snifferLog("ad-gate-read-failed", { error: String((e && e.message) || e) });
       });
     } catch (e) {
+      // A SYNCHRONOUS throw. This cleared the private flag but left
+      // window.__interceptify_ad_gate untouched - and that public record is
+      // what protectionReady() actually reads, so health stayed
+      // `verified: true, notReady: []` while every read was throwing.
       _adGateRefreshing = false;
-      _adGateVerified = false;
-      snifferLog("ad-gate-read-threw", { error: String((e && e.message) || e) });
+      markGateUnreadable(String((e && e.message) || e));
     }
+  }
+
+  // One place that makes "we cannot read the gate" true in BOTH the private
+  // flag and the public record. Two sources of truth for one fact is how the
+  // stale green survived: the code that failed updated one of them.
+  function markGateUnreadable(why) {
+    _adGateVerified = false;
+    window.__interceptify_ad_gate = { keys: _adGateKeys || [], verified: false,
+                                      readAt: _adGateReadAt, error: why };
+    snifferLog("ad-gate-unreadable", { error: why });
   }
   // TRIPWIRE: watch the core's in-stream ad delivery channel forever. This is the
   // ground truth for "no load at all" — if the core hands us an ad while the block
@@ -1485,8 +1549,35 @@
     return out;
   }
 
+  // The tripwire subscription belongs to ONE connector object. It was tracked by
+  // a global boolean instead, so once Spotify replaced connector A with
+  // connector B, B's deliveries were not counted, muted, cleared or skipped -
+  // and health still said the tripwire was armed. "We subscribed once" is not
+  // the claim health was making; "we are covering the connector that is live
+  // right now" is.
+  let _tripwireOn = null;          // the connector object we are subscribed to
+
+  function invalidateConnectorState(reason) {
+    // Everything below is an assertion about a SPECIFIC connector. When that
+    // connector goes away, the assertions do not survive it - keeping them is
+    // how a green readiness outlives the object it describes.
+    _tripwireOn = null;
+    window.__interceptify_tripwire = false;
+    _adGateVerified = false;
+    _adGateRefreshing = false;
+    window.__interceptify_ad_gate = { keys: [], verified: false,
+                                      readAt: _adGateReadAt, error: reason };
+    _slotClear.epoch++;            // orphan any in-flight acknowledgement
+    _slotClear.ok = false;
+    _slotClear.t = Date.now();
+    _slotClear.error = "connector replaced before this clear was confirmed: " + reason;
+    snifferLog("connector-state-invalidated", { reason });
+  }
+
   function installAdTripwire(ac) {
-    if (CFG.adTripwire === false || window.__interceptify_tripwire || !ac) return;
+    if (CFG.adTripwire === false || !ac) return;
+    if (_tripwireOn === ac) return;                 // already covering THIS one
+    if (_tripwireOn && _tripwireOn !== ac) invalidateConnectorState("connector-replaced");
     try {
       if (typeof ac.subscribeToInStreamAds !== "function") return;
       ac.subscribeToInStreamAds((msg) => {
@@ -1512,9 +1603,17 @@
           if (!ready.ok) snifferLog("ad-before-protection-ready", { missing: ready.missing, contained });
         } catch {}
       });
+      _tripwireOn = ac;
       window.__interceptify_tripwire = true;
       window.__interceptify_ads_delivered = window.__interceptify_ads_delivered || 0;
     } catch {}
+  }
+
+  // Health and readiness must mean "the LIVE connector is covered", not "some
+  // connector was covered at some point".
+  function tripwireCoversLiveConnector() {
+    const live = window.__interceptify_ads_connector;
+    return !!(live && _tripwireOn === live);
   }
 
   function suppressAdState(reason) {
@@ -1574,10 +1673,31 @@
             // an unstable timestamp -> re-skip storm onto whatever plays next).
             rememberInStreamApiCall("skipToNext.no-stable-key", { ad: summary });
           } else if (!inStreamSkipSafe(audioAdAuthoritative)) {
-            // Over-skip guard tripped: suppress the skip. The ad object is still
-            // nulled below (UI suppressed), and advance() will skip it once
-            // CONFIRMED + fully gated, so a real ad is never leaked here.
+            // Over-skip guard tripped: suppress the SKIP. That is correct - the
+            // guard exists because a late object may belong to a break we
+            // already advanced past, and skipping again would land on a real
+            // song.
+            //
+            // But muting was only ever done in the successful-skip branch, so a
+            // credible audio ad arriving inside the guard window got NEITHER a
+            // skip nor a mute, and nothing else covered it: L1 does not set
+            // ad_active, so the watchdog had already restored sound ~2s after
+            // the previous skip. That is a multi-ad break at a track boundary,
+            // audible in full. Reproduced by Codex at t+2.1s.
+            //
+            // Skipping and muting have opposite risk profiles: a wrong skip
+            // destroys the user's song and cannot be undone, a wrong mute costs
+            // a few seconds of silence and self-releases. So when the object is
+            // a credible AUDIO ad, suppress the skip and contain anyway.
             rememberInStreamApiCall("skipToNext.suppressed", { ad: summary });
+            if (audioAdAuthoritative) {
+              try {
+                armMute();
+                holdContainment(ad);
+                _counters.speculativeMute++;
+                snifferLog("skip-suppressed-contained", { id: stableKey });
+              } catch {}
+            }
           } else {
             try {
               rememberInStreamApiCall("skipToNext.forAd", { ad: summary });
@@ -3873,6 +3993,10 @@
         },
         l1ProviderRan: !!window.__interceptify_l1_provider_ran,
         l1ProviderActive: !!window.__interceptify_l1_provider_active,
+        // "armed" was a global boolean, so a connector swap left this true while
+        // the new connector's deliveries went entirely unobserved.
+        tripwireCoversLive: (function () { try { return tripwireCoversLiveConnector(); }
+                                           catch { return false; } })(),
         instreamModuleIds: (window.__interceptify_instream_module_ids || []).slice(),
         baselineEmptyReads: window.__interceptify_baseline_empty_reads || 0,
         // Loaded is not protective. See protectionReady().

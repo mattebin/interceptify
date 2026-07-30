@@ -144,6 +144,13 @@ CDP_PORT = 9333  # deliberately not 9222, so a manual debug session never collid
 # instreamApi is deliberately NOT here. It only materialises once Spotify hands
 # over an in-stream ad object, so requiring it would mean a session with no ads
 # could never pass - which is the session the block is supposed to produce.
+# Real listening that must be observed on the CHANGED block before a delivery can
+# be retired. Wall-clock alone lets a machine that was asleep for a day satisfy
+# the window, and a sleeping machine has produced no ad opportunities at all.
+# Deliberately modest: this is a floor under "we actually used it", not an
+# attempt to prove absence, which is not provable for server-scheduled ads.
+DELIVERY_MIN_OBSERVED_S = 30 * 60
+
 REQUIRED_LAYERS = ("fetch", "xhr", "l1Chunk", "l1Provider", "adsConnector", "adGate")
 
 # How long an unresolved ad delivery stays unresolved once something about the
@@ -830,30 +837,94 @@ def delivery_block(state: dict) -> dict | None:
     return d if isinstance(d, dict) and d.get("count") else None
 
 
+def note_block_change(state: dict, fp: dict) -> None:
+    """Stamp WHEN the running block first differed from the one that failed.
+
+    The clearance clock used to run from the delivery timestamp, so the 24 hours
+    could elapse while the broken code was still installed - and a fix patched in
+    on day ten cleared the incident instantly, with zero seconds of listening on
+    the new code. "24h with no further delivery" has to mean 24h ON THE THING
+    THAT IS SUPPOSED TO HAVE FIXED IT, or it measures nothing but patience.
+    """
+    d = delivery_block(state)
+    if not d or d.get("changed_at"):
+        return
+    if not (fp.get("live_payload_sha") and fp.get("live_config_sha")):
+        return                                   # unknown is not changed
+    if (fp["live_payload_sha"] != d.get("payload_sha")
+            or fp["live_config_sha"] != d.get("config_sha")):
+        d["changed_at"] = int(time.time())
+        d["changed_to_payload"] = fp["live_payload_sha"]
+        d["changed_to_config"] = fp["live_config_sha"]
+        d["observed_s"] = 0
+        log.info("the running block now differs from the one that failed; the %dh "
+                 "clearance window starts now, not at the delivery",
+                 DELIVERY_CLEAR_AFTER_S // 3600)
+
+
+def note_observed_playback(state: dict, report: dict) -> None:
+    """Accumulate REAL listening seen on the changed block.
+
+    Wall-clock is not evidence: a machine that was asleep for 24 hours has
+    produced exactly as many ad opportunities as one that was off. Only playback
+    the user was doing counts - a window where the test had to start the music
+    itself proves the plumbing, not the outcome.
+    """
+    d = delivery_block(state)
+    if not d or not d.get("changed_at"):
+        return
+    final = report.get("final") or (report.get("rounds") or [{}])[-1].get("result") or {}
+    if final.get("startedByTest"):
+        return
+    delta = final.get("streamedDelta")
+    if isinstance(delta, (int, float)) and delta > 0:
+        d["observed_s"] = int(d.get("observed_s", 0)) + int(delta)
+
+
 def clearable_reason(state: dict, fp: dict) -> str | None:
     """Why the unresolved delivery may be cleared now, or None if it may not."""
     d = delivery_block(state)
     if not d:
         return None
-    # A backfilled entry has no recorded provenance - see
-    # backfill_delivery_failures(). Requiring a change we cannot define would
-    # pin the flag up permanently.
+    # A backfilled entry has no recorded provenance, so it can only ever clear on
+    # time - see backfill_delivery_failures(). Requiring a change we cannot define
+    # would pin the flag up permanently.
+    if d.get("backfilled"):
+        elapsed = int(time.time()) - int(d.get("last_t") or 0)
+        if elapsed < DELIVERY_CLEAR_AFTER_S:
+            return None
+        return (f"{elapsed // 3600}h have passed since the last recorded delivery "
+                f"(provenance unknown, so this clears on time alone)")
+
     # Both sides are what Spotify is RUNNING. Comparing the sidecar config here
     # let a file edit alone satisfy "the block changed" - so a fix that was
     # never injected could clear a delivery that was never addressed.
-    changed = d.get("backfilled") or (
-        fp.get("live_payload_sha") != d.get("payload_sha")
-        or fp.get("live_config_sha") != d.get("config_sha"))
-    if not changed:
+    #
+    # And UNKNOWN is not CHANGED. A missing live hash - an unpatched archive, an
+    # unreadable one - used to compare unequal to the recorded hash and count as
+    # a fix, so the state in which the block is not running at all was the state
+    # most likely to retire a failure.
+    if not (fp.get("live_payload_sha") and fp.get("live_config_sha")):
         return None
-    elapsed = int(time.time()) - int(d.get("last_t") or 0)
+    if (fp["live_payload_sha"] == d.get("payload_sha")
+            and fp["live_config_sha"] == d.get("config_sha")):
+        return None                              # still the code that failed
+    if fp["live_payload_sha"] != d.get("changed_to_payload") \
+            or fp["live_config_sha"] != d.get("changed_to_config"):
+        return None                              # changed again; the clock restarts
+
+    # Measured from when the NEW code went in, not from when the ad played.
+    since = int(d.get("changed_at") or 0)
+    if not since:
+        return None
+    elapsed = int(time.time()) - since
     if elapsed < DELIVERY_CLEAR_AFTER_S:
         return None
-    if d.get("backfilled"):
-        return (f"{elapsed // 3600}h have passed since the last recorded delivery "
-                f"(provenance unknown, so this clears on time alone)")
-    return (f"the block changed after the failure and {elapsed // 3600}h of use have passed "
-            f"with no further delivery")
+    observed = int(d.get("observed_s") or 0)
+    if observed < DELIVERY_MIN_OBSERVED_S:
+        return None
+    return (f"the running block changed {elapsed // 3600}h ago and {observed // 60} minute(s) of "
+            f"real playback have been observed on it with no further delivery")
 
 
 def resolve_verdict(structural_verdict: str | None, state: dict, fp: dict) -> tuple[str, int]:
@@ -869,13 +940,44 @@ def resolve_verdict(structural_verdict: str | None, state: dict, fp: dict) -> tu
     Exit codes: 0 pass, 2 not verified, 3 ads reached the user, 4 unproven.
     """
     pending = delivery_block(state)
-    if pending and not clearable_reason(state, fp):
-        return "UNRESOLVED", 3
+    if pending:
+        why = clearable_reason(state, fp)
+        if not why:
+            return "UNRESOLVED", 3
+        # CLEAR IT HERE. Deciding a record is clearable and then leaving it in
+        # place produced two components disagreeing about the same machine: run()
+        # saved PASS while the record survived, and the next --verify read that
+        # surviving record as FAIL. The decision and its consequence have to be
+        # the same act, or "clearable" is a third state nobody handles.
+        log.info("clearing the unresolved delivery flag: %s", why)
+        state["cleared_delivery"] = {**pending, "cleared_t": int(time.time()), "why": why}
+        state.pop("unresolved_delivery", None)
     if structural_verdict == "PASS":
         return "PASS", 0
     if structural_verdict == "UNKNOWN":
         return "UNKNOWN", 4
     return "FAIL", 2
+
+
+def blocked_by_pending(fp: dict, pending: dict | None, force: bool) -> bool:
+    """Should this run STOP because of an unresolved delivery?
+
+    Only when there is nothing new to install. This predicate used to be an
+    unconditional `if pending: return 3` sitting IN FRONT of the repair, so on
+    any machine with a recorded failure the scheduled path could never patch
+    Spotify with a newer payload or config - the one action that might actually
+    resolve the failure was the one action the failure blocked. A machine that
+    had heard an ad was therefore the machine least able to receive the fix.
+
+    Extracted so the rule is testable on its own. Inline it was three conditions
+    inside a forty-line function, which is how it stayed wrong across two
+    reviews.
+    """
+    if not pending or force:
+        return False
+    needs_patch = (not fp.get("patched")) or (not fp.get("payload_matches")) \
+        or (not fp.get("config_matches"))
+    return not needs_patch
 
 
 def report_update(fp: dict, state: dict, reason: str) -> None:
@@ -986,12 +1088,33 @@ def candidate_gate_keys(cdp: CDP) -> list[str]:
 
 
 
-def snapshot_config() -> str | None:
-    """The config exactly as it is now, for rollback. None if unreadable."""
+class _Missing:
+    """The local config did not exist when the snapshot was taken."""
+    def __repr__(self) -> str:
+        return "<no local config>"
+
+
+NO_CONFIG = _Missing()
+
+
+def snapshot_config():
+    """The config exactly as it is now, for rollback.
+
+    Three distinct outcomes, and collapsing two of them was the bug: "the file
+    did not exist" and "the file could not be read" both returned None, and
+    restore_config() treats None as nothing-to-do. So on a machine with no local
+    config - the normal state - a repair could write a guessed
+    adblock.config.local.json, fail to prove it, "roll back" by doing nothing,
+    and leave the guess behind. That file is the highest-priority config source
+    and is never overwritten by a release, so an unproven guess would override
+    every future shipped fix, permanently.
+    """
+    if not OUR_CONFIG.exists():
+        return NO_CONFIG
     try:
         return OUR_CONFIG.read_text(encoding="utf-8")
     except Exception:
-        return None
+        return None                                  # exists but unreadable
 
 
 def restore_config(snap: str | None, why: str) -> None:
@@ -1004,14 +1127,24 @@ def restore_config(snap: str | None, why: str) -> None:
     a worse position than this one did.
     """
     if snap is None:
+        return                                       # unreadable: nothing to restore TO
+    if snap is NO_CONFIG:
+        # There was no local config before this cycle, so anything here now is
+        # something the repair invented and could not prove.
+        try:
+            if OUR_CONFIG.exists():
+                OUR_CONFIG.unlink()
+                log.warning("removed the local config a failed repair created (%s)", why)
+        except OSError as e:
+            log.error("could not remove the local config a failed repair created: %s", e)
         return
     try:
         if OUR_CONFIG.read_text(encoding="utf-8") == snap:
             return                                   # never touched, nothing to undo
         OUR_CONFIG.write_text(snap, encoding="utf-8")
-        log.warning("rolled back adblock.config.json (%s)", why)
+        log.warning("rolled back %s (%s)", OUR_CONFIG.name, why)
     except Exception as e:
-        log.error("could not roll back adblock.config.json: %s", e)
+        log.error("could not roll back %s: %s", OUR_CONFIG.name, e)
 
 
 def persist_gate_pattern(key: str) -> None:
@@ -1315,6 +1448,11 @@ def run(force: bool = False, duration_ms: int = 12000) -> int:
             reason = f"{n} ad(s) reached the user since the last run"
         state["verified_pass"] = False      # force a real re-verification
 
+    # Stamp the moment the running block first differs from the one that failed.
+    # Everything about clearance is measured from here, not from the delivery.
+    note_block_change(state, fp)
+    save_state(state)
+
     # An unresolved delivery outranks everything below. The files can be
     # perfect, the structural test can pass, and the user still heard an ad.
     pending = delivery_block(state)
@@ -1350,12 +1488,23 @@ def run(force: bool = False, duration_ms: int = 12000) -> int:
     if reason is None and not force:
         log.info("healthy — already verified; no new ad incidents")
         return 0
-    if pending and not force:
+    # An unresolved delivery does NOT outrank installing newer code. This return
+    # sat in front of the repair unconditionally, so on a machine with a recorded
+    # failure the scheduled path could never patch Spotify with the fix - the one
+    # thing that might actually resolve the failure was the one thing blocked by
+    # it. The stop is right only when there is nothing new to install.
+    if pending and not force and not blocked_by_pending(fp, pending, force):
+        log.warning("%d unresolved delivery incident(s), but the running block is not this "
+                    "build (patched=%s payload=%s config=%s) - installing it anyway; the "
+                    "incident stays open and the clearance window starts from this patch.",
+                    pending["count"], fp["patched"], fp["payload_matches"], fp["config_matches"])
+    elif blocked_by_pending(fp, pending, force):
         # Repairing again changes nothing on its own, and re-running the
         # structural test would only re-prove the plumbing. Say what is true and
         # stop, rather than performing a check whose passing would be misread.
+        base = int(pending.get("changed_at") or pending.get("last_t") or 0)
         clears = time.strftime("%Y-%m-%d %H:%M",
-                               time.localtime(int(pending.get("last_t") or 0) + DELIVERY_CLEAR_AFTER_S))
+                               time.localtime(base + DELIVERY_CLEAR_AFTER_S))
         log.error("UNRESOLVED: %d ad(s) reached the user (%s to %s). Re-running the structural "
                   "test would only re-prove the plumbing, so there is nothing to re-verify here. "
                   "Clears on its own after %s if none recurs, or now with "
@@ -1374,6 +1523,9 @@ def run(force: bool = False, duration_ms: int = 12000) -> int:
     fp2 = fingerprint()
     # Resolved against the POST-repair fingerprint: a repair that genuinely
     # changed the payload or the config starts the 24h clock, it does not stop it.
+    note_block_change(state, fp2)
+    note_observed_playback(state, report)
+    save_state(state)
     verdict, exit_code = resolve_verdict(report.get("verdict"), state, fp2)
     passed = verdict == "PASS"
     if verdict == "UNRESOLVED" and report.get("verdict") == "PASS":

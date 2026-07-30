@@ -98,6 +98,33 @@ def main() -> int:
     check("6d. re-running is a no-op, not a second pass over placeholders",
           (before2, after2) == (0, 0), f"{before2},{after2}")
 
+    # ---- 7. the raw-file path must be as strong as the in-memory one ----
+    # It was not. `redact_any` consults the KEY name and has always handled
+    # Authorization headers; `redact_structured` matched only SENSITIVE_PARAMS
+    # substrings, and "authorization" is not one of them. So --redact-captures
+    # left `"Authorization": "Bearer ..."` intact AND reported the file clean:
+    # the narrower of the two redactors was the one doing the remediation, and
+    # the checker shared its blind spot.
+    hdr = json.dumps({"headers": {"Authorization": f"Bearer {TOKEN}"}, "note": "kept"})
+    check("7. an Authorization header IS seen by the raw-file path",
+          redact.credentials_in(hdr) >= 1, f"credentials_in={redact.credentials_in(hdr)}")
+    out = redact.redact_structured(hdr)
+    check("7b. ...and removed", TOKEN not in out, out[:90])
+    check("7c. ...and then reported clean", redact.credentials_in(out) == 0, out[:90])
+    check("7d. the in-memory and raw paths now agree",
+          TOKEN not in json.dumps(redact.redact_any(json.loads(hdr))) and TOKEN not in out)
+
+    # ---- 8. historical captures kept raw URL queries ---------------------
+    # New netlogs go through redact_url(), which drops the query. Retrospective
+    # cleanup did not, so the same data was treated differently depending on
+    # which path happened to touch it.
+    q = json.dumps({"url": "https://api.spotify.com/v1/me?sp_dc=abc123def&market=SE"})
+    out = redact.redact_structured(q)
+    check("8. a raw URL query is stripped by the file path too",
+          "sp_dc" not in out and "abc123def" not in out, out)
+    check("8b. ...and the endpoint survives, unmangled",
+          "https://api.spotify.com/v1/me" in out and "<redacted>" not in out, out)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: " + "; ".join(FAILURES))

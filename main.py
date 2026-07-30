@@ -204,7 +204,16 @@ def sync_bundled_extensions() -> Optional[str]:
                     "change into adblock.config.local.json, which is never overwritten.",
                     keep.name)
     except Exception as e:
-        log.warning("Could not update adblock.config.json: %s", e)
+        # Fatal, exactly like the payload above, and for exactly the same reason.
+        # The config is half of what gets injected - slot ids, selectors, module
+        # ids, gate patterns - and this was the only half whose sync failure was
+        # advisory. A newer build could therefore inject an OLDER config while
+        # every internal check agreed with itself, which is the failure the
+        # injected-config fingerprint was added to catch. Better to refuse to
+        # patch than to patch with values this build does not ship.
+        log.error("Could not sync adblock.config.json: %s", e)
+        return (f"The config on disk could not be updated to this build ({APP_VERSION}): {e}. "
+                f"Patching is disabled until {dst_cfg} is writable.")
     return None
 
 

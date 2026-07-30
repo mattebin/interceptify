@@ -66,6 +66,12 @@ jobs:
       - name: A release must be able to correct a build-volatile default
         run: python tests/test_config_upgrade.py
 
+      # The redactor is what stands between a diagnostic capture and a shared
+      # credential, and its raw-file path was quietly weaker than its in-memory
+      # one - it left Authorization headers intact AND reported them clean.
+      - name: Redaction removes credentials and keeps diagnostics readable
+        run: python tests/test_redact.py
+
       # Applies to MANUAL runs too, via the required `version` input.
       - name: Version consistency (tag/input vs APP_VERSION vs manifest)
         run: python tests/test_version_consistency.py "${{ github.event.inputs.version || github.ref_name }}"

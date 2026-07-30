@@ -55,35 +55,85 @@ _KV_PAIR = re.compile(
 )
 
 
+_PLACEHOLDER = ("<redacted>", '"<redacted>"')
+
+# An Authorization / Cookie header as it appears in a captured JSON body. The
+# in-memory redactor has always handled these (redact_any consults _AUTH_NAME on
+# the KEY), but the raw-text path did not - "authorization" is not a substring of
+# anything in SENSITIVE_PARAMS. So a capture written before the redactor existed
+# kept `"Authorization": "Bearer ..."` intact while the cleanup reported it
+# clean: the narrower of two redactors was the one doing the remediation.
+_AUTH_PAIR = re.compile(
+    r'(?i)("(?:proxy-|www-)?(?:authorization|authenticate|cookie|set-cookie)"\s*:\s*)'
+    r'("(?:[^"\\]|\\.)*")'
+)
+
+# A URL that still carries a query string. redact_url() drops queries wholesale
+# for live capture, but retrospective cleanup left historical ones untouched, so
+# the two paths disagreed about the same data.
+_URL_QUERY = re.compile(r'(https?://[^\s"\'<>\\]*?)\?[^\s"\'<>\\]*')
+
+
+def _scrub(s: str) -> tuple[str, int]:
+    """Redact `s`, and report how many real credentials were removed.
+
+    ONE pass produces both answers. They used to be computed separately -
+    redact_structured() did the work, credentials_in() counted with a different
+    and narrower set of patterns - so the checker could report a file clean while
+    the cleaner had left credentials in it. A verifier that does not run the same
+    logic as the thing it verifies is not checking that thing.
+    """
+    n = 0
+
+    def bump(repl):
+        def f(m):
+            nonlocal n
+            if m.lastindex and m.group(m.lastindex) in _PLACEHOLDER:
+                return m.group(0)                    # already done, not a finding
+            n += 1
+            return repl(m)
+        return f
+
+    # URL queries FIRST, and the order matters. Running the pair passes first
+    # rewrites `access_token=X` to `access_token=<redacted>` inside the URL, and
+    # the query-stripper's character class then stops at the `<` - leaving a
+    # `.../me<redacted>` stub behind. Same credentials removed either way, but
+    # one of the two produces a file a human can still read.
+    def strip_query(m):
+        nonlocal n
+        n += 1
+        return m.group(1)
+    s = _URL_QUERY.sub(strip_query, s)
+
+    s = _AUTH_PAIR.sub(bump(lambda m: m.group(1) + '"<redacted>"'), s)
+    s = _JSON_PAIR.sub(bump(lambda m: m.group(1) + '"<redacted>"'), s)
+    s = _KV_PAIR.sub(bump(lambda m: m.group(1) + "=<redacted>"), s)
+
+    def bearer(m):
+        nonlocal n
+        n += 1
+        return "Bearer <redacted>"
+    s = _BEARER.sub(bearer, s)
+    return s, n
+
+
 def redact_structured(s: str) -> str:
     """Mask sensitive values in JSON or key=value text, whatever their length."""
-    s = _JSON_PAIR.sub(lambda m: m.group(1) + '"<redacted>"', s)
-    return _KV_PAIR.sub(lambda m: m.group(1) + "=<redacted>", s)
-
-
-_PLACEHOLDER = ("<redacted>", '"<redacted>"')
+    return _scrub(s)[0]
 
 
 def credentials_in(s: str) -> int:
-    """How many sensitive pairs `s` still exposes an ACTUAL VALUE for.
+    """How many credentials `s` still exposes an ACTUAL VALUE for.
 
     Used to decide whether a file needs cleaning and, more importantly, to check
     afterwards that cleaning it worked. "we ran the redactor" is not the same
     claim as "there is nothing left", and only the second one is worth acting on.
 
-    Counting matches alone is not that check: a redacted pair still matches the
-    pattern, so `access_token=<redacted>` counted as a live credential and a
-    fully-cleaned file reported exactly as dirty as it started. Note the failure
-    direction - it reported clean files as dirty, never dirty ones as clean.
+    Counting raw matches is not that check either: a redacted pair still matches
+    its pattern, so `access_token=<redacted>` once counted as a live credential
+    and a fully-cleaned file reported exactly as dirty as it started.
     """
-    n = 0
-    for _name, value in _JSON_PAIR.findall(s):
-        if value not in _PLACEHOLDER:
-            n += 1
-    for _name, value in _KV_PAIR.findall(s):
-        if value not in _PLACEHOLDER:
-            n += 1
-    return n
+    return _scrub(s)[1]
 
 
 def redact_file(path) -> tuple[int, int]:
