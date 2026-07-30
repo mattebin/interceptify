@@ -59,17 +59,49 @@ class Release:
 
 
 def _host_allowed(url: str) -> bool:
-    """True only for GitHub-controlled hosts that serve releases/assets."""
+    """True only for HTTPS URLs on GitHub-controlled release/asset hosts.
+
+    The scheme check is not decoration. The allowlist matched on hostname alone,
+    so `http://github.com/...` passed - and a plaintext download is exactly where
+    an allowlist stops meaning anything, because nothing about the response is
+    attributable to the host that was allowed.
+    """
     try:
-        host = (urlparse(url).hostname or "").lower()
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
     except Exception:
         return False
-    return host == "github.com" or host.endswith(".githubusercontent.com")
+    if p.scheme != "https":
+        return False
+    return (host in ("github.com", "api.github.com")
+            or host.endswith(".githubusercontent.com"))
+
+
+class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-check the allowlist at EVERY hop, not just the URL we started with.
+
+    GitHub release assets redirect to object storage, so following redirects is
+    required. But only the first URL was ever validated: a redirect could send
+    the download anywhere, and the integrity check downstream would then be
+    verifying whatever that host returned. The SHA-256 check still has to pass,
+    so this is defence in depth rather than the only guard - but a check that
+    stops applying after the first hop is not the check it appears to be.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _host_allowed(newurl):
+            raise ValueError(f"Refusing to follow update redirect to untrusted host: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_AllowlistRedirectHandler)
 
 
 def _fetch_text(url: str, timeout: int = 15) -> str:
+    if not _host_allowed(url):
+        raise ValueError(f"Refusing to fetch update metadata from untrusted host: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
 
@@ -106,8 +138,10 @@ def parse_version(s: str) -> tuple[int, ...]:
 
 def get_latest_release() -> Optional[Release]:
     try:
+        if not _host_allowed(LATEST_URL):
+            raise ValueError(f"Update metadata URL is not on an allowed host: {LATEST_URL}")
         req = urllib.request.Request(LATEST_URL, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with _OPENER.open(req, timeout=8) as r:
             data = json.loads(r.read())
     except Exception as e:
         log.warning("Update check failed: %s", e)
@@ -165,7 +199,7 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
     tmp = dest.with_suffix(dest.suffix + ".part")
     digest = hashlib.sha256()
     total = 0
-    with urllib.request.urlopen(req, timeout=timeout) as r, tmp.open("wb") as f:
+    with _OPENER.open(req, timeout=timeout) as r, tmp.open("wb") as f:
         while True:
             chunk = r.read(64 * 1024)
             if not chunk:

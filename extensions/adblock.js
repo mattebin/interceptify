@@ -169,6 +169,7 @@
     // audio break, and one of them would otherwise win on a plain /stream/ test.
     primarySlotRegex: "^(?!podcast)[a-z-]*stream[a-z-]*$",
     // ---- snapshot-build ads-connector resurrection (Spotify 1.2.93+ V8 snapshot) ----
+    connectorRecheckMs: 3000,           // how often to re-ask the bundle which ads connector is ACTIVE. A handed-off connector usually stays callable, so "still has its methods" was never evidence it is still the live one.
     snapshotConnector: true,            // rebuild ads-connector access from window.__webpack_modules__ when the closure require is trapped (chunk.push no longer threads it). Powers adEnabledKill + killAdEndpoints + overrideSkip on snapshot builds.
     adEnabledKill: true,                // THE MASTER PREVENTION LEVER. putState('ad_enabled','false') on the core ad-scheduler state stops ad breaks from being SCHEDULED at all (not reactively skipped). Live-proven on 1.2.93: 10 forced skips that previously triggered an ad -> 0 ads. Re-applied fast to survive product-state refreshes re-pushing ad_enabled:true.
     adEnabledKillMs: 1000,              // fast re-apply cadence for ad_enabled=false (it held ~8s untouched, so 1s is safe headroom)
@@ -857,6 +858,9 @@
   // LAZY chunk, so it appears only once the ads subsystem has loaded — hence the
   // retry loop on the interval). Cached once found.
   let _adsConnector = null;
+  // Bumped on every connector identity change. Captured by anything that goes
+  // asynchronous, so a reply can be matched against the object it was asked.
+  let _connectorEpoch = 0;
   // Is the cached connector still the one the bundle would hand us? A connector
   // whose RPC methods have gone is a dead object, and caching it forever meant
   // every later call quietly targeted a corpse while health reported a
@@ -866,18 +870,10 @@
               && typeof ac.putState === "function");
   }
 
-  function resolveAdsConnector() {
-    if (_adsConnector && connectorUsable(_adsConnector)) return _adsConnector;
-    if (_adsConnector) {
-      // Was usable, is not any more: Spotify replaced or tore it down. Drop it
-      // so the scan below can find the live one, and make everything keyed to
-      // the old identity re-establish itself (tripwire subscription, slot-clear
-      // acknowledgement, gate reading).
-      snifferLog("ads-connector-stale", {});
-      _adsConnector = null;
-      window.__interceptify_ads_connector = null;
-      invalidateConnectorState("connector-stale");
-    }
+  // Scan the live module graph for the connector Spotify would hand out NOW.
+  // Separated from the caching so "what is current" and "what did we keep" are
+  // answerable independently - the previous code could only answer the second.
+  function scanForAdsConnector() {
     if (CFG.snapshotConnector === false) return null;
     const M = window.__webpack_modules__;
     const req = anyAdsRequire();
@@ -890,13 +886,102 @@
       let ex; try { ex = req(id); } catch { continue; }
       const ac = ex && ex.adsCoreConnector;
       if (ac && typeof ac.skipToNextWithOverride === "function") {
-        _adsConnector = ac;
-        window.__interceptify_ads_connector = ac;
-        snifferLog("ads-connector-resolved", { module: String(id), live: !!(window.__interceptify_webpack_require && window.__interceptify_webpack_require.m) });
+        window.__interceptify_ads_module = String(id);
         return ac;
       }
     }
     return null;
+  }
+
+  // How often to re-ask the bundle who the active connector is. A full module
+  // sweep is not free, so between checks the cached object is used - but the
+  // cache is now a performance choice with a bounded staleness, not an
+  // assumption that the answer cannot change.
+  let _connectorCheckedAt = 0;
+
+  // THE canonical answer to "which connector is live". Everything - the
+  // tripwire, the gate, the slot flush, the endpoint kill - must agree on this
+  // one object, because every piece of state below is an assertion about it.
+  //
+  // The previous version kept the cached connector for as long as it still had
+  // the expected METHODS, which is not the same question. A handed-off connector
+  // A usually remains perfectly callable: its methods are intact, its RPCs
+  // return, and it simply no longer drives the ads Spotify is playing. So we
+  // kept talking to A, muted nothing on B, and reported green throughout. That
+  // is a mid-session leak, not a startup race, and it fits "ads returned after
+  // playback had been going a while" far better than anything fixed so far.
+  // O(1) "who is live right now". Both sources are direct reads, so this can run
+  // on every call - which matters, because a rate-limited identity check is a
+  // hole exactly the size of its interval: for that long, calls go to the old
+  // connector while readiness still reports the block covering it.
+  //
+  // The L1-hooked in-stream api carries the connector Spotify handed IT. Call
+  // sites used to reach for that themselves and fall back to the resolver, which
+  // meant two different answers to "which connector" depending on where you
+  // asked - the exact split that lets state describe one object while calls go
+  // to another. It is a SOURCE here, not a bypass.
+  function currentConnectorFast() {
+    const api = window.__interceptify_instream_api;
+    const fromApi = api && api.adsCoreConnector;
+    if (fromApi && connectorUsable(fromApi)) return fromApi;
+    // Re-read the module we already found the connector in. Same cost as a
+    // property access once the module is cached, and it catches Spotify
+    // swapping the connector out from under a module id we already know.
+    const id = window.__interceptify_ads_module;
+    if (id != null) {
+      try {
+        const req = anyAdsRequire();
+        const ex = req && req(id);
+        const ac = ex && ex.adsCoreConnector;
+        if (ac && connectorUsable(ac)) return ac;
+      } catch {}
+    }
+    return null;
+  }
+
+  function resolveAdsConnector() {
+    const fast = currentConnectorFast();
+    if (fast) {
+      if (fast !== _adsConnector) {
+        adoptConnector(fast, _adsConnector ? "connector-replaced" : "connector-resolved");
+      }
+      return _adsConnector;
+    }
+    // No cheap answer available: fall back to the full module sweep, which IS
+    // expensive (toString over every factory) and so is rate-limited. This is
+    // the only path that can take up to connectorRecheckMs to notice a change,
+    // and it is the path where the connector has moved to a module id we do not
+    // know yet - so there is nothing cheaper to ask.
+    const now = Date.now();
+    if (_adsConnector && connectorUsable(_adsConnector)
+        && now - _connectorCheckedAt < (CFG.connectorRecheckMs | 0)) {
+      return _adsConnector;
+    }
+    _connectorCheckedAt = now;
+    const live = scanForAdsConnector();
+    if (live) {
+      if (live !== _adsConnector) {
+        adoptConnector(live, _adsConnector ? "connector-replaced" : "connector-resolved");
+      }
+      return _adsConnector;
+    }
+    // A cached object that has lost its methods is a corpse, not a connector.
+    if (_adsConnector && !connectorUsable(_adsConnector)) {
+      snifferLog("ads-connector-stale", {});
+      adoptConnector(null, "connector-stale");
+    }
+    return _adsConnector;
+  }
+
+  // The ONE place the active connector changes, so no caller can swap it
+  // without the state that describes it being reset with it.
+  function adoptConnector(ac, reason) {
+    _adsConnector = ac;
+    window.__interceptify_ads_connector = ac;
+    window.__interceptify_connector_epoch = ++_connectorEpoch;
+    invalidateConnectorState(reason);
+    snifferLog(reason, { module: window.__interceptify_ads_module || null,
+                         epoch: _connectorEpoch });
   }
   // ---------------------------------------------------------------------
   // DURABLE INCIDENT RECORD — the single place an ad-experience is written.
@@ -1299,7 +1384,7 @@
       const api = window.__interceptify_instream_api;
       // Prefer the L1-hooked instream api's connector (old builds); on snapshot
       // builds that hook is dead, so fall back to the resurrected connector.
-      const acc = (api && api.adsCoreConnector) || resolveAdsConnector();
+      const acc = resolveAdsConnector();
       if (!acc) return false;
       const DEAD = CFG.deadAdEndpoint || "https://localhost.invalid/no-ads";
       // Per-method acknowledgement. This returned true whenever a connector
@@ -1391,6 +1476,13 @@
     }
     _adGateRefreshing = true;
     _adGateRefreshStartedAt = Date.now();
+    // Which connector this read belongs to. getAdState() is asynchronous, so a
+    // read issued against A can resolve AFTER B has replaced it - and it did:
+    // the resolved handler wrote `verified: true` from A's answer while B's own
+    // gate was wide open. An in-flight promise is evidence about the object it
+    // was issued to, and nothing else.
+    const epoch = _connectorEpoch;
+    const issuedTo = ac;
     try {
       const p = ac.getAdState();
       if (!p || !p.then) {
@@ -1402,6 +1494,10 @@
       }
       p.then((s) => {
         _adGateRefreshing = false;
+        if (epoch !== _connectorEpoch || issuedTo !== _adsConnector) {
+          snifferLog("ad-gate-read-superseded", { epoch, now: _connectorEpoch });
+          return;                                  // answer about a dead object
+        }
         const st = (s && s.state) || {};
         const keys = Object.keys(st);
         // Freeze the baseline ONLY from a real, populated snapshot. The ads
@@ -1435,10 +1531,11 @@
         window.__interceptify_ad_gate = { keys: found, verified: _adGateVerified,
                                           readAt: _adGateReadAt };
       }).catch((e) => {
+        _adGateRefreshing = false;
+        if (epoch !== _connectorEpoch || issuedTo !== _adsConnector) return;
         // A REJECTED read is not "no new information", it is evidence the
         // channel the gate lives on is broken. Swallowing it left the previous
         // `verified: true` standing as the current answer indefinitely.
-        _adGateRefreshing = false;
         _adGateVerified = false;
         window.__interceptify_ad_gate = { keys: _adGateKeys || [], verified: false,
                                           readAt: _adGateReadAt,
@@ -1565,8 +1662,22 @@
     window.__interceptify_tripwire = false;
     _adGateVerified = false;
     _adGateRefreshing = false;
+    // THE GATE KEYS AND THE BASELINE GO TOO, and leaving them was the worst of
+    // the three. They are the names SOME connector published. Carrying A's key
+    // set onto B means: B is asked for `ad_enabled`, B does not have it,
+    // putState() CREATES it (that is what putState does - the same property
+    // that made "write then read back" circular in the first place), the
+    // read-back finds our own invention set to "false", and the gate reports
+    // CLOSED. Meanwhile B's real switch - `ads_enabled`, or whatever it renamed
+    // to - is still true and still scheduling ads. A fabricated closed gate is
+    // strictly worse than an open one, because it silences the only signal that
+    // would have said something was wrong.
+    _adGateKeys = null;
+    _baselineKeys = null;
+    window.__interceptify_baseline_keys = null;
+    _adGateReadAt = 0;
     window.__interceptify_ad_gate = { keys: [], verified: false,
-                                      readAt: _adGateReadAt, error: reason };
+                                      readAt: 0, error: reason };
     _slotClear.epoch++;            // orphan any in-flight acknowledgement
     _slotClear.ok = false;
     _slotClear.t = Date.now();
@@ -1619,7 +1730,7 @@
   function suppressAdState(reason) {
     if (CFG.adEnabledKill === false) return false;
     try {
-      const ac = (window.__interceptify_instream_api && window.__interceptify_instream_api.adsCoreConnector) || resolveAdsConnector();
+      const ac = resolveAdsConnector();
       if (ac && typeof ac.putState === "function") {
         installAdTripwire(ac);
         refreshAdGate(ac);                                   // discover + verify (async, cached)
@@ -2189,13 +2300,27 @@
         if (resolved != null) return resolved;
         const fb = CFG.instreamModuleFallbackId;
         const key = providerKeyIn(map, fb);
-        if (key == null && map && fb != null && (map[fb] || map[String(fb)])
+        if (key != null) return key;
+        if (map && fb != null && (map[fb] || map[String(fb)])
             && !window.__interceptify_fallback_id_stale) {
           window.__interceptify_fallback_id_stale = String(fb);
           log("instreamModuleFallbackId " + fb + " is present but no longer looks like the ad " +
               "provider — using the source scan instead");
         }
-        return key;
+        // NOTHING MATCHED BY ID, so ask the source. Chunks pushed after bootstrap
+        // were only ever checked against ids we already knew, so a provider that
+        // arrived later under a NEW id was never wrapped - and because an older
+        // wrapped provider kept the l1Provider flag true, health went on
+        // reporting the layer installed while the module actually serving audio
+        // ads ran untouched. The whole-graph scan exists precisely for a renamed
+        // provider; it just was not consulted on the path where renames show up.
+        const found = discoverInStreamModuleIds(map);
+        if (found.length) {
+          window.__interceptify_instream_id = found[0];
+          snifferLog("instream-provider-rediscovered", { module: String(found[0]) });
+          return found[0];
+        }
+        return null;
       };
       const patchModules = (modules) => {
         if (!modules) return;
@@ -3986,7 +4111,16 @@
           // would make readiness depend on the user encountering an ad path.
           // l1ProviderRan / l1ProviderActive below are the stronger claims, and
           // they are reported separately rather than folded into this one.
-          l1Provider: !!window.__interceptify_l1_provider_wrapped,
+          // "the provider we currently believe in is wrapped" - not "something
+          // was wrapped once". A later chunk can introduce the real provider
+          // under a new id, and the old wrap kept this true while the module
+          // actually serving audio ads ran untouched.
+          l1Provider: (function () {
+            const id = window.__interceptify_instream_id;
+            const wrapped = window.__interceptify_instream_module_ids || [];
+            if (id == null) return !!window.__interceptify_l1_provider_wrapped;
+            return wrapped.indexOf(String(id)) !== -1;
+          })(),
           instreamApi: !!window.__interceptify_instream_api,
           adsConnector: !!window.__interceptify_ads_connector,
           adGate: !!(gate && gate.verified),

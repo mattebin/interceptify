@@ -847,19 +847,30 @@ def note_block_change(state: dict, fp: dict) -> None:
     THAT IS SUPPOSED TO HAVE FIXED IT, or it measures nothing but patience.
     """
     d = delivery_block(state)
-    if not d or d.get("changed_at"):
+    if not d:
         return
     if not (fp.get("live_payload_sha") and fp.get("live_config_sha")):
         return                                   # unknown is not changed
-    if (fp["live_payload_sha"] != d.get("payload_sha")
-            or fp["live_config_sha"] != d.get("config_sha")):
-        d["changed_at"] = int(time.time())
-        d["changed_to_payload"] = fp["live_payload_sha"]
-        d["changed_to_config"] = fp["live_config_sha"]
-        d["observed_s"] = 0
-        log.info("the running block now differs from the one that failed; the %dh "
-                 "clearance window starts now, not at the delivery",
-                 DELIVERY_CLEAR_AFTER_S // 3600)
+    if (fp["live_payload_sha"] == d.get("payload_sha")
+            and fp["live_config_sha"] == d.get("config_sha")):
+        return                                   # still the code that failed
+    # RE-STAMP whenever the deployed pair moves, rather than refusing because a
+    # stamp already exists. Refusing bricked the record: run() calls this before
+    # the repair (stamping the PRE-repair payload as the target) and again after,
+    # where the second call was ignored. Clearance then requires the live hashes
+    # to equal the stored target, which they never again did - so the incident
+    # could not clear even if the new code was perfect. The live state hit
+    # exactly this: target e538..., running 1280..., unclearable forever.
+    if (fp["live_payload_sha"] == d.get("changed_to_payload")
+            and fp["live_config_sha"] == d.get("changed_to_config")):
+        return                                   # same target, clock keeps running
+    d["changed_at"] = int(time.time())
+    d["changed_to_payload"] = fp["live_payload_sha"]
+    d["changed_to_config"] = fp["live_config_sha"]
+    d["observed_s"] = 0                          # a new block has been observed for 0s
+    log.info("the running block now differs from the one that failed; the %dh "
+             "clearance window starts now, not at the delivery",
+             DELIVERY_CLEAR_AFTER_S // 3600)
 
 
 def note_observed_playback(state: dict, report: dict) -> None:
@@ -879,6 +890,64 @@ def note_observed_playback(state: dict, report: dict) -> None:
     delta = final.get("streamedDelta")
     if isinstance(delta, (int, float)) and delta > 0:
         d["observed_s"] = int(d.get("observed_s", 0)) + int(delta)
+
+
+READ_STREAM_TIME = (
+    "(async()=>{try{const ac=window.__interceptify_ads_connector;"
+    "if(!ac||typeof ac.getAdState!=='function')return -1;"
+    "const s=await ac.getAdState();"
+    "return parseInt(((s&&s.state)||{}).elapsed_stream_time,10)||0;}catch(e){return -1}})()"
+)
+
+
+def observe_playback_passively(state: dict) -> int:
+    """Accumulate real listening WITHOUT repairing or restarting anything.
+
+    The 30-minute requirement was unreachable by design: the only place
+    observed_s grew was the post-repair report, and a run with a pending
+    incident returns before ever getting there. So the promise "clears
+    automatically after 24h with no further delivery" described a state the
+    scheduler could not reach - the flag would sit up forever waiting for a
+    number nothing incremented.
+
+    This reads Spotify's own cumulative stream counter and banks the delta since
+    the last look. It changes nothing: no patch, no restart, no gate write.
+
+    Honest limit: it needs the CDP endpoint, which only exists when Spotify was
+    launched with the debug port. Launch Spotify normally and no observation
+    accrues - which is why the message on the pending path names
+    --acknowledge-delivery rather than promising time will fix it.
+    """
+    d = delivery_block(state)
+    if not d or not d.get("changed_at"):
+        return 0
+    if not cdp_is_live():
+        return 0
+    try:
+        cdp = CDP(CDP_PORT)
+        try:
+            raw = cdp.ev(READ_STREAM_TIME)
+        finally:
+            cdp.close()
+        now_t = int(raw) if isinstance(raw, (int, float)) else int(str(raw).strip())
+    except Exception as e:
+        log.debug("passive observation unavailable: %s", e)
+        return 0
+    if now_t < 0:
+        return 0
+    prev = d.get("stream_time_at")
+    d["stream_time_at"] = now_t
+    if prev is None:
+        return 0                                 # first look establishes a baseline
+    delta = now_t - int(prev)
+    # A restart resets the counter, so a negative delta is a new session, not
+    # negative listening. Re-baseline rather than subtracting.
+    if delta <= 0:
+        return 0
+    d["observed_s"] = int(d.get("observed_s", 0)) + delta
+    log.info("observed %ds of real playback on the current block (%ds of %ds needed)",
+             delta, d["observed_s"], DELIVERY_MIN_OBSERVED_S)
+    return delta
 
 
 def clearable_reason(state: dict, fp: dict) -> str | None:
@@ -1502,17 +1571,34 @@ def run(force: bool = False, duration_ms: int = 12000) -> int:
         # Repairing again changes nothing on its own, and re-running the
         # structural test would only re-prove the plumbing. Say what is true and
         # stop, rather than performing a check whose passing would be misread.
+        # Bank whatever real listening happened since the last look. Read-only:
+        # no patch, no restart, no gate write. Without this the 30-minute
+        # requirement was unreachable, because the only place observed_s grew
+        # was after a repair - which this branch returns before ever reaching.
+        try:
+            observe_playback_passively(state)
+            save_state(state)
+        except Exception as e:
+            log.warning("passive observation: %s", e)
         base = int(pending.get("changed_at") or pending.get("last_t") or 0)
-        clears = time.strftime("%Y-%m-%d %H:%M",
-                               time.localtime(base + DELIVERY_CLEAR_AFTER_S))
+        observed = int(pending.get("observed_s") or 0)
+        earliest = time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(base + DELIVERY_CLEAR_AFTER_S))
+        # State the BOTH conditions rather than promising time alone. Observation
+        # needs the CDP endpoint, which only exists when Spotify was launched
+        # with the debug port - so on a normally-launched client the honest
+        # answer is that this clears when you say it does.
         log.error("UNRESOLVED: %d ad(s) reached the user (%s to %s). Re-running the structural "
                   "test would only re-prove the plumbing, so there is nothing to re-verify here. "
-                  "Clears on its own after %s if none recurs, or now with "
+                  "Needs BOTH: no further delivery until %s, AND %d more seconds of observed "
+                  "playback on this block (%d/%d so far; observation requires Spotify to be "
+                  "running with the debug port). Otherwise clear it yourself with "
                   "--acknowledge-delivery.",
                   pending["count"],
                   time.strftime("%Y-%m-%d %H:%M", time.localtime(pending["first_t"])),
                   time.strftime("%Y-%m-%d %H:%M", time.localtime(pending["last_t"])),
-                  clears)
+                  earliest, max(0, DELIVERY_MIN_OBSERVED_S - observed),
+                  observed, DELIVERY_MIN_OBSERVED_S)
         return 3
     log.info("ACTION NEEDED: %s", reason or "forced")
     try:
@@ -1552,11 +1638,19 @@ def run(force: bool = False, duration_ms: int = 12000) -> int:
     if verdict == "UNRESOLVED":
         # Exit 3 whether or not the structural test passed. The scheduled task
         # records the day it mattered, not a clean run.
+        # State BOTH conditions. "Clears automatically after 24h" was the claim
+        # everywhere, and it was not true: observation only accrues while the
+        # CDP endpoint is up, so on a normally-launched Spotify the honest
+        # answer is that this clears when the user says it does.
+        d = state["unresolved_delivery"]
+        observed = int(d.get("observed_s") or 0)
         log.error("UNRESOLVED: structural verdict %s, but %d ad(s) reached the user and the "
-                  "failure is not established as fixed. Clears automatically %dh after the "
-                  "block actually changes, or with --acknowledge-delivery.",
-                  report.get("verdict"), state["unresolved_delivery"]["count"],
-                  DELIVERY_CLEAR_AFTER_S // 3600)
+                  "failure is not established as fixed. Needs %dh with no further delivery on "
+                  "THIS block AND %ds more observed playback (%d/%d); observation requires "
+                  "Spotify running with the debug port, so otherwise clear it with "
+                  "--acknowledge-delivery.",
+                  report.get("verdict"), d["count"], DELIVERY_CLEAR_AFTER_S // 3600,
+                  max(0, DELIVERY_MIN_OBSERVED_S - observed), observed, DELIVERY_MIN_OBSERVED_S)
         return exit_code
     if passed:
         log.info("VERIFIED: gate proof held under real playback; 0 delivered, "

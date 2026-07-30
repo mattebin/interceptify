@@ -125,6 +125,35 @@ def main() -> int:
     check("8b. ...and the endpoint survives, unmangled",
           "https://api.spotify.com/v1/me" in out and "<redacted>" not in out, out)
 
+    # ---- 9. headers that are not JSON, and Spotify's own cookies --------
+    # The raw-file path only ever looked for the QUOTED JSON form, so a netlog
+    # line or any non-JSON capture kept its credentials while credentials_in()
+    # reported zero. Basic auth is a base64 username:password: not a lesser leak
+    # than the bearer token this module was written for.
+    raw_cases = {
+        "Authorization: Basic ZGVtbzpwYXNzd29yZDEyMw==": "ZGVtbzpwYXNzd29yZDEyMw==",
+        "X-API-Key: sk_live_9f8e7d6c5b4a3210": "sk_live_9f8e7d6c5b4a3210",
+        "Cookie: sp_dc=AQBxSECRETcookie123456; sp_key=abc": "AQBxSECRETcookie123456",
+    }
+    for line, secret in raw_cases.items():
+        name = line.split(":")[0]
+        check(f"9. {name} in raw text is SEEN", redact.credentials_in(line) >= 1,
+              f"credentials_in={redact.credentials_in(line)}")
+        out = redact.redact_structured(line)
+        check(f"9. {name} in raw text is REMOVED", secret not in out, out[:70])
+        check(f"9. {name} then reports clean", redact.credentials_in(out) == 0, out[:70])
+
+    # sp_dc is a long-lived credential that can be exchanged for access tokens,
+    # so it is worth more than the access token, and it matched nothing.
+    body = json.dumps({"sp_dc": "AQBxSECRETcookie123456", "market": "SE"})
+    out = redact.redact_structured(body)
+    check("9d. sp_dc in a JSON body is redacted", "AQBxSECRETcookie123456" not in out, out)
+    check("9e. ...and harmless siblings survive", '"market"' in out and "SE" in out, out)
+
+    # ---- 10. redacting twice must be a no-op ----------------------------
+    once = redact.redact_structured("Authorization: Basic ZGVtbzpwYXNz")
+    check("10. redaction is idempotent", redact.redact_structured(once) == once, once)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: " + "; ".join(FAILURES))

@@ -80,7 +80,11 @@ jobs:
     needs: test
     runs-on: windows-latest
     permissions:
-      contents: write   # only this job publishes, and only on a tag
+      # write ONLY when this run can actually publish, i.e. a tag push. A manual
+      # workflow_dispatch built the exe with release-write credentials in scope
+      # for the whole job even though it publishes nothing - privilege held for
+      # a capability the run does not use.
+      contents: ${{ startsWith(github.ref, 'refs/tags/') && 'write' || 'read' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -116,6 +120,12 @@ jobs:
       - name: Exercise the packaged build against a disposable Spotify
         run: python tests/test_frozen_cycle.py dist/Interceptify.exe
 
+      # The exact resolved set, transitive deps included. The pins in
+      # requirements.txt fix the direct dependencies; this is the receipt for
+      # everything else that ended up inside the binary.
+      - name: Record the dependency set this binary was built from
+        run: pip freeze | Out-File -Encoding ascii dist/build-requirements.txt
+
       - name: Compute SHA-256 checksum
         run: |
           $hash = (Get-FileHash dist/Interceptify.exe -Algorithm SHA256).Hash.ToLower()
@@ -129,6 +139,7 @@ jobs:
           path: |
             dist/Interceptify.exe
             dist/Interceptify.exe.sha256
+            dist/build-requirements.txt
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')

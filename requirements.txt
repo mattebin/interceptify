@@ -1,7 +1,14 @@
-pystray>=0.19.5
-Pillow>=10.0.0
+# PINNED, not floating. These are the versions the released .exe is built from,
+# and `>=` meant two builds from the same commit could bundle different code.
+# For a binary that self-updates and gets launched automatically by a scheduled
+# task, "which commit" has to answer "which bytes", and a floating range cannot.
+#
+# These match what this machine builds and tests against today. Bump
+# deliberately: change the pin, run the suite, then release.
+pystray==0.19.5
+Pillow==12.2.0
 # CDP client. Not optional: the packaged app runs its own self-heal
 # (`Interceptify.exe --selfheal`), and that verifies over the DevTools protocol.
 # It used to live in requirements-dev.txt, so a clean source install worked right
 # up until the first scheduled self-heal, then failed on an import.
-websocket-client>=1.7.0
+websocket-client==1.9.0

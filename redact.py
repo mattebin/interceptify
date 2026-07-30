@@ -30,6 +30,10 @@ SENSITIVE_PARAMS = (
     "api_key", "apikey", "access_key", "accesskey", "private_key", "privatekey",
     "client_id", "clientid", "device_id", "deviceid", "user_id", "userid",
     "session_id", "sessionid", "username", "email", "cookie",
+    # Spotify's own session cookies. `sp_dc` is a long-lived credential that can
+    # be exchanged for access tokens, so it is worth more than the access token
+    # this file was originally written to catch, and it matched nothing.
+    "sp_dc", "sp_key", "csrf",
 )
 
 # Long hex / base64-ish runs inside a path: source ids, track ids, device ids.
@@ -64,8 +68,21 @@ _PLACEHOLDER = ("<redacted>", '"<redacted>"')
 # kept `"Authorization": "Bearer ..."` intact while the cleanup reported it
 # clean: the narrower of two redactors was the one doing the remediation.
 _AUTH_PAIR = re.compile(
-    r'(?i)("(?:proxy-|www-)?(?:authorization|authenticate|cookie|set-cookie)"\s*:\s*)'
+    r'(?i)("(?:x-)?(?:proxy-|www-)?'
+    r'(?:authorization|authenticate|cookie|set-cookie|api[-_]?key|auth[-_]?token)"\s*:\s*)'
     r'("(?:[^"\\]|\\.)*")'
+)
+
+# The same headers as RAW TEXT, which is how they appear in a netlog line or any
+# capture that is not JSON. The file path only ever looked for the quoted JSON
+# form, so `Authorization: Basic ...` sat in a diagnostic file untouched while
+# credentials_in() reported zero - the cleanup declaring success over a header it
+# could not see. Basic auth is a base64 username:password, so this is not a
+# lesser leak than the bearer token this module was written to catch.
+_AUTH_LINE = re.compile(
+    r'(?im)^([ \t]*(?:x-)?(?:proxy-)?'
+    r'(?:authorization|api[-_]?key|auth[-_]?token|cookie|set-cookie)[ \t]*:[ \t]*)'
+    r'(?!<redacted>)(\S.*)$'
 )
 
 # A URL that still carries a query string. redact_url() drops queries wholesale
@@ -106,6 +123,7 @@ def _scrub(s: str) -> tuple[str, int]:
     s = _URL_QUERY.sub(strip_query, s)
 
     s = _AUTH_PAIR.sub(bump(lambda m: m.group(1) + '"<redacted>"'), s)
+    s = _AUTH_LINE.sub(bump(lambda m: m.group(1) + "<redacted>"), s)
     s = _JSON_PAIR.sub(bump(lambda m: m.group(1) + '"<redacted>"'), s)
     s = _KV_PAIR.sub(bump(lambda m: m.group(1) + "=<redacted>"), s)
 

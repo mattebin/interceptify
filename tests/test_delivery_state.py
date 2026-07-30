@@ -274,6 +274,57 @@ def main() -> int:
     check("13f: --force is never blocked",
           selfheal.blocked_by_pending(live, pending13, True) is False)
 
+    # ---------------------------------------------------------------------
+    # 14. TWO PATCHES IN A ROW MUST NOT BRICK THE RECORD.
+    #
+    # run() stamps the epoch BEFORE the repair and again AFTER it. The second
+    # call was ignored because a stamp already existed, so the stored target
+    # stayed the PRE-repair payload while Spotify ran the post-repair one.
+    # Clearance requires the live hashes to equal the stored target, so the
+    # incident became permanently unclearable however well the new code worked.
+    #
+    # This is not hypothetical: the live install reached exactly this state
+    # (target e538..., running 1280..., observed 0s) and had to be repaired by
+    # hand. Codex asked for a test that calls note_block_change twice; this is
+    # that test.
+    # ---------------------------------------------------------------------
+    state14: dict = {}
+    selfheal.note_delivery_failure(state14, 1, fp_before)
+    mid = dict(fp_before, live_payload_sha="mid" * 21, live_config_sha="midc" * 16)
+    final = dict(fp_before, live_payload_sha="fin" * 21, live_config_sha="finc" * 16)
+
+    selfheal.note_block_change(state14, mid)          # pre-repair stamp
+    d14 = state14["unresolved_delivery"]
+    first_stamp = d14["changed_at"]
+    check("14. the first patch is stamped as the target",
+          d14["changed_to_payload"] == mid["live_payload_sha"])
+
+    selfheal.note_block_change(state14, final)        # post-repair stamp
+    check("14b (THE BRICK): a second patch RE-stamps rather than being ignored",
+          d14["changed_to_payload"] == final["live_payload_sha"],
+          f"target={d14['changed_to_payload'][:12]} live={final['live_payload_sha'][:12]}")
+    check("14c: ...and the observation counter restarts with the new block",
+          d14["observed_s"] == 0)
+    check("14d: ...so the record can still become clearable",
+          d14["changed_to_payload"] == final["live_payload_sha"]
+          and d14["changed_to_config"] == final["live_config_sha"])
+
+    d14["changed_at"] = int(time.time()) - (selfheal.DELIVERY_CLEAR_AFTER_S + 60)
+    d14["observed_s"] = selfheal.DELIVERY_MIN_OBSERVED_S + 60
+    check("14e: and it does, once the window and the listening are satisfied",
+          selfheal.clearable_reason(state14, final) is not None,
+          str(selfheal.clearable_reason(state14, final)))
+
+    # Re-stamping only on a REAL change: calling it again with the same
+    # fingerprint must not reset the clock the run is waiting on.
+    state14["unresolved_delivery"] = dict(d14)
+    selfheal.note_block_change(state14, final)
+    check("14f: an unchanged fingerprint does not restart the clock",
+          state14["unresolved_delivery"]["changed_at"] == d14["changed_at"]
+          and state14["unresolved_delivery"]["observed_s"] == d14["observed_s"],
+          "re-stamping on every run would mean the window never completes")
+    assert first_stamp is not None
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: " + "; ".join(FAILURES))

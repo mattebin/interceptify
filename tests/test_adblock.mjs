@@ -1101,6 +1101,12 @@ function makeConnectorStub(opts = {}) {
     subscribeToInStreamAds(cb) { adCallback = cb; },
     updateAdStateEndpoint() {},
     updateAdServerEndpoint() {},
+    // The real connector is FOUND by this signature, so a stub without it was
+    // not a connector by the payload's own definition. It only passed before
+    // because call sites reached around the resolver and used whatever object
+    // they were handed; once there is one canonical resolver, the fixture has
+    // to satisfy the same test the live code does.
+    skipToNextWithOverride() { calls.overrideSkip = (calls.overrideSkip || 0) + 1; },
   };
 }
 
@@ -1145,7 +1151,8 @@ async function testJ() {
     found.includes("audio-stream"), `slots=${JSON.stringify(found)}`);
 
   // ---- readiness ----
-  const env3 = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+  const clock3 = makeClock();
+  const env3 = loadAdblock({ fixture: makeFixture(), clock: clock3, baseFetch });
   const W3 = env3.sandbox.window;
   const h3 = () => W3.__interceptify.health();
   assert("J3: with no connector, protection is NOT reported as ready",
@@ -1167,9 +1174,17 @@ async function testJ() {
   const cleared = conn.calls.clearSlot.map((c) => c.slot);
   assert("J4: the flush targets the canonical slot first",
     cleared[0] === "stream", `cleared=${JSON.stringify(cleared.slice(0, 3))}`);
+  // While the promise is outstanding it is PENDING, and after the timeout it is
+  // a definite failure. Both are "not protected"; asserting only the second
+  // name would tie the test to which of the two states the clock happens to be
+  // in rather than to the claim.
   assert("J5 (ASYNC): a clearSlot that never resolves is NOT counted as protected",
-    h3().protectionReady === false && h3().notReady.includes("slotCleared"),
+    h3().protectionReady === false
+      && h3().notReady.some((r) => r === "slotCleared" || r === "slotClearPending"),
     `ready=${h3().protectionReady} notReady=${JSON.stringify(h3().notReady)}`);
+  clock3.advance(10000);                       // past slotClearPendingMs, on env3's OWN clock
+  assert("J5b: ...and an unsettled promise hardens into a definite failure",
+    h3().notReady.includes("slotCleared"), JSON.stringify(h3().notReady));
 
   // A build whose clearSlot returns nothing to await is UNCONFIRMABLE, not
   // failed. Treating the two the same would make a structural PASS unreachable
@@ -1600,6 +1615,179 @@ async function testN() {
 }
 
 // ===========================================================================
+// TEST O — CONNECTOR IDENTITY, DONE PROPERLY
+//
+// Round 5 keyed the TRIPWIRE to the connector object and left everything else
+// pointing at the old one. That is worse than not fixing it, because the parts
+// that stayed stale now report green with more confidence.
+//
+// O1  The resolver kept a cached connector for as long as it still had its
+//     METHODS. A handed-off connector A usually stays perfectly callable - it
+//     just no longer drives the ads being played. So calls went to A, B's ads
+//     were never muted, and health was green throughout. Mid-session, not a
+//     startup race.
+// O2  Connector-scoped state included A's gate keys and A's baseline. Carried
+//     onto B, putState() CREATES the missing key, the read-back finds our own
+//     invention set to "false", and the gate reports CLOSED while B's real
+//     switch is still true. A FABRICATED closed gate.
+// O3  A getAdState() issued to A can resolve after B replaced it, writing A's
+//     answer over B's state.
+// O4  Chunks pushed after bootstrap were only checked against module ids we
+//     already knew, so a provider arriving under a NEW id was never wrapped -
+//     while the old wrap kept l1Provider green.
+// ===========================================================================
+async function testO() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST O"); };
+
+  // ---- O1: a still-callable old connector must not be kept -------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const A = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    const B = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_instream_api = { adsCoreConnector: A, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("O1.setup: covering A and ready", W.__interceptify.health().protectionReady === true,
+      JSON.stringify(W.__interceptify.health().notReady));
+
+    // Spotify hands off. A stays fully callable - that is the point.
+    W.__interceptify_instream_api = { adsCoreConnector: B, skipToNext() {} };
+    assert("O1.pre: A is still perfectly usable, so 'has its methods' proves nothing",
+      typeof A.putState === "function" && typeof A.skipToNextWithOverride === "function");
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("O1 (THE LEAK): the live connector is B, not the still-callable A",
+      W.__interceptify_ads_connector === B, "resolver kept the handed-off connector");
+
+    const beforeB = B.calls.putState.length;
+    for (const fn of maint) { try { fn(); } catch {} }
+    await flush();
+    assert("O1b: ...and the gate is now written to B",
+      B.calls.putState.length > beforeB,
+      `A.putState=${A.calls.putState.length} B.putState=${B.calls.putState.length}`);
+
+    const delivered = W.__interceptify_ads_delivered || 0;
+    B.deliver({ adId: "on-b", slot: "stream",
+                metadata: { product_name: "audio_ad", format: "audio/ogg" } });
+    await flush();
+    assert("O1c: ...and B's ads are observed and muted",
+      (W.__interceptify_ads_delivered || 0) === delivered + 1
+        && env.nodes.muteNode._muted === true,
+      `delivered=${W.__interceptify_ads_delivered} muted=${env.nodes.muteNode._muted}`);
+  }
+
+  // ---- O2: a swap must not fabricate a closed gate ---------------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const A = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    // B names its switch differently - exactly the rename the gate discovery
+    // exists to survive.
+    const B = makeConnectorStub({ initialState: { ads_enabled: "true" } });
+    W.__interceptify_instream_api = { adsCoreConnector: A, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("O2.setup: A's gate is discovered and closed",
+      W.__interceptify.health().layers.adGate === true,
+      JSON.stringify(W.__interceptify.health().gateKeys || W.__interceptify_ad_gate));
+
+    W.__interceptify_instream_api = { adsCoreConnector: B, skipToNext() {} };
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+    // The real switch on B is ads_enabled. If we invented ad_enabled on B and
+    // called the gate closed, this is where it shows.
+    const real = B.raw.ads_enabled && B.raw.ads_enabled.value;
+    const fabricated = Object.prototype.hasOwnProperty.call(B.raw, "ad_enabled");
+    const h = W.__interceptify.health();
+    assert("O2 (THE FABRICATION): the gate is not reported closed off an invented key",
+      !(h.layers.adGate === true && String(real) === "true"),
+      `adGate=${h.layers.adGate} B.ads_enabled=${real} invented_ad_enabled=${fabricated}`);
+    assert("O2b: B's OWN switch is what gets written",
+      String(real) === "false" || h.layers.adGate === false,
+      `B.ads_enabled=${real} adGate=${h.layers.adGate}`);
+  }
+
+  // ---- O3: a late reply from the old connector -------------------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    let releaseA;
+    const A = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    const B = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_instream_api = { adsCoreConnector: A, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 2; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+    // A's next read hangs; B takes over; THEN A answers "all closed".
+    A.getAdState = () => new Promise((res) => { releaseA = () => res({ state: { ad_enabled: { value: "false" } } }); });
+    for (const fn of maint) { try { fn(); } catch {} }
+    W.__interceptify_instream_api = { adsCoreConnector: B, skipToNext() {} };
+    // B's gate is genuinely OPEN and its read never lands.
+    B.getAdState = () => new Promise(() => {});
+    for (const fn of maint) { try { fn(); } catch {} }
+    await flush();
+    if (releaseA) releaseA();
+    await flush();
+    const h = W.__interceptify.health();
+    assert("O3 (THE LEAK): a stale reply from the replaced connector cannot report ready",
+      h.protectionReady === false,
+      `ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)}`);
+  }
+
+  // ---- O4: a provider that arrives later under a NEW id -----------------
+  {
+    const fixture = makeFixture();
+    const env = loadAdblock({ fixture, clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const wired = wireInStreamProvider(env, fixture);
+    assert("O4.setup: an initial provider is wrapped", !!(wired && wired.api));
+    const idBefore = W.__interceptify_instream_id;
+
+    // A later chunk pushes the REAL provider under an id nobody has seen.
+    const chunk = W.webpackChunkclient_web;
+    const lateApi = { inStreamAd: null, skipToNext() { fixture.counts.skipToNext++; } };
+    // Same shape as the bootstrap fixture. The signatures the whole-graph scan
+    // matches on live in the SOURCE, which Function.prototype.toString includes
+    // comments in - so these two lines are the needles, exactly as in the real
+    // bundle's minified accessors.
+    function lateProviderFactory(module) {
+      module.exports = {
+        d: function () { return lateApi; },              // inStreamApi accessor
+        m: function () { return lateApi.inStreamAd; },   // getInStreamAd accessor
+      };
+    }
+    chunk.push([["late-chunk"], { 999001: lateProviderFactory }]);
+    const wrappedLate = chunk[chunk.length - 1][1][999001];
+    assert("O4 (THE LEAK): a provider arriving under a NEW id is wrapped, not ignored",
+      typeof wrappedLate === "function" && wrappedLate !== lateProviderFactory
+        && (W.__interceptify_instream_module_ids || []).includes("999001"),
+      `idBefore=${idBefore} wrapped=${JSON.stringify(W.__interceptify_instream_module_ids)}`);
+
+    // And the wrap must actually work: run the late factory and hand it an ad.
+    const mod = { exports: {} };
+    wrappedLate(mod, mod.exports, undefined);
+    const api = mod.exports && typeof mod.exports.d === "function" ? mod.exports.d() : null;
+    assert("O4b.wire: the late provider instantiates", !!api);
+    if (api) {
+      fixture.present.delete('[data-testid="ad-controls"]');
+      env.sandbox.document.title = "Spotify";
+      const before = fixture.counts.skipToNext;
+      api.inStreamAd = { adId: "late-provider-ad", slot: "stream",
+                         metadata: { product_name: "audio_ad", format: "audio/ogg" } };
+      assert("O4c: an audio ad through the LATE provider is skipped",
+        fixture.counts.skipToNext > before,
+        `skips ${before} -> ${fixture.counts.skipToNext}`);
+    }
+    assert("O4d: health reports the provider we currently believe in",
+      W.__interceptify.health().layers.l1Provider === true,
+      `id=${W.__interceptify_instream_id} wrapped=${JSON.stringify(W.__interceptify_instream_module_ids)}`);
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -1644,6 +1832,9 @@ async function main() {
   }
   try { await testN(); } catch (e) {
     assert("TEST N crashed", false, String(e && e.stack || e));
+  }
+  try { await testO(); } catch (e) {
+    assert("TEST O crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));
