@@ -37,9 +37,13 @@ elevated shell, and this script prints the exact command to run.
 from __future__ import annotations
 
 import argparse
+import getpass
+import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import winreg
 from pathlib import Path
 
@@ -102,6 +106,101 @@ def tasks() -> list[tuple[str, str, list[str], str]]:
 
 
 # ---------------------------------------------------------------------------
+# Execution CONDITIONS - the part that decides whether a correct task ever runs
+# ---------------------------------------------------------------------------
+#
+# `schtasks /Create` does not expose these, so they came from Windows' defaults,
+# and the defaults are hostile to a laptop:
+#
+#   DisallowStartIfOnBatteries  true   -> the run is REFUSED on battery
+#   StopIfGoingOnBatteries      true   -> a running repair is killed on unplug
+#   StartWhenAvailable          false  -> a missed run is never made up
+#
+# On this machine that was not theoretical. The 08:00 task's last result was
+# 0x800710E0 ("the operator or administrator has refused the request") and the
+# logon task had never run at all - last run time 1999-11-30. So the self-heal
+# that exists to catch a Spotify update breaking the block had been silently
+# not running, while `--status` reported all tasks correct because it validated
+# the command and the trigger and never looked at the conditions.
+#
+# A task that cannot run is indistinguishable from one that is not installed,
+# except that it looks fine.
+WANT_SETTINGS = {
+    "DisallowStartIfOnBatteries": "false",
+    "StopIfGoingOnBatteries": "false",
+    "StartWhenAvailable": "true",       # make up a run missed while asleep/off
+}
+
+
+def _iso_local(hhmm: str) -> str:
+    """A StartBoundary for today at hh:mm, local time, no timezone suffix."""
+    return f"{time.strftime('%Y-%m-%d')}T{hhmm}:00"
+
+
+def task_xml(cmd: str, trigger: str, at: str = "") -> str:
+    """A full task definition, so every setting is stated rather than inherited.
+
+    Registered with `schtasks /Create /XML`, which is the only way to control the
+    power conditions from a plain (non-elevated, non-PowerShell) process.
+    """
+    exe, args = _split_command(cmd)
+    exe = exe.strip('"')
+    if trigger == "LogonTrigger":
+        trig = f"<LogonTrigger><Enabled>true</Enabled><UserId>{_xml(_current_user())}</UserId></LogonTrigger>"
+    else:
+        trig = ("<CalendarTrigger>"
+                f"<StartBoundary>{_iso_local(at)}</StartBoundary>"
+                "<Enabled>true</Enabled>"
+                "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>"
+                "</CalendarTrigger>")
+    # Written out in the schema's REQUIRED order, not generated from the dict.
+    # Task XML validates children as a sequence, so an alphabetical or
+    # dict-insertion order is rejected outright ("unexpected node") - and the
+    # element is MultipleInstancesPolicy, not MultipleInstances.
+    settings = (
+        "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+        f"<DisallowStartIfOnBatteries>{WANT_SETTINGS['DisallowStartIfOnBatteries']}"
+        "</DisallowStartIfOnBatteries>"
+        f"<StopIfGoingOnBatteries>{WANT_SETTINGS['StopIfGoingOnBatteries']}"
+        "</StopIfGoingOnBatteries>"
+        "<AllowHardTerminate>true</AllowHardTerminate>"
+        f"<StartWhenAvailable>{WANT_SETTINGS['StartWhenAvailable']}</StartWhenAvailable>"
+        "<Enabled>true</Enabled>"
+        "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>"
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        f"  <RegistrationInfo><Description>Interceptify</Description></RegistrationInfo>\n"
+        f"  <Triggers>{trig}</Triggers>\n"
+        '  <Principals><Principal id="Author">'
+        f"<UserId>{_xml(_current_user())}</UserId>"
+        "<LogonType>InteractiveToken</LogonType>"
+        "<RunLevel>LeastPrivilege</RunLevel>"
+        "</Principal></Principals>\n"
+        f"  <Settings>{settings}</Settings>\n"
+        '  <Actions Context="Author">'
+        f"<Exec><Command>{_xml(exe)}</Command>"
+        + (f"<Arguments>{_xml(args)}</Arguments>" if args else "")
+        + "</Exec></Actions>\n"
+        "</Task>\n"
+    )
+
+
+def _xml(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;"))
+
+
+def _current_user() -> str:
+    """A QUALIFIED account name. A bare username is rejected by the task schema
+    with "The parameter is incorrect", which is not a hint about what is wrong."""
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN") or os.environ.get("COMPUTERNAME") or ""
+    return f"{domain}\\{user}" if domain else user
+
+
+# ---------------------------------------------------------------------------
 # Reading what is actually registered
 # ---------------------------------------------------------------------------
 
@@ -131,7 +230,50 @@ def describe(name: str) -> dict | None:
         # element name is the thing worth comparing.
         "trigger_kinds": re.findall(r"<(\w+Trigger)>", triggers),
         "start_boundary": _tag(triggers, "StartBoundary"),
+        # The execution CONDITIONS. Absent from this dict entirely until now,
+        # which is why --status could report every task correct while Windows
+        # was refusing to run two of them.
+        "settings": {k: (_tag(x, k) or "").lower() for k in WANT_SETTINGS},
     }
+
+
+def last_result(name: str) -> tuple[str, str]:
+    """(last run time, last result) as Task Scheduler recorded them.
+
+    Read because a task can be perfectly defined and still never have run. The
+    logon task on this machine reported a last run of 1999-11-30 - Windows'
+    never-ran sentinel - while every structural check said it was fine.
+    """
+    r = _schtasks("/query", "/tn", name, "/fo", "LIST", "/v")
+    if r.returncode != 0:
+        return "", ""
+    run = res = ""
+    for line in r.stdout.splitlines():
+        low = line.lower()
+        if low.startswith("last run time:"):
+            run = line.split(":", 1)[1].strip()
+        elif low.startswith("last result:"):
+            res = line.split(":", 1)[1].strip()
+    return run, res
+
+
+NEVER_RAN = "1999-11-30"
+
+
+def run_health(name: str) -> list[str]:
+    """Complaints about whether the task has actually been RUNNING."""
+    run, res = last_result(name)
+    out = []
+    if run.startswith(NEVER_RAN):
+        out.append("has never run")
+    try:
+        code = int(res)
+    except (TypeError, ValueError):
+        code = 0
+    if code and (code & 0xFFFFFFFF) == 0x800710E0:
+        out.append("last run was REFUSED by Windows (0x800710E0) - an execution "
+                   "condition blocked it, typically running on battery")
+    return out
 
 
 def _split_command(cmd: str) -> tuple[str, str]:
@@ -178,6 +320,13 @@ def wrong_with(got: dict | None, cmd: str, trigger: str = "") -> list[str]:
         problems.append(f"arguments are {got.get('arguments')!r}, expected {want_args!r}")
     if trigger and trigger not in (got.get("trigger_kinds") or []):
         problems.append(f"trigger is {got.get('trigger_kinds') or '(none)'}, expected {trigger}")
+    # A task that is defined correctly and cannot RUN is not a correct task. The
+    # power conditions were never inspected, so a self-heal Windows was actively
+    # refusing looked identical to one that had been working all along.
+    for key, want in WANT_SETTINGS.items():
+        got_val = (got.get("settings") or {}).get(key, "")
+        if got_val and got_val != want:
+            problems.append(f"{key}={got_val}, expected {want}")
     return problems
 
 
@@ -223,9 +372,15 @@ def status() -> int:
             print(f"  {name}: NOT REGISTERED")
             continue
         lvl = d["level"] or "LeastPrivilege"
-        problems = wrong_with(d, cmd, trigger)
+        # Definition problems AND execution history. A task can be defined
+        # perfectly and still have never run, or be refused every time; only
+        # the second kind shows up in what Windows actually did.
+        problems = wrong_with(d, cmd, trigger) + run_health(name)
         flag = ("  <-- " + "; ".join(problems)) if problems else ""
         print(f"  {name}: [{lvl}]{flag}\n      {d['command']} {d['arguments']}".rstrip())
+        ran, res = last_result(name)
+        if ran:
+            print(f"      last run {ran}, result {res}")
     v = run_key_value()
     print(f"  HKCU Run: {v}  <-- competing autostart" if v else "  HKCU Run: absent (good)")
     foreign = foreign_deployment_tasks()
@@ -270,7 +425,25 @@ def install() -> int:
             print(f"  already correct {name}  [{existing['level'] or 'LeastPrivilege'}]")
             registered_any = True
             continue
-        r = _schtasks("/Create", "/TN", name, "/TR", cmd, *sched, "/RL", "LIMITED", "/F")
+        # Registered from a full XML definition rather than /TR + /SC flags.
+        # schtasks cannot express the power conditions on the command line, so
+        # with flags they came from Windows' defaults - which refuse to start on
+        # battery and never make up a missed run.
+        at = ""
+        for i, a in enumerate(sched):
+            if a == "/ST":
+                at = sched[i + 1]
+        xml = task_xml(cmd, trigger, at)
+        tmp = Path(tempfile.gettempdir()) / f"interceptify-task-{abs(hash(name))}.xml"
+        try:
+            # UTF-16 with a BOM: schtasks /XML rejects anything else outright.
+            tmp.write_text(xml, encoding="utf-16")
+            r = _schtasks("/Create", "/TN", name, "/XML", str(tmp), "/F")
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         if r.returncode != 0:
             why = (r.stdout or r.stderr).strip().replace("ERROR: ", "")[:80]
             print(f"  FAILED   {name}  ({why})")

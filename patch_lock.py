@@ -40,6 +40,13 @@ log = logging.getLogger("interceptify")
 # would need privileges we deliberately no longer request.
 MUTEX_NAME = r"Local\InterceptifyXpuiPatch"
 
+# A SECOND, coarser lock covering an entire self-heal run. The patch mutex only
+# spans the archive rewrite, which left everything around it - killing and
+# relaunching Spotify, harvesting incidents, writing state, verifying - free to
+# interleave between the logon, 08:00 and 21:00 tasks. Two overlapping runs can
+# each kill the other's Spotify, and both write the state file.
+RUN_MUTEX_NAME = r"Local\InterceptifySelfHealRun"
+
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
@@ -56,22 +63,22 @@ _k32.CloseHandle.restype = wintypes.BOOL
 
 
 @contextmanager
-def exclusive(timeout: float = 30.0):
-    """Hold the patch mutex for the block. Yields True if acquired.
+def _named(name: str, timeout: float, what: str):
+    """Hold a named mutex for the block. Yields True if acquired.
 
     Yields False rather than raising on timeout, so callers report a useful
     message instead of a traceback; a contended lock is a normal condition here,
     not an error.
     """
-    handle = _k32.CreateMutexW(None, False, MUTEX_NAME)
+    handle = _k32.CreateMutexW(None, False, name)
     if not handle:
         # Fail CLOSED. This used to proceed unserialised with a warning, which
         # inverts the point of the lock: the case it exists to prevent is two
         # patchers rewriting xpui.spa at once, and that is a corrupt Spotify, not
         # a missed opportunity. A warning in a log nobody reads is not a
         # substitute for the guarantee the caller thinks it has.
-        log.error("patch lock unavailable (err %s); refusing to patch unserialised",
-                  ctypes.get_last_error())
+        log.error("%s lock unavailable (err %s); refusing to proceed unserialised",
+                  what, ctypes.get_last_error())
         yield False
         return
 
@@ -82,10 +89,34 @@ def exclusive(timeout: float = 30.0):
     # pristine backup is the right move - so treat it as acquired, but say so.
     acquired = rc in (WAIT_OBJECT_0, WAIT_ABANDONED)
     if rc == WAIT_ABANDONED:
-        log.warning("patch lock was abandoned by a dead process; re-patching from backup")
+        log.warning("%s lock was abandoned by a dead process", what)
     try:
         yield acquired
     finally:
         if acquired:
             _k32.ReleaseMutex(handle)
         _k32.CloseHandle(handle)
+
+
+@contextmanager
+def exclusive(timeout: float = 30.0):
+    """Serialise the xpui.spa rewrite itself."""
+    with _named(MUTEX_NAME, timeout, "patch") as ok:
+        yield ok
+
+
+@contextmanager
+def run_exclusive(timeout: float = 5.0):
+    """Serialise an ENTIRE self-heal run.
+
+    The patch mutex only spans the archive rewrite. Killing and relaunching
+    Spotify, harvesting incidents, writing state and verifying all sat outside
+    it, so the logon, 08:00 and 21:00 tasks could interleave: two runs each
+    killing the other's Spotify and both writing the state file.
+
+    Short timeout on purpose. An overlapping scheduled run should step aside and
+    let the one already working finish, not queue behind it and repeat
+    everything.
+    """
+    with _named(RUN_MUTEX_NAME, timeout, "self-heal run") as ok:
+        yield ok

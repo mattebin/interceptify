@@ -1788,6 +1788,197 @@ async function testO() {
 }
 
 // ===========================================================================
+// TEST P — IDENTITY MUST BE RESOLVED, NOT REMEMBERED
+//
+// Three rounds of fixes all failed the same way: readiness answered from cached
+// state that a 1s tick refreshed, so anything that changed between ticks left
+// health saying "covered" about a component that was no longer live. Patching
+// each reported symptom produced the next round's symptom. The principle:
+//
+//   health resolves identity SYNCHRONOUSLY, and unknown reads as NOT PROTECTED.
+//
+// P1  A stale L1 api pointer outranked the module read, so A kept every write
+//     while B served ads.
+// P2  While the expensive module scan was deferred (3s), the cached connector
+//     was returned AND health stayed green - a deliberate false-green window
+//     long enough to hear an ad.
+// P3  A handoff between maintenance ticks: health() never resolved identity.
+// P4  The connector epoch tells A from B but not two reads on B, so a delayed
+//     older "closed" could overwrite a newer "open".
+// P5  Provider discovery picked found[0] - object-key order - and this build is
+//     documented to carry a decoy matching the same signature.
+// ===========================================================================
+async function testP() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST P"); };
+
+  // A module graph the payload can require through, so connectorFromModule()
+  // has something authoritative to read.
+  function wireModuleConnector(W, id, connector) {
+    W.__interceptify_ads_module = String(id);
+    W.__interceptify_webpack_require = Object.assign(
+      function (k) { return { adsCoreConnector: W.__intc_test_modules[String(k)] }; },
+      { m: W.__intc_test_modules || {} });
+    W.__intc_test_modules = W.__intc_test_modules || {};
+    W.__intc_test_modules[String(id)] = connector;
+    W.__interceptify_webpack_require.m = W.__intc_test_modules;
+  }
+
+  // ---- P1: a stale L1 api must not outrank the core module ------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const A = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    const B = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__intc_test_modules = {};
+    wireModuleConnector(W, 4242, A);
+    W.__interceptify_instream_api = { adsCoreConnector: A, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("P1.setup: ready while both sources agree on A",
+      W.__interceptify.health().protectionReady === true,
+      JSON.stringify(W.__interceptify.health().notReady));
+
+    // Spotify's core moves to B. The L1 api pointer is stale and still says A.
+    W.__intc_test_modules["4242"] = B;
+    const h = W.__interceptify.health();
+    assert("P1 (THE LEAK): a stale L1 pointer disagreeing with the core is NOT ready",
+      h.protectionReady === false,
+      `ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)} amb=${h.identityAmbiguous}`);
+
+    // Once the stale pointer is gone, the core's connector is adopted and used.
+    W.__interceptify_instream_api = { adsCoreConnector: B, skipToNext() {} };
+    const beforeB = B.calls.putState.length;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("P1b: writes go to B, not to the still-callable A",
+      B.calls.putState.length > beforeB,
+      `A=${A.calls.putState.length} B=${B.calls.putState.length}`);
+  }
+
+  // ---- P2: a deferred scan is 'unknown', not 'yes' --------------------
+  {
+    const clock = makeClock();
+    const env = loadAdblock({ fixture: makeFixture(), clock, baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const A = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_instream_api = { adsCoreConnector: A, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("P2.setup: ready with a direct pointer", W.__interceptify.health().protectionReady === true,
+      JSON.stringify(W.__interceptify.health().notReady));
+
+    // Every direct pointer disappears. The cached A is still callable, so the
+    // old code returned it and stayed green for the whole recheck interval.
+    W.__interceptify_instream_api = null;
+    const h = W.__interceptify.health();
+    assert("P2 (THE FALSE-GREEN WINDOW): unconfirmed identity is not ready",
+      h.protectionReady === false && String(h.notReady).includes("identity"),
+      `ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)}`);
+  }
+
+  // ---- P3: a handoff between maintenance ticks ------------------------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const A = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    const B = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_instream_api = { adsCoreConnector: A, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("P3.setup: ready on A", W.__interceptify.health().protectionReady === true);
+
+    // Hand off, and ask health WITHOUT running a maintenance tick.
+    W.__interceptify_instream_api = { adsCoreConnector: B, skipToNext() {} };
+    const h = W.__interceptify.health();
+    assert("P3 (THE GAP): health resolves identity itself, before claiming coverage",
+      h.protectionReady === false,
+      `ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)} covers=${h.tripwireCoversLive}`);
+  }
+
+  // ---- P4: two reads on the SAME connector, out of order --------------
+  {
+    const clock = makeClock();
+    const env = loadAdblock({ fixture: makeFixture(), clock, baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const B = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__interceptify_instream_api = { adsCoreConnector: B, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+    // B's switch now REFUSES our writes, so it genuinely stays open. Without
+    // this the maintenance loop closes it before the read and the test would be
+    // asserting about a gate that really is shut.
+    B.putState = (k, v) => { B.calls.putState.push([k, v]); };
+    B.raw.ad_enabled = { value: "true" };
+
+    // READ 1 hangs, and will eventually answer "closed".
+    let releaseOld;
+    B.getAdState = () => new Promise((res) => {
+      releaseOld = () => res({ state: { ad_enabled: { value: "false" } } });
+    });
+    for (const fn of maint) { try { fn(); } catch {} }
+    await flush();
+
+    // A hung read blocks every later one, so let it time out - that is the only
+    // way read 2 is ever issued, and it is what happens in the live client too.
+    clock.advance(10000);
+    B.getAdState = () => Promise.resolve({ state: { ad_enabled: { value: "true" } } });
+    for (const fn of maint) { try { fn(); } catch {} }
+    await flush();
+    assert("P4.setup: the newer read (gate genuinely OPEN) makes health red",
+      W.__interceptify.health().protectionReady === false,
+      JSON.stringify(W.__interceptify.health().notReady));
+
+    if (releaseOld) releaseOld();               // the OLD read finally answers "closed"
+    await flush();
+    const h = W.__interceptify.health();
+    assert("P4 (OUT OF ORDER): a delayed older read cannot restore a green gate",
+      h.protectionReady === false,
+      `ready=${h.protectionReady} notReady=${JSON.stringify(h.notReady)} realSwitch=${B.raw.ad_enabled && B.raw.ad_enabled.value}`);
+  }
+
+  // ---- P5: a decoy that matches the same signature --------------------
+  {
+    const fixture = makeFixture();
+    const env = loadAdblock({ fixture, clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    wireInStreamProvider(env, fixture);
+    const chunk = W.webpackChunkclient_web;
+
+    const realApi = { inStreamAd: null, skipToNext() { fixture.counts.skipToNext++; } };
+    // TWO modules matching the provider signature, decoy first by key order.
+    function decoyFactory(module) {
+      module.exports = {
+        d: function () { return { decoy: true }; },     // inStreamApi accessor
+        m: function () { return null; },                // getInStreamAd accessor
+      };
+    }
+    function realFactory(module) {
+      module.exports = {
+        d: function () { return realApi; },             // inStreamApi accessor
+        m: function () { return realApi.inStreamAd; },  // getInStreamAd accessor
+      };
+    }
+    W.__interceptify_instream_id = undefined;           // force rediscovery
+    chunk.push([["ambiguous-chunk"], { 100: decoyFactory, 200: realFactory }]);
+    const pushed = chunk[chunk.length - 1][1];
+    assert("P5 (THE DECOY): with two indistinguishable candidates, NOTHING is wrapped",
+      pushed[100] === decoyFactory && pushed[200] === realFactory,
+      `decoyWrapped=${pushed[100] !== decoyFactory} realWrapped=${pushed[200] !== realFactory}`);
+    assert("P5b: ...and the ambiguity is recorded, not resolved by key order",
+      Array.isArray(W.__interceptify_instream_ambiguous)
+        && W.__interceptify_instream_ambiguous.length === 2,
+      JSON.stringify(W.__interceptify_instream_ambiguous));
+    assert("P5c: ...and readiness goes red rather than claiming the layer is up",
+      W.__interceptify.health().protectionReady === false,
+      JSON.stringify(W.__interceptify.health().notReady));
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -1835,6 +2026,9 @@ async function main() {
   }
   try { await testO(); } catch (e) {
     assert("TEST O crashed", false, String(e && e.stack || e));
+  }
+  try { await testP(); } catch (e) {
+    assert("TEST P crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

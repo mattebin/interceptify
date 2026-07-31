@@ -920,23 +920,48 @@
   // meant two different answers to "which connector" depending on where you
   // asked - the exact split that lets state describe one object while calls go
   // to another. It is a SOURCE here, not a bypass.
+  // Set when two sources disagree about which connector is live. Ambiguity is
+  // not a tie to be broken by preference order - it means we do not know, and
+  // "we do not know" must read as NOT PROTECTED, never as the last answer that
+  // happened to be cached.
+  let _identityAmbiguous = null;
+
+  function connectorFromModule() {
+    const id = window.__interceptify_ads_module;
+    if (id == null) return null;
+    try {
+      const req = anyAdsRequire();
+      const ex = req && req(id);
+      const ac = ex && ex.adsCoreConnector;
+      return (ac && connectorUsable(ac)) ? ac : null;
+    } catch { return null; }
+  }
+
   function currentConnectorFast() {
+    // The MODULE read is the authority: it is Spotify's own core module, read
+    // through Spotify's own require. The L1 in-stream api merely holds a
+    // pointer, and a stale L1 api holds a pointer to a connector that is no
+    // longer live - which is exactly what happened: A kept receiving every
+    // write, B received none, an ad delivered through B was neither counted nor
+    // muted, and health stayed ready because the api pointer was consulted
+    // first and simply believed.
+    const fromModule = connectorFromModule();
     const api = window.__interceptify_instream_api;
     const fromApi = api && api.adsCoreConnector;
-    if (fromApi && connectorUsable(fromApi)) return fromApi;
-    // Re-read the module we already found the connector in. Same cost as a
-    // property access once the module is cached, and it catches Spotify
-    // swapping the connector out from under a module id we already know.
-    const id = window.__interceptify_ads_module;
-    if (id != null) {
-      try {
-        const req = anyAdsRequire();
-        const ex = req && req(id);
-        const ac = ex && ex.adsCoreConnector;
-        if (ac && connectorUsable(ac)) return ac;
-      } catch {}
+    const apiUsable = fromApi && connectorUsable(fromApi);
+
+    if (fromModule && apiUsable && fromApi !== fromModule) {
+      // Two live sources, two different objects. One of them is stale and
+      // nothing here can tell which, so this is genuinely unknown.
+      if (_identityAmbiguous !== "api-vs-module") {
+        _identityAmbiguous = "api-vs-module";
+        snifferLog("connector-identity-ambiguous", { module: window.__interceptify_ads_module });
+      }
+      return fromModule;                         // prefer the core, but stay unready
     }
-    return null;
+    _identityAmbiguous = null;
+    if (fromModule) return fromModule;
+    return apiUsable ? fromApi : null;
   }
 
   function resolveAdsConnector() {
@@ -952,9 +977,17 @@
     // the only path that can take up to connectorRecheckMs to notice a change,
     // and it is the path where the connector has moved to a module id we do not
     // know yet - so there is nothing cheaper to ask.
+    //
+    // While that scan is deferred, identity is UNCONFIRMED. It used to keep
+    // returning the cached connector and let health stay green for the whole
+    // interval - a deliberate three-second window in which a new lazy connector
+    // was untouched and the block reported protected. Three seconds is enough
+    // to hear an ad. The wait is still there (the scan is genuinely expensive)
+    // but it now reads as "we do not know", not as "yes".
     const now = Date.now();
     if (_adsConnector && connectorUsable(_adsConnector)
         && now - _connectorCheckedAt < (CFG.connectorRecheckMs | 0)) {
+      if (_identityAmbiguous !== "deferred-scan") _identityAmbiguous = "deferred-scan";
       return _adsConnector;
     }
     _connectorCheckedAt = now;
@@ -1040,8 +1073,19 @@
   // outlives the connector it describes - which matters most at track
   // boundaries, exactly where a queued ad gets promoted.
   function protectionReady() {
+    // RESOLVE IDENTITY FIRST, synchronously. Readiness used to report on cached
+    // state that only a 1s maintenance tick refreshed, so a handoff between
+    // ticks left health saying "covered" about a connector that was no longer
+    // live - and the delivery that arrived in that gap was the whole failure.
+    // The fast path is property reads, so there is no reason to answer this
+    // question from memory.
+    try { resolveAdsConnector(); } catch {}
     const g = window.__interceptify_ad_gate || null;
     const missing = [];
+    // Ambiguous or unconfirmed identity is NOT protected. Preferring a cached
+    // answer while the real one is unknown is precisely how every one of these
+    // reported green while an ad played.
+    if (_identityAmbiguous) missing.push("identity:" + _identityAmbiguous);
     if (!window.__interceptify_ads_connector) missing.push("connector");
     // Subscribed to the connector that is live NOW, not merely subscribed once.
     else if (!tripwireCoversLiveConnector() && CFG.adTripwire !== false) missing.push("tripwire");
@@ -1064,6 +1108,10 @@
     if (sc.ok === false || sc.t === 0) missing.push("slotCleared");
     else if (sc.ok === "pending") missing.push("slotClearPending");
     if (!window.__interceptify_l1_provider_wrapped) missing.push("l1Provider");
+    // Several modules matched the provider signature and none of them is
+    // distinguishable. Wrapping the wrong one reports success while the real
+    // provider runs untouched, so an unresolved ambiguity is a failure.
+    else if (window.__interceptify_instream_ambiguous) missing.push("l1ProviderAmbiguous");
     return { ok: missing.length === 0, missing: missing };
   }
 
@@ -1454,6 +1502,12 @@
   }
   function adGateKeys() { return _adGateKeys && _adGateKeys.length ? _adGateKeys : adGateFallbackKeys(); }
   let _adGateRefreshStartedAt = 0;
+  // Monotonic per-READ, not per-connector. The connector epoch distinguishes A
+  // from B; it cannot distinguish two reads on B. A delayed older "closed"
+  // reply could therefore land after a newer "open" one and restore a green
+  // gate while the real switch was still true. Only the latest issued read may
+  // write gate state.
+  let _gateReadSeq = 0;
   function refreshAdGate(ac) {
     // A getAdState() that never settles used to pin _adGateRefreshing true
     // forever, so no later refresh could ever run and the last "verified"
@@ -1483,6 +1537,7 @@
     // was issued to, and nothing else.
     const epoch = _connectorEpoch;
     const issuedTo = ac;
+    const seq = ++_gateReadSeq;
     try {
       const p = ac.getAdState();
       if (!p || !p.then) {
@@ -1497,6 +1552,10 @@
         if (epoch !== _connectorEpoch || issuedTo !== _adsConnector) {
           snifferLog("ad-gate-read-superseded", { epoch, now: _connectorEpoch });
           return;                                  // answer about a dead object
+        }
+        if (seq !== _gateReadSeq) {
+          snifferLog("ad-gate-read-out-of-order", { seq, latest: _gateReadSeq });
+          return;                                  // an older read, arriving late
         }
         const st = (s && s.state) || {};
         const keys = Object.keys(st);
@@ -1533,6 +1592,7 @@
       }).catch((e) => {
         _adGateRefreshing = false;
         if (epoch !== _connectorEpoch || issuedTo !== _adsConnector) return;
+        if (seq !== _gateReadSeq) return;
         // A REJECTED read is not "no new information", it is evidence the
         // channel the gate lives on is broken. Swallowing it left the previous
         // `verified: true` standing as the current answer indefinitely.
@@ -2315,12 +2375,27 @@
         // ads ran untouched. The whole-graph scan exists precisely for a renamed
         // provider; it just was not consulted on the path where renames show up.
         const found = discoverInStreamModuleIds(map);
-        if (found.length) {
-          window.__interceptify_instream_id = found[0];
-          snifferLog("instream-provider-rediscovered", { module: String(found[0]) });
-          return found[0];
+        if (!found.length) return null;
+        if (found.length > 1) {
+          // AMBIGUOUS. This build is known to carry a decoy that satisfies the
+          // same source signature as the real provider, and `found[0]` resolved
+          // that by object-key order - which is not a discriminator, it is a
+          // coin toss that happens to be stable. Picking the decoy wraps the
+          // wrong module, leaves the real one serving audio ads untouched, and
+          // reports l1Provider green because something got wrapped.
+          //
+          // There is no discriminator here worth trusting, so say so: record
+          // the candidates, wrap nothing, and let readiness go red. A missed
+          // wrap that is VISIBLE is recoverable; a wrong wrap that reports
+          // success is not.
+          window.__interceptify_instream_ambiguous = found.map(String);
+          snifferLog("instream-provider-AMBIGUOUS", { candidates: found.map(String) });
+          return null;
         }
-        return null;
+        window.__interceptify_instream_ambiguous = null;
+        window.__interceptify_instream_id = found[0];
+        snifferLog("instream-provider-rediscovered", { module: String(found[0]) });
+        return found[0];
       };
       const patchModules = (modules) => {
         if (!modules) return;
@@ -4129,6 +4204,8 @@
         l1ProviderActive: !!window.__interceptify_l1_provider_active,
         // "armed" was a global boolean, so a connector swap left this true while
         // the new connector's deliveries went entirely unobserved.
+        instreamAmbiguous: window.__interceptify_instream_ambiguous || null,
+        identityAmbiguous: (function () { try { return _identityAmbiguous; } catch { return null; } })(),
         tripwireCoversLive: (function () { try { return tripwireCoversLiveConnector(); }
                                            catch { return false; } })(),
         instreamModuleIds: (window.__interceptify_instream_module_ids || []).slice(),

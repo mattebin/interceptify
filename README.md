@@ -80,7 +80,9 @@ Two files, not one:
 | `extensions/adblock.config.json` | the release | **replaced** |
 | `extensions/adblock.config.local.json` | you (and the self-heal) | never touched, and merged **on top** |
 
-Put your own changes in the `.local.json` file. The shipped file holds exactly the values a release exists to correct, so it has to be replaceable: when both lived in one file, a release that fixed a module id or a selector could never reach anyone who already had the file. An existing customised config is migrated into the local file automatically the first time the new build starts.
+Put your own changes in the `.local.json` file. The shipped file holds exactly the values a release exists to correct, so it has to be replaceable: when both lived in one file, a release that fixed a module id or a selector could never reach anyone who already had the file. A customised shipped config is **not** migrated for you. If the new build finds `adblock.config.json` modified, it installs the new defaults (so the fix lands) and sets your previous file aside intact as `adblock.config.superseded-<timestamp>.json`. Copy anything you meant to keep into `.local.json`, which is never overwritten.
+
+The reason it does not migrate automatically: file content cannot distinguish "the user edited this" from "this is simply the previous release's copy", and guessing is wrong in both directions - keep the old values and the fix never lands; drop them and your work disappears silently.
 
 ## Detective / debug
 

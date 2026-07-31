@@ -358,17 +358,55 @@ def fingerprint() -> dict:
 
 
 def load_state() -> dict:
+    """The persisted state, or {} only when there genuinely is none.
+
+    A malformed file used to become {} silently, and {} means "no unresolved
+    delivery" - so a half-written state file ERASED the record of ads reaching
+    the user and let the next structural pass report green. That is the one
+    piece of state in this program that must never be lost by accident, and
+    truncation was the likeliest way to lose it: the write was not atomic and
+    the tasks were configured to be killed on battery.
+
+    A file that exists but cannot be parsed is set aside and reported, not
+    treated as absence.
+    """
+    if not STATE_FILE.exists():
+        return {}
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except Exception as e:
+        keep = STATE_FILE.with_name(
+            f"{STATE_FILE.stem}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}.json")
+        try:
+            STATE_FILE.replace(keep)
+            log.error("state file was unreadable (%s); kept it as %s. Treating this run as "
+                      "having NO verified state rather than as having no incidents.", e, keep.name)
+        except OSError as e2:
+            log.error("state file is unreadable (%s) and could not be set aside (%s)", e, e2)
+        # Deliberately NOT {}: an empty dict reads as "verified nothing, nothing
+        # pending", which is the reassuring interpretation of a lost file.
+        return {"verified_pass": False, "state_lost": True}
 
 
 def save_state(d: dict) -> None:
+    """Write via temp file + atomic replace, so a kill mid-write cannot truncate.
+
+    os.replace is atomic on Windows for same-volume paths: the state file is
+    either the old content or the new one, never half of either.
+    """
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
     try:
-        STATE_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
     except Exception as e:
         log.warning("save_state: %s", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def drift_reason(fp: dict, state: dict) -> str | None:
@@ -896,8 +934,12 @@ READ_STREAM_TIME = (
     "(async()=>{try{const ac=window.__interceptify_ads_connector;"
     "if(!ac||typeof ac.getAdState!=='function')return -1;"
     "const s=await ac.getAdState();"
-    "return parseInt(((s&&s.state)||{}).elapsed_stream_time,10)||0;}catch(e){return -1}})()"
+    "const v=((s&&s.state)||{}).elapsed_stream_time;"
+    "return parseInt(v&&typeof v==='object'?v.value:v,10)||0;}catch(e){return -1}})()"
 )
+
+
+OBSERVE_PORTS = (CDP_PORT, 9222)
 
 
 def observe_playback_passively(state: dict) -> int:
@@ -921,10 +963,16 @@ def observe_playback_passively(state: dict) -> int:
     d = delivery_block(state)
     if not d or not d.get("changed_at"):
         return 0
-    if not cdp_is_live():
+    # Try every port a live Spotify might be listening on. This probed only
+    # CDP_PORT (9333), which is the port a REPAIR opens and then closes again -
+    # the tray's Debug Capture uses 9222, and a normally-launched Spotify has
+    # none. So the reader could essentially never connect, and observed_s stayed
+    # zero exactly as the live state showed.
+    port = next((p for p in OBSERVE_PORTS if cdp_is_live(p)), None)
+    if port is None:
         return 0
     try:
-        cdp = CDP(CDP_PORT)
+        cdp = CDP(port)
         try:
             raw = cdp.ev(READ_STREAM_TIME)
         finally:
@@ -1483,6 +1531,23 @@ def selftest_now(duration_ms: int = 12000, allow_restart: bool = False) -> dict:
 
 
 def run(force: bool = False, duration_ms: int = 12000) -> int:
+    """Serialised against every other self-heal run on this machine.
+
+    Three scheduled tasks plus manual invocations can overlap, and only the
+    xpui.spa rewrite was protected. Everything around it - stopping Spotify,
+    relaunching it with a debug port, harvesting incidents, writing state - was
+    free to interleave, so two runs could each kill the other's Spotify and both
+    write the state file.
+    """
+    import patch_lock
+    with patch_lock.run_exclusive() as got:
+        if not got:
+            log.warning("another self-heal run is already in progress; standing down")
+            return 0
+        return _run(force=force, duration_ms=duration_ms)
+
+
+def _run(force: bool = False, duration_ms: int = 12000) -> int:
     try:
         prune_diagnostics()
     except Exception as e:
