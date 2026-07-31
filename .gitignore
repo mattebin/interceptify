@@ -63,3 +63,7 @@ sni_log.txt
 selfheal.state.json
 selfheal.report.json
 selfheal.log
+
+# Records when this install registered its scheduled tasks, so "has never run"
+# is not reported for a task that has not had a chance to yet.
+.tasks-installed

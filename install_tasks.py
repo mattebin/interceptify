@@ -259,12 +259,26 @@ def last_result(name: str) -> tuple[str, str]:
 
 NEVER_RAN = "1999-11-30"
 
+# A freshly registered task has of course never run, and saying so on every
+# install is how a real warning becomes noise the user learns to scroll past -
+# the same trap as a flag that never clears. Suppress "has never run" until a
+# daily trigger has had a chance to fire.
+INSTALL_STAMP = ROOT / ".tasks-installed"
+GRACE_S = 26 * 3600
+
+
+def _installed_recently() -> bool:
+    try:
+        return (time.time() - INSTALL_STAMP.stat().st_mtime) < GRACE_S
+    except OSError:
+        return False
+
 
 def run_health(name: str) -> list[str]:
     """Complaints about whether the task has actually been RUNNING."""
     run, res = last_result(name)
     out = []
-    if run.startswith(NEVER_RAN):
+    if run.startswith(NEVER_RAN) and not _installed_recently():
         out.append("has never run")
     try:
         code = int(res)
@@ -466,6 +480,10 @@ def install() -> int:
             registered_any = True
 
     if registered_any:
+        try:
+            INSTALL_STAMP.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+        except OSError:
+            pass
         remove_run_key()
     elif run_key_value():
         print("  kept the HKCU Run entry: no scheduled task was registered, so removing it\n"
