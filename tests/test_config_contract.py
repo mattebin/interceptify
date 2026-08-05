@@ -58,6 +58,7 @@ BUILD_VOLATILE = [
     "sponsoredPlaylistRegex", "adBodyMarkerRegex", "adUrlSignals",
     "adTextMarkers", "adGateKeyPatterns", "adGateFallbackKeys",
     "adSlots", "primaryAdSlot", "adSlotIdRegex", "primarySlotRegex",
+    "connectorSkipMethods",
 ]
 
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)

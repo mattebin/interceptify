@@ -1979,6 +1979,149 @@ async function testP() {
 }
 
 // ===========================================================================
+// TEST Q — A RENAMED SKIP METHOD MUST NOT COST US THE GATE
+//
+// Spotify 1.2.95 renamed the connector's skipToNextWithOverride to plain
+// skipToNext. Nothing else about the ad connector moved: putState, getAdState,
+// clearSlot and updateAdStateEndpoint were all still there, and ad_enabled was
+// still in Spotify's own published state.
+//
+// The payload identified the connector BY that skip name, in both the module
+// scan and connectorUsable(). So one rename read as "there is no ad connector
+// on this build": no gate written, no slot flush, health reporting
+// connector:false - and every ad played, caught only by the reactive mute.
+// That is what the user heard on 2026-08-05.
+//
+// The rule this locks in: identity is the ad-STATE surface (putState +
+// getAdState), which is what the prevention actually drives. The skip is a
+// belt, resolved by name from config, and its absence must never take the gate
+// down with it.
+// ===========================================================================
+async function testQ() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST Q"); };
+
+  // The 1.2.95 connector: same object, skip method under its new name.
+  function make1295Connector() {
+    const c = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    c.skipToNext = function () { c.calls.overrideSkip = (c.calls.overrideSkip || 0) + 1; };
+    delete c.skipToNextWithOverride;
+    return c;
+  }
+
+  // ---- Q1: the gate still closes on a build with the renamed skip ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const C = make1295Connector();
+    assert("Q1.setup: the fixture really is the renamed shape",
+      typeof C.skipToNextWithOverride === "undefined" && typeof C.skipToNext === "function");
+
+    W.__interceptify_instream_api = { adsCoreConnector: C, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+    assert("Q1a: the connector is resolved despite the renamed skip",
+      W.__interceptify_ads_connector === C,
+      `resolved=${!!W.__interceptify_ads_connector}`);
+    const wroteGate = C.calls.putState.some(([k, v]) =>
+      k === "ad_enabled" && String(v) === "false");
+    assert("Q1b (THE FIX): ad_enabled is written false - prevention is live",
+      wroteGate, JSON.stringify(C.calls.putState));
+    assert("Q1c: and health reports a connector rather than none",
+      W.__interceptify.health().connector === true);
+  }
+
+  // ---- Q2: the reactive belt uses whichever name the build has -------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const C = make1295Connector();
+    W.__interceptify_instream_api = { adsCoreConnector: C, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+    // Drive the real containment path: an ad delivered on the connector, with
+    // no in-stream api available, leaves the connector skip as the only lever.
+    W.__interceptify_instream_api = { adsCoreConnector: C };
+    const before = C.calls.overrideSkip || 0;
+    C.deliver({ adId: "q2-ad", slot: "stream",
+                metadata: { product_name: "audio_ad", format: "audio/ogg" } });
+    for (let i = 0; i < 3; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("Q2: containment reaches the ad through the renamed skip method",
+      (C.calls.overrideSkip || 0) === before + 1,
+      `calls=${C.calls.overrideSkip || 0}`);
+  }
+
+  // ---- Q3: an old 1.2.94 connector still works (no regression) -------
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    C.skipToNextWithOverride = function () { C.calls.overrideSkip = (C.calls.overrideSkip || 0) + 1; };
+    W.__interceptify_instream_api = { adsCoreConnector: C, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("Q3: the 1.2.94 shape still resolves and closes the gate",
+      W.__interceptify_ads_connector === C
+      && C.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"),
+      JSON.stringify(C.calls.putState));
+  }
+
+  // ---- Q5: the MODULE SCAN itself, over a real factory registry -----
+  // Q1-Q4 hand the connector to the payload directly, so they exercise
+  // connectorUsable() and never scanForAdsConnector(). On the live client the
+  // scan is the path that finds the connector in the first place, and its
+  // source-string prefilter named the removed symbol too. Sabotaging that line
+  // left the whole suite green - a check that does not run the code it is
+  // supposed to be checking. This runs it: a genuine __webpack_modules__ with a
+  // factory whose SOURCE looks like Spotify's, and no other route to the
+  // connector.
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const C = make1295Connector();
+    // Shaped like the real module: names adsCoreConnector, touches putState,
+    // and mentions neither skip method - exactly the 1.2.95 source.
+    W.__webpack_modules__ = {
+      "9001": function (module, exports, require) {
+        if (typeof C.putState === "function") module.exports.adsCoreConnector = C;
+      },
+      "9002": function (module, exports, require) { module.exports = { unrelated: true }; },
+    };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+
+    assert("Q5a: the module scan finds the connector by its state surface",
+      W.__interceptify_ads_connector === C,
+      `module=${W.__interceptify_ads_module} candidates=${JSON.stringify(W.__interceptify_ads_module_candidates)}`);
+    assert("Q5b: ...and the gate is written through it",
+      C.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"),
+      JSON.stringify(C.calls.putState));
+  }
+
+  // ---- Q4: an object with NEITHER skip name is still the connector ---
+  // A future build could drop the belt entirely. Losing the reactive skip is a
+  // degradation; losing the gate is the outage. They must not be the same event.
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    delete C.skipToNextWithOverride;
+    W.__interceptify_instream_api = { adsCoreConnector: C, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("Q4: no skip method at all still leaves the prevention gate working",
+      C.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"),
+      JSON.stringify(C.calls.putState));
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -2029,6 +2172,9 @@ async function main() {
   }
   try { await testP(); } catch (e) {
     assert("TEST P crashed", false, String(e && e.stack || e));
+  }
+  try { await testQ(); } catch (e) {
+    assert("TEST Q crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

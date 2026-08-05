@@ -70,6 +70,11 @@
     "rspackChunkclient_web",
     "webpackChunkclient_web"
   ],
+  "_connectorSkipMethods_note": "The ads connector's skip method, first present wins. 1.2.94 = skipToNextWithOverride, 1.2.95 = skipToNext. The override form bypasses the Free skip lock, so it stays first.",
+  "connectorSkipMethods": [
+    "skipToNextWithOverride",
+    "skipToNext"
+  ],
   "l1WatchdogMs": 20000,
   "manifestRegex": "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
   "manifestAdMaxMs": 60000,

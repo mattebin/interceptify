@@ -208,7 +208,11 @@
     tripwireHoldMs: 8000,
     tripwireHoldMaxMs: 35000,           // absolute cap even when the ad declares a longer duration
     tripwireMinHoldMs: 1200,            // floor before DOM evidence is allowed to release early
-    overrideSkip: true,                 // reactive belt ONLY: skipToNextWithOverride() bypasses the Free "skip disabled during ad" lock for any ad that slips the ad_enabled prevention (e.g. the startup window before the connector resolves, or SSAI). Gated ONLY via advance().
+    overrideSkip: true,                 // reactive belt ONLY: the connector skip bypasses the Free "skip disabled during ad" lock for any ad that slips the ad_enabled prevention (e.g. the startup window before the connector resolves, or SSAI). Gated ONLY via advance().
+    // The connector's skip method, in order of preference. 1.2.94 called it
+    // skipToNextWithOverride; 1.2.95 calls it skipToNext. Published so the next
+    // rename is a config edit and a re-patch, not a release.
+    connectorSkipMethods: ["skipToNextWithOverride", "skipToNext"],
     totalBlockIntervalMs: 3000,         // re-apply connector-capture + endpoint-kill on this cadence (faster than the 10s stream-time interval so the kill lands before the first ad once the lazy ads chunk loads)
     // Spotify moved webpack -> rspack; hooking one name silently lost the
     // whole L1 layer. All candidates are hooked and a watchdog reports if
@@ -865,9 +869,25 @@
   // whose RPC methods have gone is a dead object, and caching it forever meant
   // every later call quietly targeted a corpse while health reported a
   // connector present.
+  // The connector's skip method is the one name on it that churns: 1.2.95
+  // renamed skipToNextWithOverride to plain skipToNext and nothing else moved.
+  // Ordered by preference, first present wins - the override form bypasses the
+  // Free "skip disabled during an ad" lock, so keep it ahead of a plain skip.
+  function connectorSkipMethod(ac) {
+    if (!ac) return null;
+    const names = CFG.connectorSkipMethods || [];
+    for (const n of names) if (typeof ac[n] === "function") return n;
+    return null;
+  }
+
+  // Identity is the ad-STATE surface, not the skip. putState + getAdState are
+  // what the gate drives, and they are what makes this object the ad connector;
+  // the skip is a reactive belt that a rebuild may rename or drop. Requiring the
+  // skip here is what made 1.2.95 look like "no connector at all" - losing the
+  // prevention gate over a missing fallback.
   function connectorUsable(ac) {
-    return !!(ac && typeof ac.skipToNextWithOverride === "function"
-              && typeof ac.putState === "function");
+    return !!(ac && typeof ac.putState === "function"
+              && typeof ac.getAdState === "function");
   }
 
   // Scan the live module graph for the connector Spotify would hand out NOW.
@@ -878,19 +898,29 @@
     const M = window.__webpack_modules__;
     const req = anyAdsRequire();
     if (!M || !req) return null;
+    // Source-level prefilter, then confirm on the instantiated export. Matching
+    // on the state surface rather than the skip name survives a rename of the
+    // skip; requiring two independent symbols keeps it from matching any module
+    // that merely mentions ads.
+    const found = [];
     for (const id of Object.keys(M)) {
       let src = "";
       try { const f = M[id] && M[id].__intc_orig ? M[id].__intc_orig : M[id]; src = Function.prototype.toString.call(f); } catch { continue; }
-      if (src.indexOf("skipToNextWithOverride") < 0) continue;
-      if (src.indexOf("updateAdStateEndpoint") < 0 && src.indexOf("adsCoreConnector") < 0) continue;
+      if (src.indexOf("adsCoreConnector") < 0) continue;
+      if (src.indexOf("updateAdStateEndpoint") < 0 && src.indexOf("putState") < 0) continue;
       let ex; try { ex = req(id); } catch { continue; }
       const ac = ex && ex.adsCoreConnector;
-      if (ac && typeof ac.skipToNextWithOverride === "function") {
-        window.__interceptify_ads_module = String(id);
-        return ac;
-      }
+      if (connectorUsable(ac)) found.push({ id: String(id), ac });
     }
-    return null;
+    const distinct = [];
+    for (const f of found) if (!distinct.some((d) => d.ac === f.ac)) distinct.push(f);
+    window.__interceptify_ads_module_candidates = distinct.map((d) => d.id);
+    if (!distinct.length) return null;
+    // This build family is documented to ship decoy modules, so record when the
+    // answer is not unique instead of silently taking whichever key order won.
+    if (distinct.length > 1) snifferLog("ads-connector-ambiguous", { ids: distinct.map((d) => d.id) });
+    window.__interceptify_ads_module = distinct[0].id;
+    return distinct[0].ac;
   }
 
   // How often to re-ask the bundle who the active connector is. A full module
@@ -1203,11 +1233,12 @@
     if (CFG.overrideSkip === false) return false;
     try {
       const ac = resolveAdsConnector();
-      if (ac && typeof ac.skipToNextWithOverride === "function") {
+      const m = connectorSkipMethod(ac);
+      if (m) {
         try { armMute(); } catch {}
-        ac.skipToNextWithOverride();
+        ac[m]();
         recordIncident("skipped", { id: (window.__interceptify_last_delivered || {}).id || null });
-        snifferLog("override-skip", { reason });
+        snifferLog("override-skip", { reason, method: m });
         return true;
       }
     } catch (e) { snifferLog("override-skip-error", { reason, error: String(e && e.message || e) }); }
@@ -4143,7 +4174,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-07-29-honest-verify",
+    version: "2026-08-05-connector-rename",
     debugCapture: DEBUG_CAPTURE,
     // Machine-readable health, for the automated repair loop (selfheal.py) and
     // for a human over CDP. Cheap, no side effects.
