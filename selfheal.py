@@ -591,6 +591,61 @@ def _vault_append(lines: list[str]) -> None:
         log.warning("vault append failed: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Is the version we are running actually PUBLISHED?
+# ---------------------------------------------------------------------------
+#
+# Nothing watched this, and it cost a week. Between 2026-07-29 and 2026-08-05 an
+# expression in the release workflow's `permissions:` block made the file
+# unparseable, so every tag push failed at startup and no release was built.
+# APP_VERSION said 2.0.5, GitHub's latest release said 2.0.4, and every existing
+# check was blind to the gap:
+#
+#   * test_version_consistency runs INSIDE ci, so a workflow that never starts
+#     never runs it;
+#   * the tray's update poll only asks `is_newer(published, APP_VERSION)`, which
+#     is False when the source is AHEAD - the same answer as "up to date".
+#
+# "Our fix is written, tested and merged" and "our fix is in the binary a user
+# would download" are different facts, and only the second one matters. This
+# compares them.
+#
+# Deliberately advisory: no network, a refused request or a rate limit must
+# never produce a false alarm or block a repair. Unknown is reported as unknown.
+def published_version_gap() -> dict:
+    """Compare APP_VERSION against the latest PUBLISHED release.
+
+    Returns {"status": ..., "app": ..., "published": ...} where status is:
+      ok          - a release exists for this version (or we are behind one)
+      unpublished - APP_VERSION is newer than anything published: THE GAP
+      unknown     - could not ask (offline, rate limited, no releases yet)
+    """
+    out = {"status": "unknown", "app": None, "published": None, "detail": ""}
+    try:
+        import self_updater
+        from main import APP_VERSION
+    except Exception as e:                       # pragma: no cover - import shape
+        out["detail"] = f"import failed: {e}"
+        return out
+    out["app"] = APP_VERSION
+    try:
+        rel = self_updater.get_latest_release()
+    except Exception as e:
+        out["detail"] = f"release lookup failed: {e}"
+        return out
+    if rel is None or not rel.tag:
+        out["detail"] = "no published release found"
+        return out
+    out["published"] = rel.tag
+    try:
+        newer_locally = self_updater.parse_version(APP_VERSION) > self_updater.parse_version(rel.tag)
+    except Exception as e:
+        out["detail"] = f"version compare failed: {e}"
+        return out
+    out["status"] = "unpublished" if newer_locally else "ok"
+    return out
+
+
 LOCALSTORAGE_DIRS = [
     Path(os.environ.get("LOCALAPPDATA", "")) / "Spotify" / "Browser" / "Local Storage" / "leveldb",
     Path(os.environ.get("LOCALAPPDATA", "")) / "Spotify" / "Default" / "Local Storage" / "leveldb",
@@ -1552,6 +1607,22 @@ def _run(force: bool = False, duration_ms: int = 12000) -> int:
         prune_diagnostics()
     except Exception as e:
         log.warning("diagnostic pruning: %s", e)
+
+    # Advisory, and deliberately before anything can early-return: a run that
+    # stops at UNRESOLVED still needs to say that the fix it is defending was
+    # never actually shipped.
+    try:
+        gap = published_version_gap()
+        if gap["status"] == "unpublished":
+            msg = (f"NOT PUBLISHED: this build is {gap['app']} but the latest GitHub "
+                   f"release is {gap['published']}. The fix is not in any binary a "
+                   f"user can download - check the release workflow actually ran.")
+            log.error(msg)
+            _vault_append([f"- {time.strftime('%Y-%m-%d %H:%M')} — 🚧 **{msg}**"])
+        elif gap["status"] == "unknown":
+            log.info("publish check skipped (%s)", gap["detail"] or "no answer")
+    except Exception as e:
+        log.warning("publish check: %s", e)      # never fatal
     fp = fingerprint()
     state = load_state()
     reason = drift_reason(fp, state)

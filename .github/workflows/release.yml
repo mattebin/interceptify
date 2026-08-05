@@ -72,6 +72,10 @@ jobs:
       - name: Redaction removes credentials and keeps diagnostics readable
         run: python tests/test_redact.py
 
+      # "Merged" and "downloadable" are different facts. This covers the second.
+      - name: A version nobody can download must be reported, not assumed shipped
+        run: python tests/test_publish_gap.py
+
       # Applies to MANUAL runs too, via the required `version` input.
       - name: Version consistency (tag/input vs APP_VERSION vs manifest)
         run: python tests/test_version_consistency.py "${{ github.event.inputs.version || github.ref_name }}"
