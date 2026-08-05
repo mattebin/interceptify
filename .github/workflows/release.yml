@@ -80,11 +80,18 @@ jobs:
     needs: test
     runs-on: windows-latest
     permissions:
-      # write ONLY when this run can actually publish, i.e. a tag push. A manual
-      # workflow_dispatch built the exe with release-write credentials in scope
-      # for the whole job even though it publishes nothing - privilege held for
-      # a capability the run does not use.
-      contents: ${{ startsWith(github.ref, 'refs/tags/') && 'write' || 'read' }}
+      # Only this job gets write, and the release step below is gated on a tag
+      # push, so a manual run still publishes nothing.
+      #
+      # This value CANNOT be an expression. `permissions` is read while the
+      # workflow file is being parsed, before any context exists to evaluate
+      # `${{ }}` against, so a conditional here does not narrow the token - it
+      # makes the whole file invalid. GitHub then fails the run at startup with
+      # no jobs and no log, and because it cannot parse `on:` either, it does it
+      # for EVERY push to any branch. That is what happened between 2026-07-29
+      # and 2026-08-05: three 0-second failures, no release built, and the
+      # published binary silently stayed at v2.0.4 while main moved on.
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
