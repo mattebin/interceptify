@@ -204,8 +204,16 @@ def _current_user() -> str:
 # Reading what is actually registered
 # ---------------------------------------------------------------------------
 
+# The tray and self-heal run under pythonw, which has no console for children
+# to inherit. Without CREATE_NO_WINDOW every schtasks call allocates its own
+# console, and Windows 11 (Terminal as default host) surfaces each one as an
+# empty "Terminal" window on the desktop - a stack of them per logon.
+CREATE_NO_WINDOW = 0x08000000
+
+
 def _schtasks(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["schtasks", *args], capture_output=True, text=True)
+    return subprocess.run(["schtasks", *args], capture_output=True, text=True,
+                          creationflags=CREATE_NO_WINDOW)
 
 
 def _tag(xml: str, tag: str) -> str:
