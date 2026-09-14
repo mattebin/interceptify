@@ -117,8 +117,8 @@
     instreamSourceRegex: "",            // disabled — the AND-pair uniquely IDs the provider
     playerStateSignatures: [["AdsAPIProvider"]],  // the ads-API module's stable error-string (was 5563)
     playerStateRegex: "",
-    playerStateFallbackId: 21361,       // 1.3.0; used only if the source scan fails
-    instreamModuleFallbackId: 98213,    // 1.3.0; fast-path hint, accepted only if the module there still looks like the provider
+    playerStateFallbackId: 5563,        // used only if scan fails
+    instreamModuleFallbackId: 46849,    // used only if scan fails (fast-path hint)
     enableInstreamHook: true,           // master kill-switch for L1; set false if a build breaks on it
     inspectMode: false,                 // PASSIVE: detect+overlay only, NO skip/mute/hide (so ads stay on screen to Alt+click)
     // ---- fast in-stream skip (audio ads) ----
@@ -126,6 +126,11 @@
     inStreamPollMs: 80,                 // in-stream poll cadence
     inStreamSkipLockMs: 300,            // short post-skip self-lock (decoupled from the 1500ms FSM cooldown) -> back-to-back multi-ad skips
     // ---- TOTAL BLOCK (SpotX-style pre-play kill) ----
+    totalBlock: true,                   // call the ads connector's increaseStreamTime(-1e11) so ad breaks never SCHEDULE (proven SpotX lever). FSM skip+mute stays as the fallback (SSAI + any build where this lever moves).
+    streamTimeKillMs: 10000,            // re-apply the stream-time push on this interval (defends vs server ad-state resets)
+    streamTimeKillValue: -100000000000, // -1e11: pushes core stream-time so the ad-break threshold is never crossed
+    killAdEndpoints: true,              // point the ad-STATE pusher + per-slot ad-SERVER at a dead URL so the client can't be told to play / can't fetch an ad (live-tested stable). This is the real prevention lever (stream-time didn't prevent server-scheduled ads).
+    deadAdEndpoint: "https://localhost.invalid/no-ads",
     // Spotify's OWN slot ids, read off the live bundle's *_SLOT_ID constants
     // (2026-07-29, 1.2.94): stream, preroll, sponsored-playlist, leaderboard,
     // hpto, embedded-npv, embedded-playlist, embedded-playlist-leavebehind,
@@ -166,7 +171,7 @@
     primarySlotRegex: "^(?!podcast)[a-z-]*stream[a-z-]*$",
     // ---- snapshot-build ads-connector resurrection (Spotify 1.2.93+ V8 snapshot) ----
     connectorRecheckMs: 3000,           // how often to re-ask the bundle which ads connector is ACTIVE. A handed-off connector usually stays callable, so "still has its methods" was never evidence it is still the live one.
-    snapshotConnector: true,            // rebuild ads-connector access from window.__webpack_modules__ when the closure require is trapped (chunk.push no longer threads it). Powers adEnabledKill + overrideSkip on snapshot builds.
+    snapshotConnector: true,            // rebuild ads-connector access from window.__webpack_modules__ when the closure require is trapped (chunk.push no longer threads it). Powers adEnabledKill + killAdEndpoints + overrideSkip on snapshot builds.
     adEnabledKill: true,                // THE MASTER PREVENTION LEVER. putState('ad_enabled','false') on the core ad-scheduler state stops ad breaks from being SCHEDULED at all (not reactively skipped). Live-proven on 1.2.93: 10 forced skips that previously triggered an ad -> 0 ads. Re-applied fast to survive product-state refreshes re-pushing ad_enabled:true.
     adEnabledKillMs: 1000,              // fast re-apply cadence for ad_enabled=false (it held ~8s untouched, so 1s is safe headroom)
     clearAdSlots: true,                 // also clearSlot() the ad slots each cycle: ad_enabled=false only stops NEW scheduling, so an ad already queued before the block took hold (e.g. one pre-queued at startup) still needs flushing. With this on, 0/14 forced skips produced an ad (vs 1/14 pre-queued without it).
@@ -209,7 +214,7 @@
     // skipToNextWithOverride; 1.2.95 calls it skipToNext. Published so the next
     // rename is a config edit and a re-patch, not a release.
     connectorSkipMethods: ["skipToNextWithOverride", "skipToNext"],
-    totalBlockIntervalMs: 3000,         // connector discovery + gate re-apply cadence (the lazy ads chunk must be found before the first ad)
+    totalBlockIntervalMs: 3000,         // re-apply connector-capture + endpoint-kill on this cadence (faster than the 10s stream-time interval so the kill lands before the first ad once the lazy ads chunk loads)
     // Spotify moved webpack -> rspack; hooking one name silently lost the
     // whole L1 layer. All candidates are hooked and a watchdog reports if
     // none of them ever fires.
@@ -750,19 +755,48 @@
     return true;
   }
 
-  // Two earlier prevention levers used to live here and are gone on purpose:
-  // increaseStreamTime(-1e11) on the QA connector (ad scheduling is server-
-  // driven, proven 2026-06-29: 40+ pushes, ad breaks still came) and pointing
-  // updateAdStateEndpoint/updateAdServerEndpoint at a dead URL (proven not to
-  // prevent ads on 1.2.93, 2026-07-13). Both kept firing on every ad and every
-  // api capture for months while doing nothing. The gate below is the lever.
+  // ===================================================================
+  // TOTAL BLOCK (SpotX-style): the ad-break SCHEDULER keys off core stream-time
+  // (elapsed_stream_time - last_ad_break_stream_time > threshold; see
+  // ad-state-storage.bnk). The ads connector exposes increaseStreamTime() — a
+  // Cosmos RPC into the C++ core. Pushing it hugely negative means the threshold
+  // is never crossed -> ad breaks are never scheduled (silent, pre-play). Found
+  // by SIGNATURE (increaseStreamTime + overrideAdServerEndpoint) so it survives
+  // module-id churn. The reactive FSM (skip+mute) stays as the fallback for SSAI
+  // ads and any build where this lever moves/renames.
+  function getAdsDebugConnector() {
+    if (window.__interceptify_ads_debug) return window.__interceptify_ads_debug;
+    try {
+      const req = anyAdsRequire();
+      if (!req || !req.m) return null;
+      for (const id in req.m) {
+        let s = ""; try { s = Function.prototype.toString.call(req.m[id]); } catch {}
+        if (s.indexOf("increaseStreamTime") < 0) continue;
+        if (s.indexOf("overrideAdServerEndpoint") < 0 && s.indexOf("AdStatePusher") < 0) continue;
+        let mod; try { mod = (req.c && req.c[id]) ? req.c[id].exports : req(id); } catch { continue; }
+        if (!mod) continue;
+        const cands = [mod, mod.D, mod.default].concat(
+          Object.keys(mod).map((k) => { try { return mod[k]; } catch { return null; } }));
+        for (const c of cands) {
+          try {
+            if (c && typeof c.increaseStreamTime === "function") {
+              window.__interceptify_ads_debug = c;
+              snifferLog("total-block-connector", { module: String(id) });
+              return c;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+    return null;
+  }
   // =========================================================================
   // SNAPSHOT-BUILD ADS-CONNECTOR RESURRECTION (Spotify 1.2.93+)
   // ------------------------------------------------------------------------
   // On V8-snapshot builds Spotify's webpack require + module cache are trapped
   // in a closure and chunk.push no longer threads a require, so the L1 provider
-  // hook never captures the ads connector -> the gate silently no-ops and only
-  // the DOM mute survives (the "only mutes now" bug).
+  // hook never captures the ads connector -> killAdEndpoints/streamTimeKill
+  // silently no-op and only the DOM mute survives (the "only mutes now" bug).
   // The one surface still exposed is `window.__webpack_modules__` (the factory
   // registry, writable). A require reconstructed over it can instantiate the ad
   // connector; its RPC methods (skipToNextWithOverride / updateAdStateEndpoint /
@@ -1244,6 +1278,24 @@
     return false;
   }
 
+  function streamTimeKill(reason) {
+    if (CFG.totalBlock === false) return false;
+    try {
+      const d = getAdsDebugConnector();
+      if (d && typeof d.increaseStreamTime === "function") {
+        d.increaseStreamTime(CFG.streamTimeKillValue || -100000000000);
+        snifferLog("total-block-streamtime", { reason });
+        return true;
+      }
+    } catch (e) { snifferLog("total-block-error", { reason, error: String(e && e.message || e) }); }
+    return false;
+  }
+
+  // TOTAL BLOCK (endpoint override): point the ad-STATE channel (the server->
+  // client "an ad break is due" pusher) and each ad SLOT's ad-SERVER (fulfillment)
+  // at a dead URL, so the client can't be told to play an ad and can't fetch ad
+  // media. Live-tested stable (no playback stall). Re-applied on the interval (the
+  // server may reset it on reconnect). FSM skip+mute stays as the fallback.
   // ---- Ad slots: read Spotify's own ids, do not trust a hard-coded list ----
   let _discoveredSlots = null;
 
@@ -1436,6 +1488,50 @@
       snifferLog("slot-clear-stuck", { slot: _slotClear.slot });
     }
     return _slotClear;
+  }
+
+  function killAdEndpoints(reason) {
+    if (CFG.killAdEndpoints === false) return false;
+    try {
+      const api = window.__interceptify_instream_api;
+      // Prefer the L1-hooked instream api's connector (old builds); on snapshot
+      // builds that hook is dead, so fall back to the resurrected connector.
+      const acc = resolveAdsConnector();
+      if (!acc) return false;
+      const DEAD = CFG.deadAdEndpoint || "https://localhost.invalid/no-ads";
+      // Per-method acknowledgement. This returned true whenever a connector
+      // existed, so a build that renamed or dropped BOTH endpoint methods
+      // reported the endpoint kill as applied while nothing had been called -
+      // the same shape of false green as a config that is published but never
+      // injected. Only a method that exists AND did not throw counts.
+      const applied = [];
+      const failed = [];
+      if (typeof acc.updateAdStateEndpoint === "function") {
+        try { acc.updateAdStateEndpoint(DEAD); applied.push("updateAdStateEndpoint"); }
+        catch (e) { failed.push("updateAdStateEndpoint:" + String((e && e.message) || e)); }
+      }
+      if (typeof acc.updateAdServerEndpoint === "function") {
+        let ok = 0;
+        for (const sid of adSlots()) {
+          try { acc.updateAdServerEndpoint([sid], DEAD); ok++; } catch {}
+        }
+        if (ok) applied.push("updateAdServerEndpoint x" + ok);
+        else failed.push("updateAdServerEndpoint: every slot threw");
+      }
+      window.__interceptify_ad_endpoints = { applied, failed, t: Date.now() };
+      if (!applied.length) {
+        window.__interceptify_ad_endpoints_killed = false;
+        snifferLog("ad-endpoint-MISSING", { reason, failed,
+                                            methods: Object.keys(acc || {}).slice(0, 60) });
+        return false;
+      }
+      if (!window.__interceptify_ad_endpoints_killed) {
+        window.__interceptify_ad_endpoints_killed = true;
+        snifferLog("ad-endpoint-killed", { reason, applied });
+      }
+      return true;
+    } catch (e) { snifferLog("ad-endpoint-error", { reason, error: String(e && e.message || e) }); }
+    return false;
   }
 
   // MASTER PREVENTION (Spotify 1.2.93+): flip the core ad-scheduler's `ad_enabled`
@@ -1789,6 +1885,8 @@
   function neutralizeInStreamAd(api, ad, reason) {
     const summary = summarizeAdObject(ad);
     if (!summary) return false;
+    streamTimeKill("ad:" + (reason || ""));   // SpotX-style pre-play kill, alongside the skip
+
     suppressAdUi(reason || "neutralize", 3000);
     rememberInStreamAd(ad, reason);
     rememberInStreamApiCall(`${reason}.neutralize`, { ad: summary });
@@ -1979,6 +2077,7 @@
     if (!api || typeof api !== "object" || api.__interceptify_api_wrapped) return api;
     try {
       window.__interceptify_instream_api = api;
+      try { killAdEndpoints("api-capture"); streamTimeKill("api-capture"); } catch {}
       wrapAdMessageCallbackSlot(api, reason);
       try {
         const existing = api.inStreamAd;
@@ -2522,20 +2621,26 @@
 
   tryInstall("webpack-ad-provider", installWebpackAdProviderHook);
 
-  // PREVENTION: keep the connector resolved and the gate closed. The ads chunk
-  // is lazy, so resolveAdsConnector retries until it appears; once found,
-  // ad_enabled=false is applied and re-applied so a product-state refresh
-  // cannot reopen ads for more than ~1s.
-  if (CFG.snapshotConnector !== false || CFG.adEnabledKill !== false) {
+  // TOTAL BLOCK: proactively point the ad-state/ad-server endpoints at a dead URL
+  // so ad breaks are never scheduled/fetched (not just reactively skipped). On
+  // snapshot builds this first resurrects the connector from __webpack_modules__
+  // (the ads chunk is lazy, so resolveAdsConnector retries until it appears; once
+  // found the endpoint-kill is applied and re-applied to defend vs server resets).
+  if (CFG.totalBlock !== false || CFG.killAdEndpoints !== false || CFG.snapshotConnector !== false || CFG.adEnabledKill !== false) {
     const applyTotalBlock = (reason) => {
       try { captureLiveRequire(); } catch {}   // best-effort: prefer the genuine live require
       try { resolveAdsConnector(); } catch {}   // find the lazy ads connector once loaded
       try { suppressAdState(reason); } catch {} // MASTER: ad_enabled=false -> ads never scheduled
+      try { killAdEndpoints(reason); } catch {}
+      try { streamTimeKill(reason); } catch {}
     };
     try { applyTotalBlock("init"); } catch {}
-    // Connector discovery cadence (the connector + require are cached once found).
+    // Fast cadence so the kill lands the moment the lazy ads chunk loads (before
+    // the first ad); the connector + require are cached once found so this is cheap.
     try { setInterval(() => applyTotalBlock("interval"), CFG.totalBlockIntervalMs || 3000); } catch {}
-    // Dedicated FAST re-apply of the master ad_enabled=false switch.
+    // Dedicated FAST re-apply of the master ad_enabled=false switch — the one lever
+    // proven to prevent ad loading — so a product-state refresh can't reopen ads
+    // for more than ~1s (endpoint/stream-time kills stay on the slower interval).
     try { setInterval(() => { try { suppressAdState("fast"); } catch {} }, CFG.adEnabledKillMs || 1000); } catch {}
   }
 
@@ -3000,8 +3105,6 @@
       const po = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           try {
-            // Album art is never ad audio, and it was 90%+ of the sniffer.
-            if (entry.initiatorType === "img") continue;
             snifferLog("perf-resource", {
               name: (entry.name || "").slice(0, 220),
               initiatorType: entry.initiatorType,
@@ -4230,6 +4333,7 @@
         gateReadAgeMs: (function () { const g = window.__interceptify_ad_gate;
           return (g && g.readAt) ? Date.now() - g.readAt : null; })(),
         gateError: (window.__interceptify_ad_gate || {}).error || null,
+        adEndpoints: window.__interceptify_ad_endpoints || null,
         containHeldMs: (function () { try {
           return containmentHeld() ? window.__interceptify_contain_until - Date.now() : 0; } catch { return 0; } })(),
         layerErrors: _layerErrors.slice(-20),

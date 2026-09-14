@@ -64,8 +64,8 @@
     ]
   ],
   "playerStateRegex": "",
-  "playerStateFallbackId": 21361,
-  "instreamModuleFallbackId": 98213,
+  "playerStateFallbackId": 5563,
+  "instreamModuleFallbackId": 46849,
   "enableInstreamHook": true,
   "webpackChunkGlobals": [
     "rspackChunk",
