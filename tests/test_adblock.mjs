@@ -670,10 +670,10 @@ function wireInStreamProvider(env, fixture) {
       m: function () { return providerApi.inStreamAd; },   // getInStreamAd accessor
     };
   }
-  // 46849 == CFG.instreamModuleFallbackId; the hook replaces it with a wrapper.
-  chunk.push([["test-instream-chunk"], { 46849: providerFactory }]);
+  // 98213 == CFG.instreamModuleFallbackId; the hook replaces it with a wrapper.
+  chunk.push([["test-instream-chunk"], { 98213: providerFactory }]);
   const pushed = chunk[chunk.length - 1];
-  const wrappedFactory = pushed && pushed[1] && pushed[1][46849];
+  const wrappedFactory = pushed && pushed[1] && pushed[1][98213];
   if (typeof wrappedFactory !== "function") return null;
   const moduleObj = { exports: {} };
   wrappedFactory(moduleObj, moduleObj.exports, undefined); // webpack-style invoke
@@ -957,13 +957,13 @@ function testG() {
 
   // Something else entirely, now living at the id the config remembers.
   function strangerFactory(module) { module.exports = { hello: function () { return 1; } }; }
-  chunk.push([["test-recycled-id-chunk"], { 46849: strangerFactory }]);
-  const afterPush = chunk[chunk.length - 1][1][46849];
+  chunk.push([["test-recycled-id-chunk"], { 98213: strangerFactory }]);
+  const afterPush = chunk[chunk.length - 1][1][98213];
   assert("G1 (RECYCLED ID): a module that is not the provider is NOT wrapped",
     afterPush === strangerFactory && !afterPush.__interceptify_wrapped,
     afterPush && afterPush.__interceptify_wrapped ? "it was wrapped anyway" : "");
   assert("G2: the stale hint is reported rather than silently trusted",
-    String(env.sandbox.window.__interceptify_fallback_id_stale) === "46849",
+    String(env.sandbox.window.__interceptify_fallback_id_stale) === "98213",
     `flag=${env.sandbox.window.__interceptify_fallback_id_stale}`);
 }
 
@@ -2305,19 +2305,20 @@ async function testS() {
   {
     const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
     const W = env.sandbox.window;
-    const mods = pushChunk(W, { "98213": captureWrap(providerFactory) });
+    // Not at the fallback id on purpose: this must go through the source scan.
+    const mods = pushChunk(W, { "77001": captureWrap(providerFactory) });
     assert("S1: the provider is found through the capture wrapper's __intc_orig",
-      String(W.__interceptify_instream_id) === "98213" && mods["98213"].__interceptify_wrapped === true,
-      `instream_id=${W.__interceptify_instream_id} wrapped=${!!mods["98213"].__interceptify_wrapped} ambiguous=${JSON.stringify(W.__interceptify_instream_ambiguous)}`);
+      String(W.__interceptify_instream_id) === "77001" && mods["77001"].__interceptify_wrapped === true,
+      `instream_id=${W.__interceptify_instream_id} wrapped=${!!mods["77001"].__interceptify_wrapped} ambiguous=${JSON.stringify(W.__interceptify_instream_ambiguous)}`);
   }
 
   // ---- S2: implementation-sized match is excluded, the accessor wins ----
   {
     const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
     const W = env.sandbox.window;
-    const mods = pushChunk(W, { "42931": platformFactory, "98213": providerFactory });
+    const mods = pushChunk(W, { "42931": platformFactory, "77001": providerFactory });
     assert("S2a (THE BUG): with the implementation module also matching, the accessor provider is still wrapped",
-      String(W.__interceptify_instream_id) === "98213" && mods["98213"].__interceptify_wrapped === true,
+      String(W.__interceptify_instream_id) === "77001" && mods["77001"].__interceptify_wrapped === true,
       `instream_id=${W.__interceptify_instream_id} ambiguous=${JSON.stringify(W.__interceptify_instream_ambiguous)}`);
     assert("S2b: ...and the implementation module is left alone",
       mods["42931"] === platformFactory && !mods["42931"].__interceptify_wrapped, "platform factory was replaced");

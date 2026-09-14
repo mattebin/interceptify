@@ -60,7 +60,7 @@ advancing channel: the webpack-driven `neutralizeInStreamAd()` → `api.skipToNe
 path. This path used to call `skipToNext()` with none of `advance()`'s over-skip
 gates, so a re-read / lingering / prefetched in-stream ad object could skip a
 **real** song. The test drives the **real** webpack provider hook (pushes a
-synthetic module `46849` onto `webpackChunkclient_web`, invokes the wrapped
+synthetic module `98213` onto `webpackChunkclient_web`, invokes the wrapped
 factory webpack-style, then calls the wrapped `d()` to install the `inStreamAd`
 getter/setter), so the skip runs through the genuine code path — then asserts:
 
