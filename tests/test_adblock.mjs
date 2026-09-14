@@ -2122,6 +2122,341 @@ async function testQ() {
 }
 
 // ===========================================================================
+// TEST R — THE REQUIRE THE PAYLOAD DRIVES MUST BE SPOTIFY'S, NOT ITS OWN
+//
+// Spotify 1.3.0 renamed the chunk array to plain `rspackChunk` and, on that
+// build, instantiating the connector module through the payload's
+// reconstructed shim yields {} while Spotify's real require yields the live
+// singleton. Two defects compounded: the hook only knew the `*client_web`
+// names so the array was never hooked (and the bootstrap push that hands the
+// real require back never ran); and the shim, calling factories that the
+// capture wrapper had wrapped, was captured AS the live require, so health
+// said liveRequire:true about the payload's own object.
+//
+// R1: a chunk global with no client_web suffix is hooked and bootstrapped.
+// R2: the shim is never adopted as live - with no real require, liveRequire
+//     reads false.
+// R3: the require handed back by the bundle's runtime IS adopted, replaces the
+//     shim path, and the connector the payload drives is the live singleton
+//     (identity, not a parallel copy).
+// R4: a BigInt in the ad state neither breaks the gate nor the diagnostics.
+// ===========================================================================
+async function testR() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST R"); };
+
+  // A registry shaped like 1.3.0: the connector module reads the singleton out
+  // of another module. Under the real require (cache pre-populated with the
+  // live instance) that is Spotify's object; under the shim it is a fresh
+  // parallel instance, so identity tells the two paths apart.
+  function makeRegistry(liveConnector) {
+    return {
+      "100": function (module, exports, require) {
+        module.exports = { instance: makeConnectorStub({ initialState: { ad_enabled: "true" } }) };
+      },
+      "84032": function (module, exports, require) {
+        // adsCoreConnector + putState in the SOURCE, as the scan's prefilter wants.
+        const inst = require("100").instance;
+        if (typeof inst.putState !== "function") throw new Error("not a connector");
+        require.d(exports, { adsCoreConnector: () => inst });
+      },
+    };
+  }
+  // Spotify's runtime, minimally: a require with a module map, a cache that
+  // already holds the live singleton, and webpack's `d` getter installer.
+  function makeRealRequire(M, liveConnector) {
+    const cache = { "100": { id: "100", exports: { instance: liveConnector }, loaded: true } };
+    const req = function (id) {
+      if (cache[id]) return cache[id].exports;
+      const mod = cache[id] = { id, exports: {}, loaded: false };
+      M[id].call(mod.exports, mod, mod.exports, req);
+      mod.loaded = true;
+      return mod.exports;
+    };
+    req.m = M; req.c = cache;
+    req.d = (e, t) => { for (const o in t) if (!Object.prototype.hasOwnProperty.call(e, o)) Object.defineProperty(e, o, { enumerable: true, get: t[o] }); };
+    return req;
+  }
+  const runMaint = async (env, n = 4) => {
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    for (let i = 0; i < n; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+  };
+
+  // ---- R1: the suffix-less chunk global is hooked ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    assert("R1a: `rspackChunk` (no client_web suffix) is among the hooked chunk globals",
+      Array.isArray(W.__interceptify_chunk_globals) && W.__interceptify_chunk_globals.includes("rspackChunk"),
+      JSON.stringify(W.__interceptify_chunk_globals));
+    assert("R1b: ...the array was seeded with a wrapped push",
+      Array.isArray(W.rspackChunk) && W.rspackChunk.__interceptify_wrapped_push === true,
+      `rspackChunk=${typeof W.rspackChunk}`);
+    const probe = Array.isArray(W.rspackChunk) ? W.rspackChunk.find((e) => e && typeof e[2] === "function") : null;
+    assert("R1c: ...and the bootstrap probe that receives the runtime's require was pushed onto it",
+      !!probe, `entries=${Array.isArray(W.rspackChunk) ? W.rspackChunk.length : "n/a"}`);
+  }
+
+  // ---- R2: the shim is never mistaken for the live require ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const live = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__webpack_modules__ = makeRegistry(live);
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);
+    const r = W.__interceptify_webpack_require;
+    assert("R2a: with only the shim available, no require is recorded as live",
+      !r || r.__intc_shim === true, `stored=${r ? (r.__intc_shim ? "shim" : "non-shim object") : "none"}`);
+    assert("R2b: ...and health does not report liveRequire",
+      W.__interceptify.health().liveRequire === false, `liveRequire=${W.__interceptify.health().liveRequire}`);
+    // The shim path still finds A connector on this fixture (a parallel copy);
+    // that is the fallback working, not the bug. The bug is claiming it is live.
+    assert("R2c: the shim-path connector is a parallel instance, not the live singleton",
+      !!W.__interceptify_ads_connector && W.__interceptify_ads_connector !== live,
+      `connector=${!!W.__interceptify_ads_connector} isLive=${W.__interceptify_ads_connector === live}`);
+  }
+
+  // ---- R3: the bundle's require is adopted and the live singleton is driven ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const live = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__webpack_modules__ = makeRegistry(live);
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);                                  // shim path runs first, as on the live client
+    const R = makeRealRequire(W.__webpack_modules__, live);
+    // The runtime installs over the seeded array and replays the entries it
+    // already holds; our probe's callback receives the real require.
+    for (const e of W.rspackChunk) if (e && typeof e[2] === "function") { try { e[2](R); } catch {} }
+    await runMaint(env);
+    const stored = W.__interceptify_webpack_require;
+    assert("R3a: the require handed back by the runtime is adopted as live",
+      stored === R, `stored=${stored === R ? "R" : (stored && stored.__intc_shim ? "shim" : "other")}`
+        + (stored && stored !== R ? ` keys=${JSON.stringify(Object.keys(stored))} src=${String(stored).slice(0, 90).replace(/\s+/g, " ")}` : "")
+        + ` entries=${W.rspackChunk.length}`);
+    assert("R3b: health reports liveRequire",
+      W.__interceptify.health().liveRequire === true, `liveRequire=${W.__interceptify.health().liveRequire}`);
+    assert("R3c (THE BUG): the connector the payload drives is Spotify's live singleton",
+      W.__interceptify_ads_connector === live,
+      `isLive=${W.__interceptify_ads_connector === live} module=${W.__interceptify_ads_module}`);
+    assert("R3d: ...and the gate is closed on THAT object",
+      live.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"),
+      JSON.stringify(live.calls.putState));
+  }
+
+  // ---- R4: BigInt in the ad state ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    C.raw.ad_enabled.changed = BigInt(472392);
+    W.__interceptify_instream_api = { adsCoreConnector: C, skipToNext() {} };
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);
+    assert("R4a: a BigInt-stamped state still yields the gate key",
+      Array.isArray(W.__interceptify.health().gateKeys) && W.__interceptify.health().gateKeys.includes("ad_enabled"),
+      JSON.stringify(W.__interceptify.health().gateKeys));
+    assert("R4b: ...and the gate is written",
+      C.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"),
+      JSON.stringify(C.calls.putState));
+    // No R4c. health() and snapshot() never carry the raw state, so an
+    // assertion that they serialise cannot go red and would only decorate.
+    // The BigInt guard in compactValue() is debug-preview hardening, verified
+    // on the live client, not here.
+  }
+}
+
+// ===========================================================================
+// TEST S — FINDING THE IN-STREAM PROVIDER ON A BUILD WITHOUT THE FALLBACK ID
+//
+// 1.3.0 dropped module 46849, so the whole-graph source scan is the only path
+// to the provider. That path had two blind spots and one build change:
+//   * it tested String(wrapper) for every factory captureLiveRequire() had
+//     wrapped, which contains no needles (S1);
+//   * the pair getInStreamAd+inStreamApi matches both the 120-char accessor
+//     provider AND the 785 KB module that implements InStreamApi, and two
+//     matches meant "wrap nothing" (S2), while two genuinely alike matches
+//     must still wrap nothing (S3);
+//   * the bundle's d() now defines exports as `d(exports, {}, {name: value})`,
+//     three arguments, so the shim's two-argument d() built {} (S4), and the
+//     values it defines are non-writable, so an in-place wrap that does not
+//     take must be reported rather than claimed (S5).
+// ===========================================================================
+async function testS() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST S"); };
+  // A provider-shaped factory: both needles in the source, exports d and m.
+  function providerFactory(module, exports, require) {
+    const n = () => ({ inStreamApi: { getInStreamAd() { return null; } } }).inStreamApi;
+    module.exports = { d: n, m: () => n().getInStreamAd() };
+  }
+  // The implementation module: same needles, implementation-sized.
+  const platformFactory = new Function("module", "exports", "require",
+    "/* getInStreamAd inStreamApi " + "x".repeat(6000) + " */ module.exports = { createPlatformDesktop() {} };");
+  // What captureLiveRequire() leaves in the registry: a wrapper whose own
+  // source has no needles, carrying the original on __intc_orig.
+  function captureWrap(orig) {
+    const w = function (module, exports, require) { return orig.apply(this, arguments); };
+    w.__intc_capwrap = true; w.__intc_orig = orig;
+    return w;
+  }
+  const pushChunk = (W, modules) => { W.rspackChunk.push([["test-chunk-" + Object.keys(modules).join("-")], modules]); return modules; };
+
+  // ---- S1: a capture-wrapped provider is still discovered ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const mods = pushChunk(W, { "98213": captureWrap(providerFactory) });
+    assert("S1: the provider is found through the capture wrapper's __intc_orig",
+      String(W.__interceptify_instream_id) === "98213" && mods["98213"].__interceptify_wrapped === true,
+      `instream_id=${W.__interceptify_instream_id} wrapped=${!!mods["98213"].__interceptify_wrapped} ambiguous=${JSON.stringify(W.__interceptify_instream_ambiguous)}`);
+  }
+
+  // ---- S2: implementation-sized match is excluded, the accessor wins ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const mods = pushChunk(W, { "42931": platformFactory, "98213": providerFactory });
+    assert("S2a (THE BUG): with the implementation module also matching, the accessor provider is still wrapped",
+      String(W.__interceptify_instream_id) === "98213" && mods["98213"].__interceptify_wrapped === true,
+      `instream_id=${W.__interceptify_instream_id} ambiguous=${JSON.stringify(W.__interceptify_instream_ambiguous)}`);
+    assert("S2b: ...and the implementation module is left alone",
+      mods["42931"] === platformFactory && !mods["42931"].__interceptify_wrapped, "platform factory was replaced");
+    assert("S2c: ...with no ambiguity recorded", !W.__interceptify_instream_ambiguous,
+      JSON.stringify(W.__interceptify_instream_ambiguous));
+  }
+
+  // ---- S3: two accessor-sized matches remain ambiguous: wrap nothing ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    // Same needles in its OWN source: a genuine look-alike, not a caller.
+    const twin = function (module, exports, require) {
+      const n = () => ({ inStreamApi: { getInStreamAd() { return null; } } }).inStreamApi;
+      module.exports = { d: n, m: () => n().getInStreamAd() };
+    };
+    const mods = pushChunk(W, { "1001": providerFactory, "1002": twin });
+    assert("S3a: two provider-sized candidates wrap nothing",
+      !mods["1001"].__interceptify_wrapped && !mods["1002"].__interceptify_wrapped,
+      `1001=${!!mods["1001"].__interceptify_wrapped} 1002=${!!mods["1002"].__interceptify_wrapped}`);
+    assert("S3b: ...and the ambiguity is recorded with both ids",
+      Array.isArray(W.__interceptify_instream_ambiguous) && W.__interceptify_instream_ambiguous.length === 2,
+      JSON.stringify(W.__interceptify_instream_ambiguous));
+  }
+
+  // ---- S4: the shim's d() handles the three-argument form ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    W.__webpack_modules__ = {
+      "84032": function (module, exports, require) {
+        // adsCoreConnector + putState in the source; exported the 1.3.0 way.
+        if (typeof C.putState !== "function") throw new Error("no putState");
+        require.d(exports, {}, { adsCoreConnector: C });
+      },
+    };
+    W.__interceptify_l1_provider_wrapped = true;
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    for (let i = 0; i < 4; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+    assert("S4: a module exported via d(exports, {}, values) instantiates under the shim",
+      W.__interceptify_ads_connector === C,
+      `connector=${!!W.__interceptify_ads_connector} module=${W.__interceptify_ads_module} candidates=${JSON.stringify(W.__interceptify_ads_module_candidates)}`);
+  }
+
+  // ---- S5: frozen exports are reported, never claimed as hooked ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const mods = pushChunk(W, { "98213": providerFactory });
+    const wrappedFactory = mods["98213"];
+    if (typeof wrappedFactory !== "function" || !wrappedFactory.__interceptify_wrapped) {
+      assert("S5.pre: provider factory wrapped", false, "not wrapped");
+    } else {
+      // A require shaped like the bundle's: d() defines VALUES (non-writable),
+      // and no player-state module, so the fast path falls through to the
+      // generic in-place wrap - the path that cannot take on this build.
+      const fakeRequire = function () { throw new Error("no such module"); };
+      fakeRequire.m = {};
+      fakeRequire.d = (e, getters, values) => {
+        for (const k in getters || {}) Object.defineProperty(e, k, { enumerable: true, get: getters[k] });
+        for (const k in values || {}) Object.defineProperty(e, k, { enumerable: true, value: values[k] });
+      };
+      function frozenProvider(module, exports, require) {
+        const n = () => ({ inStreamApi: { getInStreamAd() { return null; } } }).inStreamApi;
+        require.d(exports, {}, { d: n, m: () => n().getInStreamAd() });
+      }
+      // Re-wrap a frozen-style factory the same way the hook would.
+      const mods2 = pushChunk(W, { "98214": frozenProvider });
+      // Force the instream id to the frozen one so the hook wraps it.
+      const wf = mods2["98214"];
+      const moduleObj = { exports: {} };
+      // The harness pre-seeds an in-stream api pointer for the FSM tests;
+      // "active" keys off that pointer, so clear it: with no api captured and
+      // a wrap that did not take, nothing may report the layer active.
+      delete W.__interceptify_instream_api;
+      try { wf(moduleObj, moduleObj.exports, fakeRequire); } catch (e) { assert("S5.invoke: wrapped factory ran", false, String(e)); }
+      assert("S5a: an in-place wrap that cannot take is reported as frozen",
+        W.__interceptify_instream_exports_frozen === true, `frozen=${W.__interceptify_instream_exports_frozen}`);
+      assert("S5b: ...and the layer is not reported active",
+        W.__interceptify_l1_provider_active !== true, `active=${W.__interceptify_l1_provider_active}`);
+      assert("S5c: ...and the exports are not marked hooked",
+        moduleObj.exports.__interceptify_instream_hooked !== true, "marked hooked");
+    }
+  }
+
+  // ---- S6: the fast path fires for a capture-wrapped provider ----
+  // With the registry wrapped in place, the factory the hook wraps is the
+  // capture wrapper. The fast path (install our accessors at instantiation,
+  // the only wrap that works on frozen exports) keyed on String(originalFactory)
+  // and never fired; the generic path then ran and could not take.
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    delete W.__interceptify_instream_api;
+    const liveApi = { getInStreamAd() { return null; } };
+    // The ads-API context module the fast path resolves by signature.
+    function playerStateFactory(module, exports, require) {
+      /* AdsAPIProvider */ module.exports = { G: () => ({ inStreamApi: liveApi }) };
+    }
+    // The bundle's runtime, minimally, with the registry ALREADY capture-wrapped
+    // (as captureLiveRequire() leaves it) and the provider not yet instantiated.
+    const M = { "21361": captureWrap(playerStateFactory), "98213": captureWrap(providerFactory) };
+    const cache = {};
+    const R = function (id) {
+      id = String(id);
+      if (cache[id]) return cache[id].exports;
+      if (!M[id]) throw new Error("no module " + id);
+      const mod = cache[id] = { id, exports: {}, loaded: false };
+      M[id].call(mod.exports, mod, mod.exports, R);
+      mod.loaded = true;
+      return mod.exports;
+    };
+    R.m = M;
+    R.d = (e, getters, values) => {
+      for (const k in getters || {}) Object.defineProperty(e, k, { enumerable: true, get: getters[k] });
+      for (const k in values || {}) Object.defineProperty(e, k, { enumerable: true, value: values[k] });
+    };
+    // Hand the runtime's require to the bootstrap probe, exactly as the live
+    // runtime does: this drives patchRequire -> discover -> wrap -> require(id)
+    // -> the generic in-place pass, the whole route.
+    for (const e of W.rspackChunk) if (e && typeof e[2] === "function") { try { e[2](R); } catch {} }
+    const ex = cache["98213"] && cache["98213"].exports;
+    const dDesc = ex && Object.getOwnPropertyDescriptor(ex, "d");
+    const dIsOurs = !!(ex && typeof ex.d === "function" && dDesc && dDesc.get);
+    assert("S6a (THE BUG): a capture-wrapped provider goes through the fast path, so d/m are OUR accessors",
+      dIsOurs && typeof ex.m === "function",
+      `instantiated=${!!ex} dGetter=${dIsOurs} m=${ex && typeof ex.m} instream_id=${W.__interceptify_instream_id}`);
+    assert("S6b: ...the layer is recorded wrapped and NOT reported frozen by the generic pass that follows",
+      W.__interceptify_l1_provider_wrapped === true && W.__interceptify_instream_exports_frozen !== true,
+      `wrapped=${W.__interceptify_l1_provider_wrapped} frozen=${W.__interceptify_instream_exports_frozen}`);
+    let api = null; try { api = ex.d(); } catch (e) { api = "threw " + e; }
+    assert("S6c: ...and calling d() captures and hooks the live in-stream api",
+      api === liveApi && W.__interceptify_instream_api === liveApi && !!Object.getOwnPropertyDescriptor(liveApi, "inStreamAd"),
+      `api=${api === liveApi} captured=${W.__interceptify_instream_api === liveApi}`);
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -2175,6 +2510,12 @@ async function main() {
   }
   try { await testQ(); } catch (e) {
     assert("TEST Q crashed", false, String(e && e.stack || e));
+  }
+  try { await testR(); } catch (e) {
+    assert("TEST R crashed", false, String(e && e.stack || e));
+  }
+  try { await testS(); } catch (e) {
+    assert("TEST S crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

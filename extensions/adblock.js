@@ -113,6 +113,7 @@
     // over-matched unrelated modules and broke Spotify's boot, since wrapping
     // touches exports named d/m that countless minified modules also have.
     instreamSourceSignatures: [["getInStreamAd", "inStreamApi"]],
+    instreamProviderMaxSourceLen: 4000,  // the provider is a ~120-char accessor; the InStreamApi IMPLEMENTATION matches the same needles at ~785 KB
     instreamSourceRegex: "",            // disabled — the AND-pair uniquely IDs the provider
     playerStateSignatures: [["AdsAPIProvider"]],  // the ads-API module's stable error-string (was 5563)
     playerStateRegex: "",
@@ -217,7 +218,7 @@
     // Spotify moved webpack -> rspack; hooking one name silently lost the
     // whole L1 layer. All candidates are hooked and a watchdog reports if
     // none of them ever fires.
-    webpackChunkGlobals: ["rspackChunkclient_web", "webpackChunkclient_web"],
+    webpackChunkGlobals: ["rspackChunk", "rspackChunkclient_web", "webpackChunkclient_web"],
     l1WatchdogMs: 20000,                // how long to wait before calling the hook dead
     // ---- network classifier ----
     manifestRegex: "/manifests/v\\d+/json/sources/([a-f0-9]+)/options",
@@ -532,6 +533,9 @@
     if (value == null) return value;
     if (typeof value === "string") return value.slice(0, 600);
     if (typeof value === "number" || typeof value === "boolean") return value;
+    // 1.3.0 stamps ad-state entries with a BigInt `changed`; JSON.stringify
+    // throws on it, and a preview that throws is a preview that never logs.
+    if (typeof value === "bigint") return String(value);
     if (typeof value === "function") return "[Function]";
     if (depth > 3) return "[DepthLimit]";
     if (Array.isArray(value)) return value.slice(0, 20).map((v) => compactValue(v, depth + 1));
@@ -814,7 +818,15 @@
       return mod.exports;
     };
     req.m = M; req.c = cache;
-    req.d = (e, t) => { for (const o in t) if (Object.prototype.hasOwnProperty.call(t, o) && !Object.prototype.hasOwnProperty.call(e, o)) Object.defineProperty(e, o, { enumerable: true, get: t[o] }); };
+    // Mirrors the bundle's own d(): the second argument holds getters, the
+    // third holds plain values. 1.3.0 emits `d(exports, {}, {name: value})` for
+    // most modules, and a d() that only read the second argument instantiated
+    // every one of them as {} - including the ads connector module.
+    req.d = (e, getters, values) => {
+      const has = (o, p) => Object.prototype.hasOwnProperty.call(o, p);
+      const define = (src, kind) => { if (!src) return; for (const o in src) if (has(src, o) && !has(e, o)) Object.defineProperty(e, o, { enumerable: true, [kind]: src[o] }); };
+      define(getters, "get"); define(values, "value");
+    };
     req.o = (o, p) => Object.prototype.hasOwnProperty.call(o, p);
     req.r = (e) => { if (typeof Symbol !== "undefined" && Symbol.toStringTag) Object.defineProperty(e, Symbol.toStringTag, { value: "Module" }); Object.defineProperty(e, "__esModule", { value: true }); };
     req.n = (e) => { const g = e && e.__esModule ? () => e.default : () => e; req.d(g, { a: g }); return g; };
@@ -824,14 +836,37 @@
     try { req.b = document.baseURI || self.location.href; } catch { req.b = ""; }
     req.nmd = (m) => { m.paths = []; m.children = m.children || []; return m; };
     req.hmd = (m) => m;
+    // Marked so nothing downstream can mistake it for Spotify's own require.
+    // The capture wrapper below takes the 3rd argument of any factory call, and
+    // this shim calls those same wrapped factories - so on 1.3.0 it captured
+    // ITSELF as the "live" require, health said liveRequire:true, and every
+    // connector read went through a shim that instantiates the connector
+    // module as {} on that build. A parallel require is a fallback, never an
+    // identity.
+    req.__intc_shim = true;
     _snapshotRequire = req;
     return req;
+  }
+  // Only a require that is genuinely Spotify's counts as live: it has a module
+  // map and it is not the reconstructed shim. Anything else is the fallback.
+  function isLiveRequire(r) {
+    return !!(r && r.m && !r.__intc_shim);
+  }
+  // Adopt a require as the live one. A real require always outranks the shim,
+  // so a poisoned global (the shim stored where the live one belongs) is
+  // replaced, not kept - that was the 1.3.0 outage.
+  function adoptLiveRequire(r) {
+    if (!isLiveRequire(r)) return false;
+    const cur = window.__interceptify_webpack_require;
+    if (isLiveRequire(cur)) return false;
+    try { window.__interceptify_webpack_require = r; } catch { return false; }
+    return true;
   }
   // The genuine live require if captured (returns live-cached singletons); else
   // the reconstructed one (parallel instance, RPCs still reach the shared core).
   function anyAdsRequire() {
     const live = window.__interceptify_webpack_require;
-    if (live && live.m) return live;
+    if (isLiveRequire(live)) return live;
     return buildSnapshotRequire();
   }
   // Capture the GENUINE live require by wrapping registry factories in place; the
@@ -839,16 +874,14 @@
   // require (3rd arg). Idempotent + re-runnable (catches lazily added factories).
   function captureLiveRequire() {
     try {
-      if (window.__interceptify_webpack_require) return;
+      if (isLiveRequire(window.__interceptify_webpack_require)) return;
       const M = window.__webpack_modules__;
       if (!M || typeof M !== "object") return;
       for (const id of Object.keys(M)) {
         const orig = M[id];
         if (typeof orig !== "function" || orig.__intc_capwrap) continue;
         const w = function (module, exports, require) {
-          if (require && require.m && !window.__interceptify_webpack_require) {
-            try { window.__interceptify_webpack_require = require; } catch {}
-          }
+          adoptLiveRequire(require);
           return orig.apply(this, arguments);
         };
         w.__intc_capwrap = true; w.__intc_orig = orig;
@@ -2154,7 +2187,7 @@
           return ad;
         };
         wrapped.__interceptify_wrapped = true;
-        exportsObj.m = wrapped;
+        try { exportsObj.m = wrapped; } catch {}     // non-writable in strict code throws; checked below
       }
       if (typeof exportsObj.d === "function" && !exportsObj.d.__interceptify_wrapped) {
         const orig = exportsObj.d;
@@ -2174,7 +2207,18 @@
           return api;
         };
         wrapped.__interceptify_wrapped = true;
-        exportsObj.d = wrapped;
+        try { exportsObj.d = wrapped; } catch {}
+      }
+      // Did the assignments TAKE? On 1.3.0 the bundle's d() defines these as
+      // non-writable values, so `exportsObj.d = wrapped` is a silent no-op in
+      // sloppy code, and marking the object hooked here would report a layer
+      // that wraps nothing. A wrap that cannot take must stay visibly absent.
+      const dOk = typeof exportsObj.d === "function" && exportsObj.d.__interceptify_wrapped === true;
+      const mOk = typeof exportsObj.m === "function" && exportsObj.m.__interceptify_wrapped === true;
+      if (!dOk || !mOk) {
+        window.__interceptify_instream_exports_frozen = true;
+        snifferLog("instream-exports-frozen", { d: dOk, m: mOk });
+        return;
       }
       exportsObj.__interceptify_instream_hooked = true;
     } catch {}
@@ -2188,9 +2232,25 @@
   // via a WeakSet so chunk pushes don't re-stringify everything.
   window.__interceptify_instream_module_ids = window.__interceptify_instream_module_ids || [];
   const _stringifiedFactories = new WeakSet();
+  // The source that identifies a factory is the ORIGINAL factory's. Once
+  // captureLiveRequire() has wrapped the registry in place, String(fn) is the
+  // wrapper's own text for every module, which contains none of the needles -
+  // so on a build where the fallback id was gone (and only the source scan was
+  // left) the scan matched nothing, quietly.
+  function _factorySource(fn) {
+    const f = fn && fn.__intc_orig ? fn.__intc_orig : fn;
+    return String(f);
+  }
   function _factoryMatchesInstream(fn) {
     let src;
-    try { src = String(fn); } catch { return false; }
+    try { src = _factorySource(fn); } catch { return false; }
+    // The provider is an accessor shim: it reads inStreamApi off the ads-API
+    // context and exposes d()/m(). The module that IMPLEMENTS InStreamApi
+    // carries the same two needles and is three orders of magnitude larger;
+    // wrapping it replaces the platform's exports and blanks the UI. Size is a
+    // stated discriminator with a stated reason, not a preference order.
+    const maxLen = CFG.instreamProviderMaxSourceLen | 0;
+    if (maxLen > 0 && src.length > maxLen) return false;
     try {
       const sigs = CFG.instreamSourceSignatures || [];
       for (const andSet of sigs) {
@@ -2207,7 +2267,7 @@
   }
   function _factoryMatchesPlayerState(fn) {
     let src;
-    try { src = String(fn); } catch { return false; }
+    try { src = _factorySource(fn); } catch { return false; }
     try {
       const sigs = CFG.playerStateSignatures || [];
       for (const andSet of sigs) {
@@ -2261,10 +2321,15 @@
       // Every plausible name, plus anything already on window with the right
       // shape. Seeding is deliberate: this payload runs before the bundle, so
       // the array must exist for the bundle to push into.
-      const names = (CFG.webpackChunkGlobals || ["rspackChunkclient_web"]).slice();
+      const names = (CFG.webpackChunkGlobals || ["rspackChunk"]).slice();
+      // Any bundler chunk array already on window, whatever it is called. 1.3.0
+      // dropped the client_web suffix (plain `rspackChunk`), and a pattern that
+      // required the suffix never hooked it - which mattered more than before,
+      // because on that build the bootstrap push is what hands back the real
+      // require.
       try {
         for (const k of Object.keys(window)) {
-          if (/Chunk[a-z_]*client_web$/i.test(k) && names.indexOf(k) < 0) names.push(k);
+          if (/^(rspack|webpack)Chunk/i.test(k) && Array.isArray(window[k]) && names.indexOf(k) < 0) names.push(k);
         }
       } catch {}
       window.__interceptify_chunk_globals = names;
@@ -2278,7 +2343,7 @@
           const live = [];
           try {
             for (const k of Object.keys(window)) {
-              if (/Chunk[a-z_]*client_web$/i.test(k) && (window[k] || []).length) live.push(k);
+              if (/^(rspack|webpack)Chunk/i.test(k) && Array.isArray(window[k]) && window[k].length) live.push(k);
             }
           } catch {}
           window.__interceptify_l1_dead = { hooked: names, populated: live };
@@ -2294,7 +2359,11 @@
       const makeWrappedFactory = (originalFactory) => {
         const wrappedFactory = function (module, exports, require) {
           try {
-            const source = String(originalFactory);
+            // The ORIGINAL factory's source, not the capture wrapper's. On
+            // 1.3.0 this decided everything: the wrapper's text has no
+            // needles, so the fast path was skipped and the generic wrap ran
+            // against exports the bundle had already frozen.
+            const source = _factorySource(originalFactory);
             // Fast-path replacement: this factory builds the in-stream ad
             // provider via the player-state module. Discover the player-state
             // id by source scan (was hard-coded 5563).
@@ -2323,6 +2392,10 @@
                 return ad;
               };
               require.d(exports, { d: () => wrappedD, m: () => wrappedM });
+              // These ARE our accessors. The generic in-place wrap that the
+              // bootstrap runs next must not try to re-wrap them, fail against
+              // its own getters, and report the exports frozen.
+              try { exports.__interceptify_instream_hooked = true; } catch {}
               snifferLog("webpack-module-replaced", { module: "instream" });
               return undefined;
             }
@@ -2487,10 +2560,17 @@
         // Falls back to the live push only for an array someone else already
         // wrapped, where no raw handle exists to take.
         const originalPush = rawPush.get(arr) || arr.push.bind(arr);
-        originalPush([[`interceptify-${Date.now()}-${Math.round(performance.now())}`], {},
+        // The probe's id must never be the reason the probe does not push: a
+        // missing `performance` used to throw here, inside a bare catch, and
+        // the live require was simply never asked for.
+        const probeTick = (typeof performance !== "undefined" && performance && typeof performance.now === "function")
+          ? Math.round(performance.now()) : 0;
+        originalPush([[`interceptify-${Date.now()}-${probeTick}`], {},
           function (require) {
         try {
-          window.__interceptify_webpack_require = window.__interceptify_webpack_require || require;
+          // This require came from the bundle's own runtime, so it outranks
+          // whatever the shim path may already have stored.
+          adoptLiveRequire(require);
           patchRequire(require);
           // Whole-graph view of require.m: prefer the known provider id; only if
           // it is genuinely absent (renamed build) wrap the SINGLE best source
@@ -4174,7 +4254,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-08-05-connector-rename",
+    version: "2026-09-14-rspackChunk-live-require",
     debugCapture: DEBUG_CAPTURE,
     // Machine-readable health, for the automated repair loop (selfheal.py) and
     // for a human over CDP. Cheap, no side effects.
@@ -4258,7 +4338,7 @@
           return containmentHeld() ? window.__interceptify_contain_until - Date.now() : 0; } catch { return 0; } })(),
         layerErrors: _layerErrors.slice(-20),
         chunkGlobals: window.__interceptify_chunk_globals || null,
-        liveRequire: !!window.__interceptify_webpack_require,
+        liveRequire: isLiveRequire(window.__interceptify_webpack_require),
       };
     },
     // STRUCTURAL self-test. Named for what it actually establishes.
