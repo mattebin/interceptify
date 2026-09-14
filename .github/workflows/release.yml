@@ -180,7 +180,7 @@ jobs:
             - **Total block:** flips Spotify's core ad-scheduler off (`ad_enabled = false`) and clears queued ad slots, so ad breaks are never scheduled or loaded — not just skipped after they start. Re-applied continuously so a server refresh can't reopen ads.
             - Reactive fallback: if an ad ever slips through, it's skipped (via Spotify's own override-skip) and muted so it's silent.
             - Hides visual ad surfaces with CSS.
-            - Supports Spotify's current V8-snapshot desktop build (1.2.93+), where the ad modules are reached at runtime from `__webpack_modules__`.
+            - Supports Spotify's current V8-snapshot desktop builds (1.2.93 through 1.3.0), where the ad modules are reached at runtime from `__webpack_modules__`.
 
             ### Settings
             Tunables live in `extensions/adblock.config.json`, which belongs to the release and is replaced on every update. Put your own changes in `extensions/adblock.config.local.json` — that file is never overwritten and wins over the shipped defaults.
