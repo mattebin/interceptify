@@ -14,8 +14,6 @@ _interceptify_update.bat
 
 # Runtime state (never push)
 config.json
-proxy_snapshot.json
-blocked.log
 # Per-machine overrides + whatever self-heal discovered on this install. The
 # SHIPPED defaults (extensions/adblock.config.json) ARE tracked; this is the
 # file that must survive an update, so it can never be part of one.
@@ -24,34 +22,9 @@ extensions/adblock.config.local.json
 # ever turn off our own change.
 .interceptify-devtools-owned
 
-# --- Legacy network-proxy code ---
-# Spotify 1.2.88+ ignores the Windows system proxy, so the mitmproxy
-# pipeline no longer works for Spotify. These files stay on disk locally
-# but are not part of the public Interceptify project.
-apps.json
-bypass.txt
-cert_manager.py
-filters/
-proxy_addon.py
-proxy_watchdog.py
-system_proxy.py
-test_safety.py
-
-# Local-only analysis / diagnostic helpers
-ad_detective.py
-ad_detective.log
-afk_monitor.py
-afk_monitor.log
-cdp_eval.py
-diag_*.py
-hotfix_*.py
-dump_run.py
-run_dump_*.json
-
-# Session capture artifacts (ephemeral CDP/network diagnostic dumps, 2026-06-13)
+# Capture artifacts written by cdp_capture.py / cdp_netlog.py / Wireshark
 capture_*.json
 netlog_*.jsonl
-sni_log.txt
 *.pcapng
 
 # Self-healing automation. selfheal.py is now TRACKED: it is executed by three
