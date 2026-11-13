@@ -586,6 +586,22 @@ def _patch_as_user(debug_capture: bool | None = None):
         debug_capture=s["debug_capture"] if debug_capture is None else debug_capture)
 
 
+def record_recon(cdp) -> None:
+    """Write down every Spotify-side name the block depends on, for the build
+    being verified, and log what moved since the last build. This run already
+    has a debug session open, so it costs no extra restart. Never a reason to
+    fail a verification."""
+    try:
+        import recon_ids
+        raw = cdp.ev(recon_ids.JS, timeout=60)
+        path, moved = recon_ids.save(json.loads(raw), ROOT / "recon")
+        log.info("recon: recorded %s", path.name)
+        for m in moved:
+            log.warning("recon: Spotify moved %s", m)
+    except Exception as e:
+        log.warning("recon: %s", e)
+
+
 def _incident_log_path() -> Path | None:
     env = os.environ.get("INTERCEPTIFY_INCIDENT_LOG", "").strip()
     if env:
@@ -1436,6 +1452,7 @@ def repair_and_verify(max_rounds: int = 3, duration_ms: int = 12000) -> dict:
             log.info("payload=%s connector=%s", ver, got_conn)
             res = verify(cdp, duration_ms)
             log.info("verify: %s", json.dumps(res)[:400])
+            record_recon(cdp)
             # Incidents are harvested from disk once per run(), not here: they
             # must be collected whether or not a verification ever happens.
             entry = {"round": rnd, "payload": ver, "connector": got_conn, "result": res}

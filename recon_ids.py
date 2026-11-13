@@ -159,6 +159,67 @@ def wait_port(port: int, seconds: int = 45) -> bool:
     return False
 
 
+def _listdiff(label: str, old, new) -> list[str]:
+    old, new = set(old or []), set(new or [])
+    out = []
+    if new - old:
+        out.append(f"{label} added: {', '.join(sorted(map(str, new - old)))}")
+    if old - new:
+        out.append(f"{label} removed: {', '.join(sorted(map(str, old - new)))}")
+    return out
+
+
+def changes_between(old: dict, new: dict) -> list[str]:
+    """What a Spotify update moved, in words. Only things the block depends on."""
+    g = lambda d, *path: __import__("functools").reduce(
+        lambda a, k: (a or {}).get(k) if isinstance(a, dict) else None, path, d)
+    out: list[str] = []
+    for label, path in (("chunk array", ("runtime", "chunkArrays")),
+                        ("export definer arity", ("runtime", "defineExportsArity")),
+                        ("module registry global", ("runtime", "registryGlobal")),
+                        ("connector module", ("connector", "moduleId")),
+                        ("connector export names", ("connector", "exportNames")),
+                        ("in-stream provider module", ("provider", "moduleId")),
+                        ("gate key", ("gate", "gateKeysDiscovered")),
+                        ("ad-state envelope", ("gate", "envelopeKeys")),
+                        ("primary ad slot", ("slots", "primary"))):
+        a, b = g(old, *path), g(new, *path)
+        if a != b:
+            out.append(f"{label}: {a} -> {b}")
+    out += _listdiff("connector method", g(old, "connector", "methods"), g(new, "connector", "methods"))
+    lost = [k for k, v in (g(new, "connector", "used") or {}).items()
+            if not v and (g(old, "connector", "used") or {}).get(k)]
+    if lost:
+        out.append("connector methods the block USES are gone: " + ", ".join(sorted(lost)))
+    out += _listdiff("ad-state key", g(old, "gate", "stateKeys"), g(new, "gate", "stateKeys"))
+    out += _listdiff("ad slot", (g(old, "slots", "constants") or {}).values(), (g(new, "slots", "constants") or {}).values())
+    out += _listdiff("ads service", (old.get("esperanto") or {}).keys(), (new.get("esperanto") or {}).keys())
+    od, nd = old.get("dom") or {}, new.get("dom") or {}
+    dead = sorted(k for k, v in nd.items() if not v.get("inBundleModules") and (od.get(k) or {}).get("inBundleModules"))
+    if dead:
+        out.append("screen-element names no longer in the bundle: " + ", ".join(dead))
+    return out
+
+
+def save(data: dict, out_dir: Path) -> tuple[Path, list[str]]:
+    """Write this build's record and return (path, what moved since the most
+    recent record of a DIFFERENT build)."""
+    version = (data.get("client", {}).get("userAgent") or "Spotify/unknown").split("/")[-1]
+    data["recorded"] = time.strftime("%Y-%m-%d %H:%M")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"spotify-{version}.json"
+    previous = None
+    others = sorted((p for p in out_dir.glob("spotify-*.json") if p != path), key=lambda p: p.stat().st_mtime)
+    if others:
+        try:
+            previous = json.loads(others[-1].read_text(encoding="utf-8"))
+        except Exception:
+            previous = None
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path, (changes_between(previous, data) if previous else [])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0, help="attach to this debug port instead of restarting Spotify")
@@ -189,12 +250,10 @@ def main() -> int:
                     break
                 spotify_patcher.kill_spotify(); time.sleep(1.2)
             spotify_patcher.launch_spotify(0)
-    version = (data.get("client", {}).get("userAgent") or "Spotify/unknown").split("/")[-1]
-    data["recorded"] = time.strftime("%Y-%m-%d %H:%M")
-    out_dir = Path(a.out); out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"spotify-{version}.json"
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    path, moved = save(data, Path(a.out))
     print(path)
+    for m in moved:
+        print("  moved:", m)
     return 0
 
 

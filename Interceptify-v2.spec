@@ -18,7 +18,7 @@ a = Analysis(
     # main.py imports these lazily from its subcommand dispatcher, so the .exe
     # can run the scheduler and the self-heal itself. Without them the packaged
     # app cannot own its own autostart and the deployment splits in two.
-    hiddenimports=['selfheal', 'install_tasks', 'websocket'],
+    hiddenimports=['selfheal', 'install_tasks', 'recon_ids', 'websocket'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

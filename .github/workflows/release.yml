@@ -52,7 +52,7 @@ jobs:
         run: python tests/test_config_contract.py
 
       - name: Python syntax
-        run: python -m compileall -q main.py selfheal.py spotify_patcher.py self_updater.py patch_lock.py install_tasks.py redact.py cdp_capture.py cdp_netlog.py
+        run: python -m compileall -q main.py selfheal.py spotify_patcher.py self_updater.py patch_lock.py install_tasks.py redact.py recon_ids.py cdp_capture.py cdp_netlog.py
 
       - name: Install runtime deps for the state/config tests
         run: pip install -r requirements.txt
@@ -85,6 +85,9 @@ jobs:
       # tampered download, a locked exe. Reading the script proves nothing.
       - name: The updater script ends with the tray running, whatever happens
         run: python tests/test_updater_script.py
+
+      - name: A Spotify update's moves are reported in words
+        run: python tests/test_recon.py
 
       # Applies to MANUAL runs too, via the required `version` input.
       - name: Version consistency (tag/input vs APP_VERSION vs manifest)

@@ -2597,6 +2597,177 @@ async function testT() {
 }
 
 // ===========================================================================
+// TEST U — FOUND BY WHAT IT IS, NOT WHAT IT IS CALLED
+//
+// Every outage so far was a NAME moving while the thing itself stayed put: a
+// module id, the chunk array, an export. Three more lookups were still by name.
+//
+// U1: the connector's export is renamed and its module no longer says
+//     "adsCoreConnector" -> found by the two methods the gate drives.
+// U2: ...without instantiating modules that merely CALL those methods.
+// U3: the connector under another property of the in-stream api is found,
+//     and accessor properties on that api are never read to look for it.
+// U4: the registry global is gone -> Spotify's own require still has the table.
+// U5: the chunk array has a name we have never seen -> recognised by its
+//     entries, and the bundle's require arrives through it. An ordinary array
+//     of arrays is left alone.
+// U6: a wrapped provider still exposes its original source.
+// ===========================================================================
+async function testU() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST U"); };
+  const runMaint = async (env, n = 4) => {
+    const maint = env.intervals.filter((i) => i.ms !== 500).map((i) => i.fn);
+    for (let i = 0; i < n; i++) { for (const fn of maint) { try { fn(); } catch {} } await flush(); }
+  };
+  // A connector module with NO "adsCoreConnector" anywhere and a mangled export.
+  const renamedConnectorModule = (C, hook) => function (module, exports, require) {
+    if (hook) hook();
+    const conn = new (class {
+      putState(k, v) { return C.putState(k, v); }
+      getAdState() { return C.getAdState(); }
+      clearSlot(s, r) { return C.clearSlot(s, r); }
+      subscribeToInStreamAds(cb) { return C.subscribeToInStreamAds(cb); }
+    })();
+    require.d(exports, {}, { q: conn, l: 7 });
+  };
+
+  // ---- U1 + U2 ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    delete W.__interceptify_instream_api;
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    let consumerRan = false;
+    W.__webpack_modules__ = {
+      "7001": renamedConnectorModule(C),
+      "7002": function (module, exports, require) {
+        consumerRan = true;
+        const x = require("7001").q;
+        exports.use = () => { x.putState("a", "b"); return x.getAdState(); };
+      },
+    };
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);
+    const ac = W.__interceptify_ads_connector;
+    assert("U1a (THE NEXT BREAK): a connector with a renamed export and no name in its module is still found",
+      !!ac && String(W.__interceptify_ads_module) === "7001" && typeof ac.putState === "function",
+      `found=${!!ac} module=${W.__interceptify_ads_module} candidates=${JSON.stringify(W.__interceptify_ads_module_candidates)}`);
+    assert("U1b: ...and the gate is closed through it",
+      C.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"), JSON.stringify(C.calls.putState));
+    assert("U2: a module that only CALLS the connector's methods is not instantiated to look", consumerRan === false);
+  }
+  {
+    // The same, in the minified form the real 1.3.9 module 15 uses
+    // (`}putState(e,t){return T.putState(...)}...getAdState(){return T.getState({})}`),
+    // with the export renamed.
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    delete W.__interceptify_instream_api;
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    globalThis.__u1c = C;      // the factory below is compiled in this realm, not the sandbox's
+    W.__webpack_modules__ = {
+      "15": new Function("e", "t", "i",
+        '"use strict";let T=globalThis.__u1c;let I=new class{createSlot(e,t){return null}clearSlot(e,t){return T.clearSlot(e,t)}' +
+        'putState(e,t){return T.putState(e,t)}subscribeToInStreamAds(e){return T.subscribeToInStreamAds(e)}' +
+        'subscribeToState(e){return null}getAdState(){return T.getAdState()}logAudioVolume(e){return null}};' +
+        'i.d(t,{},{zz:I,l:1,q:2})'),
+    };
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);
+    assert("U1c: ...including in the minified form the real 1.3.9 connector module is written in",
+      String(W.__interceptify_ads_module) === "15"
+        && C.calls.putState.some(([k, v]) => k === "ad_enabled" && String(v) === "false"),
+      `module=${W.__interceptify_ads_module} puts=${JSON.stringify(C.calls.putState).slice(0, 80)}`);
+  }
+
+  // ---- U3 ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    let getterReads = 0;
+    // The accessor comes BEFORE the connector in key order, so a lookup that
+    // reads accessors has to trip over it on the way. Nothing else in the
+    // payload has a reason to touch this name, so a read can only be the lookup.
+    const api = { skipToNext() {} };
+    Object.defineProperty(api, "aaAccessor", { enumerable: true, configurable: true, get() { getterReads++; return null; } });
+    api.zz = C;
+    W.__interceptify_instream_api = api;
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);
+    assert("U3a: the connector under an unfamiliar property of the in-stream api is found",
+      W.__interceptify_ads_connector === C, `same=${W.__interceptify_ads_connector === C}`);
+    assert("U3b: ...without reading the api's accessor properties", getterReads === 0, `reads=${getterReads}`);
+  }
+
+  // ---- U4 ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    delete W.__interceptify_instream_api;
+    delete W.__webpack_modules__;
+    const C = makeConnectorStub({ initialState: { ad_enabled: "true" } });
+    const M = { "15": function (module, exports, require) { if (typeof C.putState === "function") require.d(exports, {}, { adsCoreConnector: C }); } };
+    const cache = {};
+    const R = function (id) { if (cache[id]) return cache[id].exports; const m = cache[id] = { exports: {} }; M[id].call(m.exports, m, m.exports, R); return m.exports; };
+    R.m = M; R.c = cache;
+    R.d = (e, g, v) => { for (const k in g || {}) Object.defineProperty(e, k, { enumerable: true, get: g[k] }); for (const k in v || {}) Object.defineProperty(e, k, { enumerable: true, value: v[k] }); };
+    W.__interceptify_webpack_require = R;                 // the bundle's own require, as the chunk probe delivers it
+    W.__interceptify_l1_provider_wrapped = true;
+    await runMaint(env);
+    assert("U4: with no registry global, the module table on Spotify's own require is used",
+      W.__interceptify_ads_connector === C && W.__interceptify.health().webpackModules === 1,
+      `same=${W.__interceptify_ads_connector === C} modules=${W.__interceptify.health().webpackModules}`);
+  }
+
+  // ---- U5 ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const R = function () { return {}; };
+    R.m = {}; R.d = () => {};
+    // A chunk array under a name with nothing recognisable in it, with the
+    // bundle's runtime installed over push (it calls a pushed runtime callback).
+    const q = [[["c1"], { "101": function () {} }]];
+    const rawPush = q.push.bind(q);
+    q.push = function (entry) { if (entry && typeof entry[2] === "function") entry[2](R); return rawPush(entry); };
+    W.zzLoadQueue = q;
+    const plain = [[1, 2], [3, 4]];
+    W.someGrid = plain;
+    await runMaint(env);
+    assert("U5a: a chunk array with an unknown name is recognised by its entries and yields the bundle's require",
+      W.__interceptify_webpack_require === R && W.__interceptify.health().chunkArrayByShape === "zzLoadQueue",
+      `adopted=${W.__interceptify_webpack_require === R} byShape=${W.__interceptify.health().chunkArrayByShape}`);
+    assert("U5b: ...and an ordinary array of arrays is not written to", plain.length === 2, `len=${plain.length}`);
+  }
+  {
+    // A chunk-shaped array whose runtime never answers: the probe must not be
+    // pushed again on every tick while we wait for a require that is not coming.
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const dead = [[["c1"], { "101": function () {} }]];
+    W.zzDeadQueue = dead;
+    await runMaint(env, 6);
+    assert("U5c: an array that never answers is probed once, not on every tick",
+      dead.length === 2, `entries=${dead.length}`);
+  }
+
+  // ---- U6 ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    const provider = function (module, exports, require) {
+      const n = () => ({ inStreamApi: { getInStreamAd() { return null; } } }).inStreamApi;
+      module.exports = { d: n, m: () => n().getInStreamAd() };
+    };
+    W.rspackChunk.push([["test-U6"], { "77002": provider }]);
+    const wrapped = W.rspackChunk[W.rspackChunk.length - 1][1]["77002"];
+    assert("U6: a wrapped provider still exposes its original source",
+      wrapped !== provider && wrapped.__interceptify_wrapped === true && wrapped.__intc_orig === provider);
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -2659,6 +2830,9 @@ async function main() {
   }
   try { await testT(); } catch (e) {
     assert("TEST T crashed", false, String(e && e.stack || e));
+  }
+  try { await testU(); } catch (e) {
+    assert("TEST U crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

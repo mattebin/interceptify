@@ -872,6 +872,42 @@
   // Capture the GENUINE live require by wrapping registry factories in place; the
   // next time the app instantiates a not-yet-cached wrapped module we grab its
   // require (3rd arg). Idempotent + re-runnable (catches lazily added factories).
+  // Any array on window whose entries are [chunkIds, modules] IS the bundle's
+  // chunk array, whatever this build calls it. Pushing a runtime callback onto
+  // it is how the bundle itself hands out its require, so this is the same
+  // probe the named hook pushes - for a name we did not know. Only runs while
+  // no live require has been captured, and each array is tried once.
+  const _shapeProbed = new WeakSet();
+  function probeChunkArraysByShape() {
+    if (isLiveRequire(window.__interceptify_webpack_require)) return;
+    let keys = [];
+    try { keys = Object.keys(window); } catch { return; }
+    for (const k of keys) {
+      if (k.indexOf("__interceptify") === 0) continue;
+      let arr;
+      try { arr = window[k]; } catch { continue; }
+      if (!Array.isArray(arr) || !arr.length || _shapeProbed.has(arr)) continue;
+      let isChunkArray = false;
+      try {
+        isChunkArray = arr.some((e) => {
+          if (!Array.isArray(e) || !Array.isArray(e[0]) || !e[1] || typeof e[1] !== "object") return false;
+          const ids = Object.keys(e[1]);
+          return ids.length > 0 && typeof e[1][ids[0]] === "function";
+        });
+      } catch {}
+      if (!isChunkArray) continue;
+      _shapeProbed.add(arr);
+      try {
+        arr.push([["interceptify-shape-" + k], {}, function (require) {
+          if (adoptLiveRequire(require)) {
+            window.__interceptify_chunk_by_shape = k;
+            snifferLog("live-require-by-shape", { global: k });
+          }
+        }]);
+      } catch {}
+    }
+  }
+
   function captureLiveRequire() {
     try {
       if (isLiveRequire(window.__interceptify_webpack_require)) return;
@@ -923,12 +959,51 @@
               && typeof ac.getAdState === "function");
   }
 
+  // The connector inside a module's exports or on the in-stream api, found by
+  // what it can DO. `adsCoreConnector` is the name every build has used so
+  // far, so it is tried first - but it is an export name, and 1.3.9 showed
+  // export names are the minifier's to change (its two sibling exports are
+  // already `l` and `q`). When the name is gone, anything with the two methods
+  // the gate drives is the connector.
+  // `readGetters` is for module exports, whose properties are getters by
+  // design. On the api object it must stay off: reading its `inStreamAd`
+  // accessor is not free.
+  function connectorIn(obj, readGetters) {
+    if (!obj || (typeof obj !== "object" && typeof obj !== "function")) return null;
+    try { if (connectorUsable(obj.adsCoreConnector)) return obj.adsCoreConnector; } catch {}
+    let keys = [];
+    try { keys = Object.keys(obj); } catch { return null; }
+    for (const k of keys.slice(0, 64)) {
+      if (k === "adsCoreConnector") continue;
+      let v;
+      try {
+        const d = Object.getOwnPropertyDescriptor(obj, k);
+        if (!d) continue;
+        if ("value" in d) v = d.value;
+        else if (readGetters && d.get) v = obj[k];
+        else continue;
+      } catch { continue; }
+      if (connectorUsable(v)) return v;
+    }
+    return null;
+  }
+
+  // Spotify's module table. The global has carried it on every build so far;
+  // if a build drops the global, Spotify's own require still has the same
+  // table on `.m`, and that require is what the chunk array hands us.
+  function moduleRegistry() {
+    const g = window.__webpack_modules__;
+    if (g && typeof g === "object") return g;
+    const live = window.__interceptify_webpack_require;
+    return (isLiveRequire(live) && live.m && typeof live.m === "object") ? live.m : null;
+  }
+
   // Scan the live module graph for the connector Spotify would hand out NOW.
   // Separated from the caching so "what is current" and "what did we keep" are
   // answerable independently - the previous code could only answer the second.
   function scanForAdsConnector() {
     if (CFG.snapshotConnector === false) return null;
-    const M = window.__webpack_modules__;
+    const M = moduleRegistry();
     const req = anyAdsRequire();
     if (!M || !req) return null;
     // Source-level prefilter, then confirm on the instantiated export. Matching
@@ -936,14 +1011,33 @@
     // skip; requiring two independent symbols keeps it from matching any module
     // that merely mentions ads.
     const found = [];
+    const sourceOf = (id) => {
+      try { const f = M[id] && M[id].__intc_orig ? M[id].__intc_orig : M[id]; return Function.prototype.toString.call(f); } catch { return ""; }
+    };
+    const consider = (id) => {
+      let ex; try { ex = req(id); } catch { return; }
+      const ac = connectorIn(ex, true);
+      if (ac) found.push({ id: String(id), ac });
+    };
+    // Pass 1, by name: what every build so far satisfies.
     for (const id of Object.keys(M)) {
-      let src = "";
-      try { const f = M[id] && M[id].__intc_orig ? M[id].__intc_orig : M[id]; src = Function.prototype.toString.call(f); } catch { continue; }
+      const src = sourceOf(id);
       if (src.indexOf("adsCoreConnector") < 0) continue;
       if (src.indexOf("updateAdStateEndpoint") < 0 && src.indexOf("putState") < 0) continue;
-      let ex; try { ex = req(id); } catch { continue; }
-      const ac = ex && ex.adsCoreConnector;
-      if (connectorUsable(ac)) found.push({ id: String(id), ac });
+      consider(id);
+    }
+    // Pass 2, by shape, only when the name found nothing: the module that
+    // DEFINES both methods the gate drives. Definitions, not calls, so the
+    // modules that merely use the connector are not instantiated to look.
+    if (!found.length) {
+      const defines = (src, m) => new RegExp("(?:^|[^.\\w$])" + m + "\\s*\\([^)]*\\)\\s*\\{").test(src);
+      for (const id of Object.keys(M)) {
+        const src = sourceOf(id);
+        if (src.indexOf("putState") < 0 || src.indexOf("getAdState") < 0) continue;
+        if (!defines(src, "putState") || !defines(src, "getAdState")) continue;
+        consider(id);
+      }
+      if (found.length) snifferLog("ads-connector-by-shape", { ids: found.map((f) => f.id) });
     }
     const distinct = [];
     for (const f of found) if (!distinct.some((d) => d.ac === f.ac)) distinct.push(f);
@@ -995,8 +1089,7 @@
     try {
       const req = anyAdsRequire();
       const ex = req && req(id);
-      const ac = ex && ex.adsCoreConnector;
-      return (ac && connectorUsable(ac)) ? ac : null;
+      return connectorIn(ex, true);
     } catch { return null; }
   }
 
@@ -1010,8 +1103,8 @@
     // first and simply believed.
     const fromModule = connectorFromModule();
     const api = window.__interceptify_instream_api;
-    const fromApi = api && api.adsCoreConnector;
-    const apiUsable = fromApi && connectorUsable(fromApi);
+    const fromApi = connectorIn(api, false);
+    const apiUsable = !!fromApi;
 
     if (fromModule && apiUsable && fromApi !== fromModule) {
       // Two live sources, two different objects. One of them is stale and
@@ -1306,7 +1399,7 @@
     // ever compared our list against theirs.
     const out = [];
     try {
-      const M = window.__webpack_modules__ || {};
+      const M = moduleRegistry() || {};
       const re = rx(CFG.adSlotIdRegex, "g");
       if (!re) return out;
       for (const id of Object.keys(M)) {
@@ -2521,6 +2614,9 @@
           return result;
         };
         wrappedFactory.__interceptify_wrapped = true;
+        // So a source read (ours, or the recon's) sees the provider and not
+        // this wrapper's own text.
+        wrappedFactory.__intc_orig = originalFactory.__intc_orig || originalFactory;
         return wrappedFactory;
       };
       // Wrap EVERY discovered in-stream module in a modules object (replaces
@@ -2735,6 +2831,7 @@
   if (CFG.totalBlock !== false || CFG.killAdEndpoints !== false || CFG.snapshotConnector !== false || CFG.adEnabledKill !== false) {
     const applyTotalBlock = (reason) => {
       try { captureLiveRequire(); } catch {}   // best-effort: prefer the genuine live require
+      try { probeChunkArraysByShape(); } catch {}   // ...including through a chunk array we have no name for
       try { resolveAdsConnector(); } catch {}   // find the lazy ads connector once loaded
       try { suppressAdState(reason); } catch {} // MASTER: ad_enabled=false -> ads never scheduled
       try { killAdEndpoints(reason); } catch {}
@@ -4360,7 +4457,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-11-13-provider-export-names",
+    version: "2026-11-13-resolve-by-shape",
     debugCapture: DEBUG_CAPTURE,
     // Machine-readable health, for the automated repair loop (selfheal.py) and
     // for a human over CDP. Cheap, no side effects.
@@ -4378,7 +4475,8 @@
         // only ad-outcome record that exists in a production patch.
         counters: { ..._counters },
         debugCaptureOn: DEBUG_CAPTURE,   // says whether the sniffer-based views mean anything
-        webpackModules: (() => { try { return Object.keys(window.__webpack_modules__ || {}).length; } catch { return 0; } })(),
+        webpackModules: (() => { try { return Object.keys(moduleRegistry() || {}).length; } catch { return 0; } })(),
+        chunkArrayByShape: window.__interceptify_chunk_by_shape || null,
         // L1 = the fast in-stream skip layer. It hangs off the bundler chunk
         // array, and when Spotify renamed that (webpack -> rspack) the layer
         // died silently for weeks. Surfaced here so the repair loop can fail on
