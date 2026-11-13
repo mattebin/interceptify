@@ -2,6 +2,8 @@ name: Build & Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -91,7 +93,7 @@ jobs:
 
       # Applies to MANUAL runs too, via the required `version` input.
       - name: Version consistency (tag/input vs APP_VERSION vs manifest)
-        run: python tests/test_version_consistency.py "${{ github.event.inputs.version || github.ref_name }}"
+        run: python tests/test_version_consistency.py "${{ github.event.inputs.version || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}"
 
   build:
     needs: test
@@ -143,6 +145,12 @@ jobs:
       # defects were found only here.
       - name: Exercise the packaged build against a disposable Spotify
         run: python tests/test_frozen_cycle.py dist/Interceptify.exe
+
+      # The whole update, for real: this commit's exe finds the latest release on
+      # GitHub, installs it and comes back, with the screen watched for windows.
+      # If this fails, nothing is published.
+      - name: A real update, end to end, with no window on screen
+        run: python tests/test_real_update.py
 
       # The exact resolved set, transitive deps included. The pins in
       # requirements.txt fix the direct dependencies; this is the receipt for
@@ -197,6 +205,9 @@ jobs:
 
             ### Settings
             Tunables live in `extensions/adblock.config.json`, which belongs to the release and is replaced on every update. Put your own changes in `extensions/adblock.config.local.json`. That file is never overwritten and wins over the shipped defaults.
+
+            ### Updating
+            New versions show up in the tray menu. If a Terminal window stays open while updating from 2.0.7 or older, close Interceptify, download **Interceptify.exe** from this page and replace the old one.
 
             ### Spotify auto-updates
             Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update, or tick the repair options under **Autostart** and it is put back for you. The original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.

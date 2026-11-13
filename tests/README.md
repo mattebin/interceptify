@@ -16,6 +16,7 @@ No Spotify, no network and no admin rights needed. CI runs all of them before a 
 | `test_redact.py` | Tokens are masked in diagnostic files |
 | `test_version_consistency.py` | Tag, app version, manifest and exe resource agree |
 | `test_bundled_payload.py` | The built exe carries this commit's payload and does not ask for admin |
+| `test_real_update.py` | The real update, end to end: the packaged tray finds the latest release, installs it and comes back, with no window on screen. Runs in the release pipeline |
 | `test_frozen_cycle.py` | The packaged exe works from its own folder (paths, log, read-only verify) |
 
 ```
