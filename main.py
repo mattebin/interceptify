@@ -56,7 +56,7 @@ except ImportError:
 
 
 APP_NAME = "Interceptify"
-APP_VERSION = "2.0.7"  # bump in lockstep with the GitHub tag
+APP_VERSION = "2.0.8"  # bump in lockstep with the GitHub tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("interceptify")
@@ -385,7 +385,11 @@ class InterceptifyApp:
         try:
             import patch_lock
             patch_lock.release_tray_mutex()
+            # A fresh start, not a helper of this process: without this a
+            # packaged build reuses our unpacked files, which are deleted
+            # when we exit (PyInstaller 6.9 and later).
             subprocess.Popen([sys.executable], cwd=str(ROOT), close_fds=True,
+                             env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
                              creationflags=0x00000008 | 0x00000200)
         except Exception as e:
             log.warning("could not restart outside the scheduled task: %s", e)
@@ -696,7 +700,7 @@ class InterceptifyApp:
             bat = ROOT / "_interceptify_update.bat"
             try:
                 self_updater.write_updater_bat(
-                    bat, current_pid=os.getpid(),
+                    bat,
                     new_exe=new_exe.resolve(), target_exe=target_exe,
                     expected_sha256=rel.exe_asset_sha256,
                 )

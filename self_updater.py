@@ -230,15 +230,14 @@ def download_asset(url: str, dest: Path, expected_size: int = 0,
     return hexdigest
 
 
-def write_updater_bat(bat_path: Path, current_pid: int, new_exe: Path,
-                      target_exe: Path, expected_sha256: str | None = None) -> None:
+def write_updater_bat(bat_path: Path, new_exe: Path, target_exe: Path,
+                      expected_sha256: str | None = None, swap_wait_s: int = 60) -> None:
     """
-    Write a small batch script that:
-      1. Waits for the running Interceptify PID to exit (so the exe unlocks)
-      2. Re-checks the downloaded exe's SHA-256
-      3. Moves the new exe over the current one
-      4. Relaunches Interceptify
-      5. Deletes itself
+    Write the script that finishes an update after the app has closed:
+      1. Re-checks the downloaded exe's SHA-256
+      2. Moves it over the current exe, retrying while the old one is in use
+      3. Starts Interceptify again
+      4. Deletes itself
 
     The re-check matters because of the gap. The download is verified while the
     app is still running, but the swap happens seconds later, after we have
@@ -246,12 +245,21 @@ def write_updater_bat(bat_path: Path, current_pid: int, new_exe: Path,
     as the user) can write to. Verifying once at download time says nothing
     about the bytes that actually get installed. certutil is used because it is
     present on every supported Windows and this runs after our process is gone.
+
+    Step 2 retries instead of waiting for one process id. A packaged build is
+    two processes, a launcher and the program, and the launcher keeps the exe
+    in use for a moment after the program is gone. A scheduled repair can hold
+    it too. Whatever holds it, the move works as soon as nothing does.
+
+    The script sets PYINSTALLER_RESET_ENVIRONMENT=1 for what it starts. It runs
+    with the environment of the program that is closing, and without this a
+    packaged build started from here takes itself for a helper of that old
+    program and looks for its unpacked files, which are being deleted
+    (PyInstaller 6.9 and later).
+
+    Every path ends with the tray running (the old build on failure, the new
+    one on success), one line in update.log, and no leftover download.
     """
-    # This script runs detached with no window, after the app has exited. It
-    # used to `pause` on failure, which waited forever on a console nobody could
-    # see and never brought the tray back. Every path now ends with the tray
-    # running again (old build on failure, new build on success) and one line
-    # in update.log saying which.
     log_path = bat_path.with_name("update.log")
     guard = ""
     if expected_sha256:
@@ -271,27 +279,31 @@ if /I not "%GOT%"=="%WANT%" (
     exit /b 1
 )
 """
-    # chcp 65001 so cmd reads the rest of this UTF-8 file as UTF-8: a detached
-    # cmd otherwise decodes it in the OEM codepage and an install path with a
-    # non-ASCII character names a file that does not exist.
+    # chcp 65001 so cmd reads the rest of this UTF-8 file as UTF-8: otherwise
+    # it decodes it in the OEM codepage and an install path with a non-ASCII
+    # character names a file that does not exist.
     script = f"""@echo off
 chcp 65001 >NUL
-setlocal enabledelayedexpansion
-set PID={current_pid}
-:waitloop
-tasklist /FI "PID eq %PID%" 2>NUL | findstr %PID% >NUL
-if not errorlevel 1 (
-    ping -n 2 127.0.0.1 >NUL
-    goto waitloop
-)
+setlocal
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
 {guard}
+set /a LEFT={int(swap_wait_s)}
+:swap
 move /Y "{new_exe}" "{target_exe}" >NUL 2>&1
-if errorlevel 1 (
-    echo %DATE% %TIME% failed to replace the exe, new build left at "{new_exe}" >> "{log_path}"
-    start "" "{target_exe}"
-    del "%~f0"
-    exit /b 1
-)
+if not errorlevel 1 goto swapped
+set /a LEFT-=1
+if %LEFT% LEQ 0 goto giveup
+ping -n 2 127.0.0.1 >NUL
+goto swap
+
+:giveup
+echo %DATE% %TIME% failed to replace the exe, it stayed in use >> "{log_path}"
+del "{new_exe}" >NUL 2>&1
+start "" "{target_exe}"
+del "%~f0"
+exit /b 1
+
+:swapped
 echo %DATE% %TIME% updated >> "{log_path}"
 start "" "{target_exe}"
 del "%~f0"

@@ -195,7 +195,7 @@ def main() -> int:
     inst.mkdir(parents=True)
     bat = inst / "_interceptify_update.bat"
     target = inst / "Interceptify.exe"
-    self_updater.write_updater_bat(bat, current_pid=4242, new_exe=inst / "Interceptify.exe.new",
+    self_updater.write_updater_bat(bat, new_exe=inst / "Interceptify.exe.new",
                                    target_exe=target, expected_sha256="ab" * 32)
     raw = bat.read_bytes()
     text = raw.decode("utf-8")
@@ -206,6 +206,15 @@ def main() -> int:
           lines[0].lower() == "@echo off" and lines[1].lower().startswith("chcp 65001"), str(lines[:2]))
     check("4c. a non-ASCII install path survives as UTF-8 bytes",
           str(target).encode("utf-8") in raw, "path not found in the script bytes")
+    check("4g. what it starts is told it is a fresh program, before anything is started",
+          'set "PYINSTALLER_RESET_ENVIRONMENT=1"' in lines
+          and lines.index('set "PYINSTALLER_RESET_ENVIRONMENT=1"') < min(i for i, l in enumerate(lines) if l.startswith("start ")),
+          "missing or too late")
+    main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+    check("4h. the tray's own restart asks for a fresh start too",
+          'env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}' in main_src)
+    check("4i. the script has no pipe to wait on a process id (that is what hung)",
+          "tasklist" not in text and "findstr" not in text)
     relaunch_old = f'start "" "{target}"'
     check("4d. every branch (two failures, one success) ends by starting the tray",
           lines.count(relaunch_old) == 3, f"count={lines.count(relaunch_old)}")

@@ -50,7 +50,7 @@ def stand_in(tag: str, marker: Path) -> bytes:
     return ("Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n"
             "Set f = fso.OpenTextFile(fso.GetParentFolderName(WScript.ScriptFullName) & \"\\"
             f"{marker.name}\", 8, True)\r\n"
-            f"f.WriteLine \"{tag}\"\r\nf.Close\r\n").encode("ascii")
+            f"f.WriteLine \"{tag} \" & CreateObject(\"WScript.Shell\").Environment(\"PROCESS\")(\"PYINSTALLER_RESET_ENVIRONMENT\")\r\nf.Close\r\n").encode("ascii")
 
 
 _CONSOLE_CLASSES = ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "PseudoConsoleWindow")
@@ -78,7 +78,7 @@ def visible_console_windows() -> dict:
     return found
 
 
-def scenario(name: str, *, tamper: bool = False, lock: bool = False):
+def scenario(name: str, *, tamper: bool = False, lock: bool = False, busy_s: float = 0):
     base = Path(tempfile.mkdtemp(prefix="intc-upd-")) / "Användare åäö" / "Interceptify"
     base.mkdir(parents=True)
     marker = base / "started.txt"
@@ -88,12 +88,15 @@ def scenario(name: str, *, tamper: bool = False, lock: bool = False):
     good = stand_in("new", marker)
     new.write_bytes(good + (b"' tampered\r\n" if tamper else b""))
     bat = base / "_interceptify_update.bat"
-    self_updater.write_updater_bat(bat, current_pid=4000000, new_exe=new, target_exe=target,
-                                   expected_sha256=hashlib.sha256(good).hexdigest())
+    self_updater.write_updater_bat(bat, new_exe=new, target_exe=target,
+                                   expected_sha256=hashlib.sha256(good).hexdigest(), swap_wait_s=8)
     held = None
-    if lock:
+    if lock or busy_s:
         # An open handle without delete sharing is what a still-running exe looks like.
         held = open(target, "rb")
+        if busy_s:
+            # ...and this is the old program's launcher letting go a few seconds later
+            threading.Timer(busy_s, held.close).start()
     try:
         # Started exactly the way the tray starts it, with the screen watched
         # for the whole run: an update must never put a window in front of
@@ -128,10 +131,11 @@ def scenario(name: str, *, tamper: bool = False, lock: bool = False):
         watcher.join(timeout=2)
         if held:
             held.close()
-    started = marker.read_text(encoding="ascii", errors="replace").strip() if marker.exists() else ""
+    words = marker.read_text(encoding="ascii", errors="replace").split() if marker.exists() else []
+    started = words[0] if words else ""
     log = (base / "update.log").read_text(encoding="utf-8", errors="replace") if (base / "update.log").exists() else ""
     return {"finished": finished, "started": started, "log": log, "new_left": new.exists(),
-            "windows": sorted(set(windows.values())),
+            "windows": sorted(set(windows.values())), "fresh": words[1:] == ["1"],
             "bat_left": bat.exists(), "target_is_new": target.read_bytes() == good}
 
 
@@ -153,6 +157,12 @@ def main() -> int:
           r["finished"] and not r["bat_left"] and "updated" in r["log"], str(r))
 
     check("1d. ...and no console or Terminal window appears at any moment", not r["windows"], str(r["windows"]))
+    check("1e. ...and the new build is started as a fresh program, not as a helper of the old one", r["fresh"], str(r))
+
+    r = scenario("busy", busy_s=4)
+    check("5a. while the old exe is still in use the script waits, then swaps and starts the new build",
+          r["target_is_new"] and r["started"] == "new" and r["finished"] and not r["new_left"], str(r))
+    check("5b. ...with no window while it waits", not r["windows"], str(r["windows"]))
 
     pyw = Path(sys.executable).with_name("pythonw.exe")
     if pyw.exists():
@@ -175,7 +185,8 @@ def main() -> int:
 
     r = scenario("locked", lock=True)
     check("3a. when the exe cannot be replaced the old build stays in place", not r["target_is_new"], str(r))
-    check("3b. ...and is started again", r["started"] == "old", repr(r["started"]))
+    check("3b. ...and is started again, as a fresh program", r["started"] == "old" and r["fresh"], repr(r["started"]))
+    check("3d. ...and the unused download is removed", not r["new_left"], str(r))
     check("3c. ...the script still ends on its own and logs it",
           r["finished"] and "failed to replace" in r["log"], str(r))
 

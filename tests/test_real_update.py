@@ -128,7 +128,10 @@ def main() -> int:
         check("1. the tray starts and stays running", bool(trays_in(inst)), "it exited: is another Interceptify running?")
         t0 = time.time()
         # the tray looks for a release one minute after it starts
+        seen_download = None
         while not FAILURES and time.time() - t0 < 300:
+            if seen_download is None and (inst / "Interceptify.exe.new").exists():
+                seen_download = time.time()
             try:
                 if sha(exe) == rel.exe_asset_sha256.lower():
                     swapped_after = round(time.time() - t0)
@@ -140,10 +143,19 @@ def main() -> int:
               swapped_after is not None, f"still the old build: {sha(exe) == old_sha}")
         back = []
         t1 = time.time()
-        while swapped_after is not None and time.time() - t1 < 60 and not back:
+        while time.time() - t1 < 60 and not back:
             time.sleep(2)
             back = trays_in(inst)
         check("3. the tray is running again from the same folder", bool(back))
+        time.sleep(8)
+        try:
+            stamp = json.loads((inst / "config.json").read_text(encoding="utf-8")).get("last_version")
+        except Exception as e:
+            stamp = f"unreadable: {e}"
+        check(f"6. the program that came back really is {rel.tag} and finished starting",
+              stamp == rel.tag.lstrip("v") and bool(trays_in(inst)), f"config says {stamp!r}")
+        if seen_download and swapped_after is not None:
+            print(f"   from download to swapped: {round(t0 + swapped_after - seen_download)} s")
         time.sleep(5)
         log = (inst / "update.log").read_text(encoding="utf-8", errors="replace") if (inst / "update.log").exists() else ""
         check("4. the update script removed itself and its download, and logged the outcome",
