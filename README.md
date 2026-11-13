@@ -169,11 +169,12 @@ Earlier releases (≤ v1.4.0) shipped a mitmproxy + Windows-proxy pipeline; Spot
 
 - **v1.5.2**: manifest-based pre-player block (`end_time_millis` discriminator).
 - **v1.5.3**: in-stream payload block wrapping Spotify's renderer ad provider.
-- **v2.0.0**: over-skip rework: explicit ad-state machine with a single gated skip choke point that **never skips a real song**; ID-agnostic in-stream module discovery; manifest corroboration guard (no more false-blocking short real tracks); all build-volatile knobs externalized to `adblock.config.json`; mute/gain watchdog so playback never stays stuck silent; integrity-verified self-update; remote debugging made opt-in and loopback-bound. The phone (ntfy) test notification was removed.
-- **v2.0.1**: near-instant silent ad skipping, plus inspect and debug tooling.
-- **v2.0.2**: first total-block layer (ad state and stream time).
-- **v2.0.3**: total block restored on Spotify 1.2.93, the first V8-snapshot build.
-- **v2.0.4**: self-healing ad gate and a block that can be verified, for Spotify 1.2.94.
-- **v2.0.5**: the ad connector is found by its state methods instead of the skip method. Scheduled tasks no longer open ghost Terminal windows.
-- **v2.0.6**: Spotify 1.3.0 support. The 1.3.0 build renamed its chunk-loading global to plain `rspackChunk`, changed the module runtime's `d()` to a three-argument form, and moved the ad modules to new ids. The ad connector and its `ad_enabled` switch were unchanged, but the payload could no longer reach them, so only the mute fallback ran. Fixed: the new global is hooked, the real module loader is always preferred over the reconstructed fallback (which can no longer be mistaken for it), the fallback understands the three-argument `d()`, and provider discovery reads the original factory source and ignores implementation-sized matches. Also removed a dead recon tool (`frida_recon.py`) and stale ignore rules.
-- **v2.0.7**: Spotify 1.3.9 support. That build renamed the exports of its in-stream ad module, and the old hook replaced them by name, which left Spotify stuck on its loading screen. The hook now wraps whatever the module exports and recognises things by what they do. The connector, the module table and the chunk loader are found the same way when their names move. The tray is now silent (no pop-up notifications, a status line in the menu instead), can install updates by itself if you tick **Update automatically** (off by default) and refreshes the patch afterwards, starts from the Windows startup programs instead of a scheduled task, and has separate Autostart options. The scheduled repair respects Unpatch, restarts Spotify once and only when the patch is actually missing.
+- **v2.0.0**: rework so real songs are never skipped.
+- **v2.0.1**: faster silent ad skipping.
+- **v2.0.2**: first full ad block.
+- **v2.0.3**: add support for Spotify 1.2.93.
+- **v2.0.4**: add support for Spotify 1.2.94.
+- **v2.0.5**: fixes for finding Spotify's ad switch and for the scheduled tasks.
+- **v2.0.6**: add support for Spotify 1.3.0.
+- **v2.0.7**: add support for Spotify 1.3.9. Quiet tray, Autostart options.
+- **v2.0.8**: fix updates. They run in the background with no windows, and the app starts again by itself.

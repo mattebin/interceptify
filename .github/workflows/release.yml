@@ -207,7 +207,7 @@ jobs:
             Tunables live in `extensions/adblock.config.json`, which belongs to the release and is replaced on every update. Put your own changes in `extensions/adblock.config.local.json`. That file is never overwritten and wins over the shipped defaults.
 
             ### Updating
-            New versions show up in the tray menu. If a Terminal window stays open while updating from 2.0.7 or older, close Interceptify, download **Interceptify.exe** from this page and replace the old one.
+            New versions show up in the tray menu. Coming from 2.0.7 or older: close Interceptify, download **Interceptify.exe** from this page and replace the old file. The built-in update in those versions does not work well.
 
             ### Spotify auto-updates
             Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update, or tick the repair options under **Autostart** and it is put back for you. The original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.
