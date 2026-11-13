@@ -238,6 +238,7 @@ def describe(name: str) -> dict | None:
         "arguments": _tag(x, "Arguments"),
         "level": _tag(x, "RunLevel"),
         "limit": _tag(x, "ExecutionTimeLimit"),
+        "priority": _tag(x, "Priority"),
         "userid": _tag(x, "UserId"),
         "triggers": triggers,
         # The trigger ELEMENTS, e.g. ["LogonTrigger"]. StartBoundary inside a
@@ -349,6 +350,10 @@ def wrong_with(got: dict | None, cmd: str, trigger: str = "") -> list[str]:
         problems.append(f"arguments are {got.get('arguments')!r}, expected {want_args!r}")
     if trigger and trigger not in (got.get("trigger_kinds") or []):
         problems.append(f"trigger is {got.get('trigger_kinds') or '(none)'}, expected {trigger}")
+    # Absent means Task Scheduler's default of 7, below normal, which every
+    # process the task starts inherits - including a Spotify self-heal relaunches.
+    if (got.get("priority") or "7") != "4":
+        problems.append(f"runs at below-normal priority ({got.get('priority') or '7'})")
     if cmd == tray_command() and (got.get("limit") or "") not in ("PT0S",):
         problems.append(f"is stopped by Task Scheduler after {got.get('limit') or 'its default limit'}")
     # A task that is defined correctly and cannot RUN is not a correct task. The

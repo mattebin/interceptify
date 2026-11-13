@@ -142,8 +142,15 @@ def main() -> int:
     check("6c. tasks run at normal priority, in schema order after the time limit",
           "</ExecutionTimeLimit><Priority>4</Priority>" in tray_xml and "<Priority>4</Priority>" in heal_xml)
     exe, args = install_tasks._split_command(install_tasks.tray_command())
-    good = {"command": exe.strip('"'), "arguments": args, "level": "", "trigger_kinds": ["LogonTrigger"]}
+    good = {"command": exe.strip('"'), "arguments": args, "level": "", "trigger_kinds": ["LogonTrigger"],
+            "priority": "4"}
     old = install_tasks.wrong_with({**good, "limit": "PT1H"}, install_tasks.tray_command(), "LogonTrigger")
+    low = install_tasks.wrong_with({**good, "limit": "PT0S", "priority": ""}, install_tasks.tray_command(), "LogonTrigger")
+    check("6e. a task registered without a priority (Windows default, below normal) is reported as wrong",
+          any("below-normal priority" in p for p in low), str(low))
+    fine = [p for p in install_tasks.wrong_with({**good, "limit": "PT0S"}, install_tasks.tray_command(), "LogonTrigger")
+            if "priority" in p or "stopped by" in p]
+    check("6f. ...and a task with the new settings is not", fine == [], str(fine))
     check("6d. an already-registered tray task with the old limit is reported as wrong",
           any("stopped by Task Scheduler" in p for p in old), str(old))
 

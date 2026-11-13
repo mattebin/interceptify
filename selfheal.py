@@ -1914,6 +1914,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.verify:
         res = status_only()
+        # One line in the log per check, so "did it run, and what did it say"
+        # has an answer on disk in the packaged build, where stdout goes nowhere.
+        log.info("read-only verify: verdict=%s drift=%s", res.get("verdict"), res.get("drift"))
         print(json.dumps(res, indent=2))
         return {"PASS": 0, "UNKNOWN": 4}.get(res.get("verdict"), 2)
     if a.selftest:

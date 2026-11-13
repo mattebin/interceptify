@@ -112,6 +112,10 @@ def main(argv: list[str]) -> int:
     check("5. state lives next to the .exe, so it survives the process exiting",
           (exe.parent / "selfheal.log").is_file(),
           f"{[p.name for p in exe.parent.iterdir()]}")
+    # "The file exists" passed for months while it was always 0 bytes: the
+    # packaged build configured logging before self-heal could add its handler.
+    log_size = (exe.parent / "selfheal.log").stat().st_size if (exe.parent / "selfheal.log").is_file() else 0
+    check("5b. ...and the packaged self-heal actually writes to its log", log_size > 0, f"{log_size} bytes")
 
     r = run(exe, ["--install-tasks", "--status"], appdata)
     check("6. the packaged task installer reports the FROZEN deployment",
