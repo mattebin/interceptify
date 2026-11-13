@@ -2381,9 +2381,13 @@ async function testS() {
         for (const k in getters || {}) Object.defineProperty(e, k, { enumerable: true, get: getters[k] });
         for (const k in values || {}) Object.defineProperty(e, k, { enumerable: true, value: values[k] });
       };
+      // Defines its exports directly, not through require.d: the one case
+      // the d() interception cannot reach, so the in-place wrap is all that
+      // is left and it cannot take against non-writable values.
       function frozenProvider(module, exports, require) {
         const n = () => ({ inStreamApi: { getInStreamAd() { return null; } } }).inStreamApi;
-        require.d(exports, {}, { d: n, m: () => n().getInStreamAd() });
+        Object.defineProperty(exports, "d", { enumerable: true, value: n });
+        Object.defineProperty(exports, "m", { enumerable: true, value: () => n().getInStreamAd() });
       }
       // Re-wrap a frozen-style factory the same way the hook would.
       const mods2 = pushChunk(W, { "98214": frozenProvider });
@@ -2457,6 +2461,142 @@ async function testS() {
 }
 
 // ===========================================================================
+// TEST T — EXPORT NAMES ARE THE MINIFIER'S, NOT OURS
+//
+// Spotify 1.3.9 renamed the in-stream provider's exports from {d, m} to
+// {dY, mr} and added a React hook (bS). The L1 fast path REPLACED the module's
+// exports with d and m, so every export Spotify actually imports was gone,
+// each consumer called undefined, and the client never got past its loading
+// skeleton. Verbatim 1.3.9 module shape below.
+//
+// T1: every original export survives under its own name (THE BUG).
+// T2: the api accessor, whatever it is called, hands back the live api and
+//     that api is captured and hooked.
+// T3: the ad accessor still returns the ad, and the ad is seen.
+// T4: the hook export passes its arguments and result through untouched, and
+//     a selector result that merely has an id is NOT recorded as an ad.
+// T5: a provider with the legacy {d, m} shape still works through whichever
+//     path takes it.
+// ===========================================================================
+async function testT() {
+  const baseFetch = async () => { throw new Error("unexpected fetch in TEST T"); };
+  const pushChunk = (W, modules) => { W.rspackChunk.push([["test-T-" + Object.keys(modules).join("-")], modules]); return modules; };
+  const makeRuntime = (M) => {
+    const cache = {};
+    const R = function (id) {
+      id = String(id);
+      if (cache[id]) return cache[id].exports;
+      if (!M[id]) throw new Error("no module " + id);
+      const mod = cache[id] = { id, exports: {}, loaded: false };
+      M[id].call(mod.exports, mod, mod.exports, R);
+      mod.loaded = true;
+      return mod.exports;
+    };
+    R.m = M; R.c = cache;
+    // rspack's d(): getters in the 2nd argument, non-writable values in the 3rd.
+    R.d = (e, getters, values) => {
+      for (const k in getters || {}) Object.defineProperty(e, k, { enumerable: true, get: getters[k] });
+      for (const k in values || {}) Object.defineProperty(e, k, { enumerable: true, value: values[k] });
+    };
+    return R;
+  };
+
+  // ---- T1-T4: the 1.3.9 shape ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    delete W.__interceptify_instream_api;
+    const liveAd = { adId: "ad-T", uri: "spotify:ad:T", advertiser: "AcmeCo" };
+    const liveApi = { current: null, getInStreamAd() { return this.current; }, subscribeToInStreamAdChanges() {} };
+    const hookCalls = [];
+    // 57106 on 1.3.9, structure verbatim: i.d(t,{},{bS:<hook>,dY:a,mr:()=>a().getInStreamAd()})
+    const provider139 = function (e, t, i) {
+      const n = i(84638);
+      const a = () => (0, n.G)().inStreamApi;
+      i.d(t, {}, {
+        bS: (sel) => { hookCalls.push(sel); return sel(a().getInStreamAd()); },
+        dY: a,
+        mr: () => a().getInStreamAd(),
+      });
+    };
+    const M = {
+      // Discoverable as the ads-API context (its source names AdsAPIProvider),
+      // exactly as on the live client. Without that the destructive fast path
+      // cannot resolve it, bails out, and the bug this test exists for never
+      // gets the chance to happen.
+      "84638": function (module) { /* AdsAPIProvider */ module.exports = { G: () => ({ inStreamApi: liveApi }) }; },
+      "57106": provider139,
+    };
+    pushChunk(W, { "57106": M["57106"] });        // the hook wraps it in the pushed map
+    M["57106"] = W.rspackChunk[W.rspackChunk.length - 1][1]["57106"];
+    assert("T.pre: the 1.3.9 provider was discovered and wrapped",
+      M["57106"].__interceptify_wrapped === true && String(W.__interceptify_instream_id) === "57106",
+      `wrapped=${!!M["57106"].__interceptify_wrapped} id=${W.__interceptify_instream_id}`);
+    const R = makeRuntime(M);
+    let ex = null, threw = "";
+    try { ex = R("57106"); } catch (e) { threw = String(e); }
+    assert("T1 (THE BUG): bS, dY and mr all survive as functions under their own names",
+      !!ex && typeof ex.bS === "function" && typeof ex.dY === "function" && typeof ex.mr === "function",
+      threw || `keys=${ex ? JSON.stringify(Object.keys(ex)) : "none"}`);
+    assert("T1b: ...and nothing was invented in their place",
+      !!ex && !("d" in ex) && !("m" in ex), `keys=${ex ? JSON.stringify(Object.keys(ex)) : "none"}`);
+    if (ex && typeof ex.dY === "function") {
+      const api = ex.dY();
+      assert("T2: the api accessor hands back the live api, captured and hooked",
+        api === liveApi && W.__interceptify_instream_api === liveApi
+          && !!Object.getOwnPropertyDescriptor(liveApi, "inStreamAd")
+          && W.__interceptify_l1_provider_active === true,
+        `same=${api === liveApi} captured=${W.__interceptify_instream_api === liveApi} active=${W.__interceptify_l1_provider_active}`);
+      const seenBefore = (W.__interceptify_seen_instream_ads && W.__interceptify_seen_instream_ads.size) || 0;
+      // A selector result with an id, while NO ad is playing: must not count.
+      const sel = (ad) => ({ id: "track-123", fromAd: ad });
+      const out = ex.bS(sel);
+      const seenAfterHook = (W.__interceptify_seen_instream_ads && W.__interceptify_seen_instream_ads.size) || 0;
+      assert("T4: the hook export passes its argument and result through",
+        hookCalls.length === 1 && hookCalls[0] === sel && out && out.id === "track-123" && out.fromAd === null,
+        `calls=${hookCalls.length} out=${JSON.stringify(out)}`);
+      assert("T4b: ...and a selector result is not recorded as an ad",
+        seenAfterHook === seenBefore, `before=${seenBefore} after=${seenAfterHook}`);
+      liveApi.current = liveAd;
+      let got = null; try { got = ex.mr(); } catch (e) { got = "threw " + e; }
+      const seenAfterAd = (W.__interceptify_seen_instream_ads && W.__interceptify_seen_instream_ads.size) || 0;
+      // The api was captured in T2, so its getInStreamAd is hooked: the ad is
+      // seen and then withheld from Spotify (blockInStreamSignal). Reaching
+      // the hooked api through an export we never named is the point.
+      assert("T3: an ad read through the renamed ad accessor is seen by the payload",
+        seenAfterAd === seenBefore + 1 && (got === null || got === liveAd),
+        `got=${got === liveAd ? "ad" : JSON.stringify(got)} before=${seenBefore} after=${seenAfterAd}`);
+    }
+  }
+
+  // ---- T5: the legacy {d, m} shape, defined the rspack way ----
+  {
+    const env = loadAdblock({ fixture: makeFixture(), clock: makeClock(), baseFetch });
+    const W = env.sandbox.window;
+    delete W.__interceptify_instream_api;
+    const liveApi = { getInStreamAd() { return null; } };
+    const providerLegacy = function (e, t, i) {
+      const r = i(21361);
+      const n = () => (0, r.G)().inStreamApi;
+      i.d(t, {}, { d: n, m: () => n().getInStreamAd() });
+    };
+    const M = {
+      "21361": function (module) { /* AdsAPIProvider */ module.exports = { G: () => ({ inStreamApi: liveApi }) }; },
+      "98213": providerLegacy,
+    };
+    pushChunk(W, { "98213": M["98213"] });
+    M["98213"] = W.rspackChunk[W.rspackChunk.length - 1][1]["98213"];
+    const R = makeRuntime(M);
+    let ex = null, threw = "";
+    try { ex = R("98213"); } catch (e) { threw = String(e); }
+    let api = null; try { api = ex && ex.d(); } catch (e) { threw = String(e); }
+    assert("T5: the legacy {d, m} provider still yields a captured, hooked api",
+      !!ex && typeof ex.m === "function" && api === liveApi && W.__interceptify_instream_api === liveApi,
+      threw || `same=${api === liveApi} captured=${W.__interceptify_instream_api === liveApi}`);
+  }
+}
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 async function main() {
@@ -2516,6 +2656,9 @@ async function main() {
   }
   try { await testS(); } catch (e) {
     assert("TEST S crashed", false, String(e && e.stack || e));
+  }
+  try { await testT(); } catch (e) {
+    assert("TEST T crashed", false, String(e && e.stack || e));
   }
 
   const pad = Math.max(...results.map((r) => r.label.length));

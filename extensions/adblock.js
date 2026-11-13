@@ -2356,6 +2356,92 @@
       const chunkGlobal = names[0];
       const chunks = names.map(function (n) { return (window[n] = window[n] || []); });
       const chunk = window[chunkGlobal];
+      // The provider shape the destructive fast path below was built for:
+      // exactly two exports, d (the api accessor) and m (the ad accessor).
+      const _LEGACY_PROVIDER_SHAPE = /\{\s*d\s*:\s*[\w$]+\s*,\s*m\s*:\s*\(\s*\)\s*=>\s*[\w$]+\(\s*\)\s*\.getInStreamAd\(\s*\)\s*\}/;
+      // What a provider export handed back. An object carrying getInStreamAd
+      // IS the in-stream api, whatever the export is called: capture and hook
+      // it. A zero-argument accessor that reads getInStreamAd() hands back the
+      // ad itself. Everything else (React hooks, selectors) passes through
+      // untouched - a selector result is not evidence of an ad.
+      const _inspectProviderReturn = (out, fn, name) => {
+        if (!out || typeof out !== "object") return out;
+        if (typeof out.getInStreamAd === "function") {
+          const api = wrapInStreamApi(out, "webpack-instream." + name);
+          try {
+            if (api && !api.getInStreamAd.__interceptify_wrapped) {
+              const origGet = api.getInStreamAd;
+              api.getInStreamAd = function () {
+                const ad = origGet.apply(this, arguments);
+                rememberInStreamAd(ad, "webpack-instream." + name + ".getInStreamAd");
+                return ad;
+              };
+              api.getInStreamAd.__interceptify_wrapped = true;
+            }
+          } catch {}
+          window.__interceptify_l1_provider_active = true;
+          return api;
+        }
+        let isAdAccessor = false;
+        try { isAdAccessor = fn.length === 0 && String(fn).indexOf("getInStreamAd") !== -1; } catch {}
+        if (isAdAccessor) rememberInStreamAd(out, "webpack-instream." + name);
+        return out;
+      };
+      const _providerWrappers = new WeakMap();
+      const _wrapProviderExport = (fn, name) => {
+        if (typeof fn !== "function" || fn.__interceptify_wrapped) return fn;
+        let w = _providerWrappers.get(fn);
+        if (w) return w;
+        w = function () {
+          const out = fn.apply(this, arguments);
+          try { return _inspectProviderReturn(out, fn, name); } catch { return out; }
+        };
+        w.__interceptify_wrapped = true;
+        _providerWrappers.set(fn, w);
+        return w;
+      };
+      // A stand-in for the bundle's require that differs in exactly one
+      // respect: d() on THIS module's exports wraps function exports first.
+      // Returns null when interception is not possible (no d(), or a d() that
+      // a Proxy is not allowed to shadow), and the caller runs the factory
+      // with the real require - an unwrapped provider is a missing belt, a
+      // broken one is a dead client.
+      const _interceptingRequire = (require, module, exports) => {
+        if (!require || typeof require.d !== "function" || typeof Proxy !== "function") return null;
+        const desc = Object.getOwnPropertyDescriptor(require, "d");
+        if (desc && desc.configurable === false && desc.writable === false) return null;
+        const realD = require.d;
+        const wrapAll = (defs, viaGetter) => {
+          if (!defs || typeof defs !== "object") return defs;
+          const out = {};
+          for (const k of Object.keys(defs)) {
+            const v = defs[k];
+            if (viaGetter) {
+              out[k] = typeof v === "function"
+                ? function () { return _wrapProviderExport(v.apply(this, arguments), k); }
+                : v;
+            } else {
+              out[k] = _wrapProviderExport(v, k);
+            }
+            if (typeof v === "function") window.__interceptify_instream_exports_intercepted =
+              (window.__interceptify_instream_exports_intercepted || 0) + 1;
+          }
+          return out;
+        };
+        const d = function (target, getters, values) {
+          let g = getters, v = values;
+          try {
+            if (target === exports || (module && target === module.exports)) {
+              g = wrapAll(getters, true);
+              v = wrapAll(values, false);
+            }
+          } catch { g = getters; v = values; }
+          return arguments.length > 2 ? realD.call(require, target, g, v) : realD.call(require, target, g);
+        };
+        return new Proxy(require, {
+          get(t, k) { return k === "d" ? d : t[k]; },
+        });
+      };
       const makeWrappedFactory = (originalFactory) => {
         const wrappedFactory = function (module, exports, require) {
           try {
@@ -2367,7 +2453,16 @@
             // Fast-path replacement: this factory builds the in-stream ad
             // provider via the player-state module. Discover the player-state
             // id by source scan (was hard-coded 5563).
-            if (source.includes("getInStreamAd") && source.includes("inStreamApi") && require.d) {
+            // ONLY for the exact two-export shape it was written for
+            // (`{d:<api accessor>, m:()=>x().getInStreamAd()}`, 1.2.9x-1.3.6).
+            // This path REPLACES the module's exports with d and m. 1.3.9
+            // renamed them (dY, mr) and added a third (bS); replacing then
+            // deleted every export Spotify asks for, each consumer got
+            // undefined, and the whole UI died on its loading skeleton. Any
+            // other shape goes through the name-agnostic interception below,
+            // which never removes an export.
+            if (source.includes("getInStreamAd") && source.includes("inStreamApi") && require.d
+                && _LEGACY_PROVIDER_SHAPE.test(source)) {
               const psId = discoverPlayerStateId(require);
               const playerState = require(psId);
               const getApi = () => (0, playerState.G)().inStreamApi;
@@ -2400,7 +2495,18 @@
               return undefined;
             }
           } catch {}
-          const result = originalFactory.apply(this, arguments);
+          // Name-agnostic interception. Run the ORIGINAL factory, but hand it
+          // a require whose d() wraps each function export on its way in. The
+          // module keeps every export under whatever name this build gave it;
+          // we learn what an export is from what it RETURNS, never from what
+          // it is called. Export names are minifier output and changed in
+          // 1.3.9 with nothing else moving.
+          let factoryRequire = require;
+          try {
+            const viaD = _interceptingRequire(require, module, exports);
+            if (viaD) factoryRequire = viaD;
+          } catch { factoryRequire = require; }
+          const result = originalFactory.call(this, module, exports, factoryRequire);
           // The factory has now RUN. "We replaced a factory" and "that factory
           // executed and produced something we could wrap" are different claims,
           // and only the first was ever reported - so a provider that was
@@ -4254,7 +4360,7 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-09-14-rspackChunk-live-require",
+    version: "2026-11-13-provider-export-names",
     debugCapture: DEBUG_CAPTURE,
     // Machine-readable health, for the automated repair loop (selfheal.py) and
     // for a human over CDP. Cheap, no side effects.
