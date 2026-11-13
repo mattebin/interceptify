@@ -74,7 +74,8 @@ scheduler state, drives the break timer and starts playback if nothing is
 streaming. All of that now lives behind `--selftest`, which says what it does.
 
 USAGE
-    python selfheal.py --once      # cheap check; full repair+verify only on drift
+    python selfheal.py --once      # cheap check; on drift the patch is put back, and
+                                   # proven live only with "live_verify" in config.json
     python selfheal.py --force     # always run the full repair+verify cycle
     python selfheal.py --verify    # READ-ONLY status; changes nothing
     python selfheal.py --selftest  # DISRUPTIVE causal proof; needs a debug session
@@ -565,7 +566,8 @@ def _user_settings() -> dict:
     re-patched after an explicit Unpatch, turned the status dot back on and
     switched debug capture off, because it only ever called patch() with its
     own defaults."""
-    out = {"show_badge": True, "debug_capture": False, "user_unpatched": False}
+    out = {"show_badge": True, "debug_capture": False, "user_unpatched": False,
+           "live_verify": False}
     try:
         cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
         for k in out:
@@ -584,6 +586,40 @@ def _patch_as_user(debug_capture: bool | None = None):
     return spotify_patcher.patch(
         show_badge=s["show_badge"],
         debug_capture=s["debug_capture"] if debug_capture is None else debug_capture)
+
+
+def repair_files_only(fp: dict) -> int:
+    """The scheduled repair for everyone who has not switched the live check on.
+
+    Proving the block inside a running client means opening Spotify with a
+    debug port, watching it, and opening it again without one: two restarts in
+    a minute, and Spotify opens even when it was closed. That proof is for the
+    machine the block is developed on ("live_verify": true in config.json).
+    Everywhere else the patch is put back and nothing more: Spotify is closed
+    only when its file has to change, which is after it updated itself or after
+    Interceptify did, and it is reopened only if it was open."""
+    if not spotify_patcher.is_installed():
+        log.info("Spotify is not installed; nothing to repair")
+        return 0
+    if fp["patched"] and fp["payload_matches"] and fp["config_matches"]:
+        log.info("patch is in place on spotify %s; nothing to do", fp["spotify_version"])
+        return 0
+    was_running = spotify_patcher.is_spotify_running()
+    if was_running and not spotify_patcher.kill_spotify():
+        log.error("NOT REPAIRED: could not stop Spotify, and it holds xpui.spa open")
+        return 2
+    ok, msg = _patch_as_user()
+    problem = None if ok else msg
+    if ok:
+        problem = spotify_patcher.verify_patched_archive(spotify_patcher.spotify_xpui_path())
+    if was_running:
+        spotify_patcher.launch_spotify(9222 if _user_settings()["debug_capture"] else 0)
+    if problem:
+        log.error("NOT REPAIRED on spotify %s: %s", fp["spotify_version"], problem)
+        return 2
+    log.info("REPAIRED: patch put back on spotify %s (%s)", fp["spotify_version"],
+             "Spotify was open and has been reopened" if was_running else "Spotify was closed and stays closed")
+    return 0
 
 
 def record_recon(cdp) -> None:
@@ -1779,6 +1815,12 @@ def _run(force: bool = False, duration_ms: int = 12000) -> int:
         state["verified_pass"] = False
         save_state(state)
         return 2
+
+    # The live proof restarts Spotify twice. It runs where it was asked for
+    # (and for --force, which is typed by hand); a scheduled run on anyone
+    # else's machine only puts the patch back when the file needs it.
+    if not force and not _user_settings()["live_verify"]:
+        return repair_files_only(fp)
 
     if reason is None and not force:
         log.info("healthy — already verified; no new ad incidents")

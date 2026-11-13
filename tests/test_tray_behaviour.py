@@ -14,6 +14,9 @@ with it. Each case here is something that was observed NOT to hold:
   6. Task Scheduler killed the tray after one hour. The tray is no longer a
      scheduled task at all: it starts from the Windows startup entry.
   7. The packaged self-heal never wrote its log.
+ 13. Every scheduled repair restarted Spotify twice to prove the block live,
+     on every machine. That proof is now opt-in; a normal repair closes
+     Spotify once, and only when its file has to change.
 
 No network, no Spotify, nothing outside a temp directory.
 
@@ -108,6 +111,84 @@ def main() -> int:
         check("1c. ...and without the flag the run proceeds past the gate", went_on)
     finally:
         spotify_patcher.patch = real_patch
+
+    # ------------------------------------------------------------------- 13
+    # The live check (Spotify opened with a debug port, watched, opened again
+    # without one) runs only where it is switched on. Everyone else gets the
+    # patch put back: Spotify closes only when its file has to change, opens
+    # again only if it was open, and never on the verification port.
+    did: list = []
+    full: list = []
+    st8 = {"running": True, "problem": None,
+           "fp": {"spotify_version": "t", "patched": False,
+                  "payload_matches": False, "config_matches": False}}
+    saved8 = {n: getattr(spotify_patcher, n) for n in
+              ("patch", "is_installed", "is_spotify_running", "kill_spotify",
+               "launch_spotify", "verify_patched_archive", "spotify_xpui_path")}
+    saved_foreign = install_tasks.foreign_deployment_tasks
+
+    def full_cycle(*a, **k):
+        full.append(1)
+        raise Reached()
+
+    spotify_patcher.patch = lambda **kw: (did.append(("patch", kw["debug_capture"])) or (True, "patched"))
+    spotify_patcher.is_installed = lambda: True
+    spotify_patcher.is_spotify_running = lambda: st8["running"]
+    spotify_patcher.kill_spotify = lambda *a, **k: (did.append(("kill",)) or True)
+    spotify_patcher.launch_spotify = lambda port=0: (did.append(("launch", port)) or True)
+    spotify_patcher.verify_patched_archive = lambda p: st8["problem"]
+    spotify_patcher.spotify_xpui_path = lambda: tmp / "xpui.spa"
+    install_tasks.foreign_deployment_tasks = lambda: []
+    quiet = ("backfill_delivery_failures", "save_state", "note_block_change",
+             "delivery_block", "report_update")
+    saved_heal = {n: getattr(selfheal, n) for n in
+                  quiet + ("fingerprint", "harvest", "repair_and_verify")}
+    for name in quiet:
+        setattr(selfheal, name, lambda *a, **k: None)
+    selfheal.fingerprint = lambda: dict(st8["fp"])
+    selfheal.harvest = lambda *a, **k: 0
+    selfheal.repair_and_verify = full_cycle
+
+    def run8(settings: dict, force: bool = False):
+        did.clear(); full.clear()
+        cfg.write_text(json.dumps(settings), encoding="utf-8")
+        try:
+            return selfheal._run(force=force)
+        except Reached:
+            return "full cycle"
+
+    try:
+        rc = run8({})
+        check("13a. Spotify updated while open: one close, patch, one normal reopen, no live check",
+              rc == 0 and did == [("kill",), ("patch", False), ("launch", 0)] and not full, f"rc={rc} {did}")
+        st8["running"] = False
+        rc = run8({})
+        check("13b. Spotify updated while closed: patched, and Spotify is not opened",
+              rc == 0 and did == [("patch", False)] and not full, f"rc={rc} {did}")
+        st8["running"] = True
+        st8["fp"] = {"spotify_version": "t", "patched": True, "payload_matches": True, "config_matches": True}
+        rc = run8({})
+        check("13c. patch in place but never proven live: Spotify is not touched",
+              rc == 0 and not did and not full, f"rc={rc} {did}")
+        st8["fp"] = {"spotify_version": "t", "patched": False, "payload_matches": False, "config_matches": False}
+        st8["problem"] = "payload missing from index.html"
+        rc = run8({})
+        check("13d. a patch that does not check out is reported, and Spotify still comes back",
+              rc == 2 and did[-1] == ("launch", 0), f"rc={rc} {did}")
+        st8["problem"] = None
+        rc = run8({"debug_capture": True})
+        check("13e. the reopen keeps the user's debug-capture setting",
+              rc == 0 and did == [("kill",), ("patch", True), ("launch", 9222)], f"rc={rc} {did}")
+        rc = run8({"live_verify": True})
+        check("13f. with live_verify on, the full live check runs", rc == "full cycle" and not did, f"rc={rc} {did}")
+        rc = run8({}, force=True)
+        check("13g. --force runs the full live check whatever the setting", rc == "full cycle" and not did, f"rc={rc} {did}")
+    finally:
+        for n, f in saved8.items():
+            setattr(spotify_patcher, n, f)
+        install_tasks.foreign_deployment_tasks = saved_foreign
+        for n, f in saved_heal.items():
+            setattr(selfheal, n, f)
 
     # -------------------------------------------------------------------- 4
     inst = tmp / "Användare åäö" / "Interceptify"
