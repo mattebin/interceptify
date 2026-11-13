@@ -334,16 +334,31 @@ def main() -> int:
     check("5c. ...and no code path in the tray can raise one",
           ".icon.notify(" not in src and "icon.notify(" not in src, "main.py still calls icon.notify")
 
-    check("3a. automatic updates are on by default", a.cfg.get("auto_update") is True, str(a.cfg))
+    check("3a. automatic updates are off by default", a.cfg.get("auto_update") is False, str(a.cfg))
     installs = []
     a.install_update = lambda *x: installs.append(1)
+
+    class Rel0:
+        tag = "v9.9.8"
+
+    for label, setup in (("untouched", lambda: None), ("missing from an older config.json", lambda: a.cfg.pop("auto_update"))):
+        setup()
+        a._auto_update_tried = None
+        a._last_status = None
+        a._offer_or_install(Rel0())
+        check(f"3a. with the setting {label}, a release is announced on the status line and not installed",
+              installs == [] and a._last_status is not None and "v9.9.8" in a._last_status[0],
+              f"installs={installs} status={a._last_status}")
+    check("3a. ...and the menu box is not ticked", bool(a.cfg.get("auto_update", False)) is False)
+    a.cfg["auto_update"] = True
+    a._auto_update_tried = None
 
     class Rel:
         tag = "v9.9.9"
 
     a._last_status = None
     a._offer_or_install(Rel())
-    check("3b. a newer release is installed, not just announced",
+    check("3b. with the box ticked, a newer release is installed, not just announced",
           installs == [1] and a._last_status is None, f"installs={installs} status={a._last_status}")
     a._offer_or_install(Rel())
     check("3c. the same release is not retried every poll; the status line says it is waiting",

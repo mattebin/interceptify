@@ -271,10 +271,10 @@ def xpui_write_problem() -> Optional[str]:
 DEFAULT_CONFIG = {
     "show_badge": True,
     "debug_capture": False,
-    # Install new releases without being asked. A release usually exists
-    # because a Spotify update broke something, and a tray that only shows a
-    # toast nobody sees leaves the broken build in place.
-    "auto_update": True,
+    # Installing new releases without being asked is the user's choice, so it
+    # is off until they tick it. Without it the status line, the tooltip and
+    # an Install item in the menu say that a release exists.
+    "auto_update": False,
 }
 
 
@@ -581,7 +581,7 @@ class InterceptifyApp:
         """Install a newer release now, or say it exists when the user turned
         automatic updates off. Tried once per release per run, so a blocked or
         failing update does not repeat its toast every six hours."""
-        if bool(self.cfg.get("auto_update", True)) and self._auto_update_tried != rel.tag:
+        if bool(self.cfg.get("auto_update", False)) and self._auto_update_tried != rel.tag:
             self._auto_update_tried = rel.tag
             self.install_update()
         else:
@@ -607,7 +607,7 @@ class InterceptifyApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def toggle_auto_update(self, *_args) -> None:
-        self.cfg["auto_update"] = not bool(self.cfg.get("auto_update", True))
+        self.cfg["auto_update"] = not bool(self.cfg.get("auto_update", False))
         save_config(self.cfg)
         self.refresh_icon()
 
@@ -883,7 +883,7 @@ class InterceptifyApp:
             Item(
                 "Update automatically",
                 self.toggle_auto_update,
-                checked=lambda item: bool(self.cfg.get("auto_update", True)),
+                checked=lambda item: bool(self.cfg.get("auto_update", False)),
             ),
             Menu.SEPARATOR,
             Item(
