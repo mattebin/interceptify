@@ -22,7 +22,7 @@ extensions/adblock.config.local.json
 # ever turn off our own change.
 .interceptify-devtools-owned
 
-# Capture artifacts written by cdp_capture.py / cdp_netlog.py / Wireshark
+# Capture files from debugging sessions
 capture_*.json
 netlog_*.jsonl
 *.pcapng

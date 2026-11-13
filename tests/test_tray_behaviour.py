@@ -466,10 +466,10 @@ def main() -> int:
     hook_dead = {"t": 2000, "kind": "l1-hook-dead", "id": "l1", "gate": {"closed": True}}
     spec_mute = {"t": 2001, "kind": "speculative-mute", "gate": {"closed": True}}
     delivered = {"t": 2002, "kind": "delivered", "id": "ad-1", "gate": {"closed": True}}
-    saved_h = (selfheal.read_incidents_from_disk, selfheal._vault_append)
+    saved_h = (selfheal.read_incidents_from_disk, selfheal._incident_log_append)
     written: list[str] = []
     try:
-        selfheal._vault_append = lambda lines: written.extend(lines)
+        selfheal._incident_log_append = lambda lines: written.extend(lines)
         selfheal.read_incidents_from_disk = lambda: [hook_dead, spec_mute]
         st: dict = {}
         n = selfheal.harvest("1.3.9", st)
@@ -482,7 +482,7 @@ def main() -> int:
         n = selfheal.harvest("1.3.9", {})
         check("9c. a real delivery next to a diagnostic still counts, once", n == 1, f"n={n}")
     finally:
-        selfheal.read_incidents_from_disk, selfheal._vault_append = saved_h
+        selfheal.read_incidents_from_disk, selfheal._incident_log_append = saved_h
 
     # ------------------------------------------------- 10: gate-key repair
     yes = ["ad_enabled", "ads_enabled", "enable-ads", "adEnabled", "enableAds", "AD_ENABLED"]

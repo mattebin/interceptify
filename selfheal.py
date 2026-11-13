@@ -650,31 +650,30 @@ def _incident_log_path() -> Path | None:
         return None
 
 
-VAULT_NOTE = _incident_log_path()
+INCIDENT_LOG = _incident_log_path()
 
 # Spotify is Chromium: localStorage lives in a LevelDB on disk. Reading it there
 # means an incident can be collected with Spotify closed and no debug port, which
 # is the whole point - the previous harvester needed a live CDP session and so
 # could only run during a verification it had already decided to skip.
-def _vault_append(lines: list[str]) -> None:
-    """Short, append-only log so a new session (or /vault) can see what happened."""
-    if not lines or VAULT_NOTE is None:
+def _incident_log_append(lines: list[str]) -> None:
+    """Short, append-only log of what self-heal saw and did. Off unless a path is configured."""
+    if not lines or INCIDENT_LOG is None:
         return
     try:
-        VAULT_NOTE.parent.mkdir(parents=True, exist_ok=True)
-        if not VAULT_NOTE.exists():
-            VAULT_NOTE.write_text(
-                "---\ntags: [project, interceptify, spotify, monitoring]\nproject: Interceptify\n---\n\n"
-                "# Interceptify — ad incidents & self-heal log\n\n"
-                "Appended automatically by `selfheal.py` (local only). An **AD DELIVERED** line means an\n"
-                "ad actually reached the client — that is a block failure worth investigating.\n\n",
+        INCIDENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if not INCIDENT_LOG.exists():
+            INCIDENT_LOG.write_text(
+                "# Interceptify: ad incidents and self-heal log\n\n"
+                "Appended automatically by self-heal (local only). An **AD DELIVERED** line means an\n"
+                "ad actually reached the client. That is a block failure worth investigating.\n\n",
                 encoding="utf-8",
             )
-        with VAULT_NOTE.open("a", encoding="utf-8") as f:
+        with INCIDENT_LOG.open("a", encoding="utf-8") as f:
             for ln in lines:
                 f.write(ln.rstrip() + "\n")
     except Exception as e:
-        log.warning("vault append failed: %s", e)
+        log.warning("incident log append failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -834,14 +833,14 @@ def is_expected_incident(it: dict) -> bool:
     """True when selftest opened the gate on purpose to prove its ad trigger works.
 
     Such an ad is the verification succeeding, not the block failing. Reporting
-    it as a failure would put a false alarm in the vault on every verified run,
+    it as a failure would put a false alarm in the incident log on every verified run,
     which is how a log becomes something you stop reading.
     """
     return bool((it.get("gate") or {}).get("suspended"))
 
 
 def _incident_line(it: dict, spotify_ver: str) -> str:
-    """One vault line. The gate snapshot is taken AT DELIVERY by the payload, so
+    """One incident log line. The gate snapshot is taken AT DELIVERY by the payload, so
     the line says whether the block was up when the ad arrived - an incident that
     only says "an ad happened" cannot be acted on later."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime((it.get("t") or 0) / 1000))
@@ -887,13 +886,13 @@ def harvest(spotify_ver: str, state: dict) -> int:
     fresh = [i for i in items if int(i.get("t") or 0) > mark]
     if not fresh:
         return 0
-    _vault_append([_incident_line(i, spotify_ver) for i in fresh])
+    _incident_log_append([_incident_line(i, spotify_ver) for i in fresh])
     # Advance past everything seen, expected or not, so nothing is reported twice.
     state["incident_watermark"] = max(int(i["t"]) for i in fresh)
     real = [i for i in fresh if is_ad_incident(i) and not is_expected_incident(i)]
     if real:
         log.warning("harvested %d ad incident(s), %d of them real block failures -> %s",
-                    len(fresh), len(real), VAULT_NOTE)
+                    len(fresh), len(real), INCIDENT_LOG)
     else:
         log.info("harvested %d expected self-test ad(s); no block failures", len(fresh))
     return len(real)
@@ -1253,20 +1252,20 @@ def blocked_by_pending(fp: dict, pending: dict | None, force: bool) -> bool:
 
 def report_update(fp: dict, state: dict, reason: str) -> None:
     """Log the DISCOVERY of a change (Spotify update / patch wiped / payload swapped)
-    the moment we notice it — before any repair — so the vault shows what happened."""
+    the moment we notice it, before any repair, so the incident log shows what happened."""
     ts = time.strftime("%Y-%m-%d %H:%M")
     prev = state.get("verified_spotify_version")
     now = fp.get("spotify_version")
     if prev and now and prev != now:
-        _vault_append([f"- {ts} — 🔄 **SPOTIFY UPDATED** `{prev}` -> `{now}` "
+        _incident_log_append([f"- {ts} - 🔄 **SPOTIFY UPDATED** `{prev}` -> `{now}` "
                        f"(patch wiped by the update; self-heal re-patching + verifying)"])
     elif not fp.get("patched"):
-        _vault_append([f"- {ts} — 🔄 **PATCH MISSING** on spotify `{now}` — re-patching ({reason})"])
+        _incident_log_append([f"- {ts} - 🔄 **PATCH MISSING** on spotify `{now}` - re-patching ({reason})"])
     elif not fp.get("payload_matches"):
-        _vault_append([f"- {ts} — 🔄 **PAYLOAD DRIFT** on spotify `{now}` — live payload is not ours "
+        _incident_log_append([f"- {ts} - 🔄 **PAYLOAD DRIFT** on spotify `{now}` - live payload is not ours "
                        f"(something else re-patched); restoring + verifying"])
     else:
-        _vault_append([f"- {ts} — 🔄 re-verifying on spotify `{now}` ({reason})"])
+        _incident_log_append([f"- {ts} - 🔄 re-verifying on spotify `{now}` ({reason})"])
 
 
 def report_run(verdict: str, spotify_ver: str, reason: str | None, detail: dict | None) -> None:
@@ -1274,11 +1273,11 @@ def report_run(verdict: str, spotify_ver: str, reason: str | None, detail: dict 
     ts = time.strftime("%Y-%m-%d %H:%M")
     d = detail or {}
     if verdict == "PASS":
-        _vault_append([f"- {ts} — self-heal **verified OK** on spotify `{spotify_ver}` "
+        _incident_log_append([f"- {ts} - self-heal **verified OK** on spotify `{spotify_ver}` "
                        f"(trigger: {reason or 'forced'}; gate=`{d.get('gateKeys')}` "
                        f"toggle={d.get('toggleProven')} reassert={d.get('reassertProven')})"])
     else:
-        _vault_append([f"- {ts} — ⚠️ self-heal **NOT VERIFIED** on spotify `{spotify_ver}` "
+        _incident_log_append([f"- {ts} - ⚠️ self-heal **NOT VERIFIED** on spotify `{spotify_ver}` "
                        f"(trigger: {reason or 'forced'}) — reasons: {d.get('reasons')}"])
 
 
@@ -1738,7 +1737,7 @@ def _run(force: bool = False, duration_ms: int = 12000) -> int:
                    f"release is {gap['published']}. The fix is not in any binary a "
                    f"user can download - check the release workflow actually ran.")
             log.error(msg)
-            _vault_append([f"- {time.strftime('%Y-%m-%d %H:%M')} — 🚧 **{msg}**"])
+            _incident_log_append([f"- {time.strftime('%Y-%m-%d %H:%M')} - 🚧 **{msg}**"])
         elif gap["status"] == "unknown":
             log.info("publish check skipped (%s)", gap["detail"] or "no answer")
     except Exception as e:
@@ -1872,7 +1871,7 @@ def _run(force: bool = False, duration_ms: int = 12000) -> int:
     try:
         report_update(fp, state, reason or "forced run")
     except Exception as e:
-        log.warning("vault update report: %s", e)
+        log.warning("incident log update: %s", e)
     report = repair_and_verify(duration_ms=duration_ms)
     fp2 = fingerprint()
     # Resolved against the POST-repair fingerprint: a repair that genuinely
@@ -1902,7 +1901,7 @@ def _run(force: bool = False, duration_ms: int = 12000) -> int:
     try:
         report_run(report.get("verdict", "FAIL"), fp2["spotify_version"], reason, final)
     except Exception as e:
-        log.warning("vault report: %s", e)
+        log.warning("incident log report: %s", e)
     if verdict == "UNRESOLVED":
         # Exit 3 whether or not the structural test passed. The scheduled task
         # records the day it mattered, not a clean run.
