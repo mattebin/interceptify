@@ -76,10 +76,11 @@ def build_old_exe(work: Path) -> Path:
 
 def trays_in(folder: Path) -> list[int]:
     """Process ids of Interceptify.exe running from this folder."""
-    cmd = ("Get-CimInstance Win32_Process -Filter \"Name='Interceptify.exe'\" | "
+    cmd = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+           "Get-CimInstance Win32_Process -Filter \"Name='Interceptify.exe'\" | "
            "ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.ExecutablePath }")
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                       capture_output=True, text=True, creationflags=NOWIN)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NOWIN)
     out = []
     for line in r.stdout.splitlines():
         pid, _, path = line.partition("|")
