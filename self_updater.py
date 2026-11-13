@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import re
+import subprocess
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -296,3 +297,24 @@ start "" "{target_exe}"
 del "%~f0"
 """
     bat_path.write_text(script, encoding="utf-8")
+
+
+def launch_updater_bat(bat_path: Path) -> "subprocess.Popen":
+    """Start the update script so that nothing ever shows on screen.
+
+    CREATE_NO_WINDOW gives cmd one hidden console, and every command in the
+    script (tasklist, findstr, certutil, ping) shares it. Up to 2.0.7 the script
+    was started with DETACHED_PROCESS instead, which gives cmd no console at
+    all, so each of those commands opened a console of its own: on Windows 11 a
+    Terminal window per command, and the first one (findstr, reading a pipe)
+    could sit there forever with the tray already gone.
+
+    The tray and the tests both start the script through this function, so what
+    is tested is what runs."""
+    return subprocess.Popen(
+        ["cmd", "/c", str(bat_path)],
+        cwd=str(Path(bat_path).parent),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=0x08000000 | 0x00000200,   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        close_fds=True,
+    )

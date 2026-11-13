@@ -704,11 +704,7 @@ class InterceptifyApp:
                 self.notify(f"Updater script failed: {e}")
                 return
             self.notify(f"Installing {rel.tag} - the app will restart in a few seconds.")
-            subprocess.Popen(
-                ["cmd", "/c", str(bat)],
-                creationflags=0x00000008 | 0x00000200,
-                close_fds=True,
-            )
+            self_updater.launch_updater_bat(bat)
         except Exception as e:
             self.notify(f"Updater launch failed: {e}")
             return
