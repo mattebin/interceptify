@@ -271,6 +271,10 @@ def xpui_write_problem() -> Optional[str]:
 DEFAULT_CONFIG = {
     "show_badge": True,
     "debug_capture": False,
+    # Install new releases without being asked. A release usually exists
+    # because a Spotify update broke something, and a tray that only shows a
+    # toast nobody sees leaves the broken build in place.
+    "auto_update": True,
 }
 
 
@@ -320,8 +324,10 @@ def make_icon(active: bool) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 class InterceptifyApp:
-    def __init__(self) -> None:
+    def __init__(self, post_update: bool = False) -> None:
         self.cfg = load_config()
+        self._post_update = post_update
+        self._auto_update_tried: Optional[str] = None
         self.icon: Optional[pystray.Icon] = None
         self._latest_release: Optional[self_updater.Release] = None
         self._update_in_progress = False
@@ -348,9 +354,12 @@ class InterceptifyApp:
 
     def notify(self, msg: str, title: str = APP_NAME) -> None:
         log.info("NOTIFY: %s", msg)
+        # Windows rejects a balloon text over 255 characters outright, so the
+        # longest warnings were the ones that never appeared.
+        shown = msg if len(msg) <= 250 else msg[:247] + "..."
         try:
             if self.icon is not None:
-                self.icon.notify(msg, title)
+                self.icon.notify(shown, title)
         except Exception as e:
             log.warning("Notify failed: %s -- %s", e, msg)
 
@@ -418,6 +427,7 @@ class InterceptifyApp:
             log.info("patch_spotify: ok=%s msg=%s", ok, msg)
             self.notify(msg)
             if ok:
+                self._set_user_unpatched(False)
                 spotify_patcher.launch_spotify(remote_debug_port=self._spotify_debug_port())
             self.refresh_icon()
         threading.Thread(target=worker, daemon=True).start()
@@ -432,9 +442,17 @@ class InterceptifyApp:
             log.info("unpatch_spotify: ok=%s msg=%s", ok, msg)
             self.notify(msg)
             if ok:
+                # Recorded so the scheduled self-heal leaves it unpatched.
+                self._set_user_unpatched(True)
                 spotify_patcher.launch_spotify(remote_debug_port=self._spotify_debug_port())
             self.refresh_icon()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _set_user_unpatched(self, value: bool) -> None:
+        if bool(self.cfg.get("user_unpatched", False)) == value:
+            return
+        self.cfg["user_unpatched"] = value
+        save_config(self.cfg)
 
     def toggle(self, *_args) -> None:
         if self._is_active():
@@ -513,13 +531,80 @@ class InterceptifyApp:
                     if self._latest_release is None or self._latest_release.tag != rel.tag:
                         log.info("Update available: %s (current %s)", rel.tag, APP_VERSION)
                         self._set_latest_release(rel)
-                        self.notify(
-                            f"Update {rel.tag} available. Click 'Install update' in the tray menu.",
-                        )
+                        self._offer_or_install(rel)
                 else:
                     self._set_latest_release(None)
             except Exception as e:
                 log.warning("Update poll failed: %s", e)
+
+    def _offer_or_install(self, rel: "self_updater.Release") -> None:
+        """Install a newer release now, or say it exists when the user turned
+        automatic updates off. Tried once per release per run, so a blocked or
+        failing update does not repeat its toast every six hours."""
+        if bool(self.cfg.get("auto_update", True)) and self._auto_update_tried != rel.tag:
+            self._auto_update_tried = rel.tag
+            self.install_update()
+        else:
+            self.notify(f"Update {rel.tag} available. Click 'Install update' in the tray menu.")
+
+    def check_updates_now(self, *_args) -> None:
+        def worker():
+            if not is_frozen_build():
+                self.notify("Running from source: update with git pull.")
+                return
+            try:
+                rel = self_updater.get_latest_release()
+            except Exception as e:
+                self.notify(f"Could not check for updates: {e}")
+                return
+            if rel and self_updater.is_newer(rel.tag, APP_VERSION):
+                self._set_latest_release(rel)
+                self._auto_update_tried = None       # an explicit check always tries
+                self._offer_or_install(rel)
+            else:
+                self._set_latest_release(None)
+                self.notify(f"Interceptify {APP_VERSION} is the latest version.")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def toggle_auto_update(self, *_args) -> None:
+        self.cfg["auto_update"] = not bool(self.cfg.get("auto_update", True))
+        save_config(self.cfg)
+        self.refresh_icon()
+
+    def _apply_update_to_spotify(self) -> None:
+        """After an update, put the NEW payload into Spotify. Replacing the exe
+        changed nothing in the client: Spotify kept running the previous
+        payload until the next scheduled self-heal, so "updated" was true of
+        the tray and false of the thing the update was for."""
+        try:
+            if bool(self.cfg.get("user_unpatched", False)):
+                return
+            if not spotify_patcher.is_installed() or not spotify_patcher.is_patched():
+                return
+            live = spotify_patcher.inline_payload_sha_of(spotify_patcher.spotify_xpui_path())
+            ours = spotify_patcher.our_payload_sha()
+            if not ours or live == ours:
+                return
+            was_running = spotify_patcher.is_spotify_running()
+            if was_running:
+                spotify_patcher.kill_spotify()
+                time.sleep(2)
+            problem = xpui_write_problem()
+            if problem:
+                self.notify(f"Updated to {APP_VERSION}, but Spotify could not be re-patched: {problem}")
+                return
+            ok, msg = spotify_patcher.patch(
+                show_badge=self._current_show_badge(),
+                debug_capture=self._current_debug_capture(),
+            )
+            log.info("post-update re-patch: ok=%s msg=%s", ok, msg)
+            if ok and was_running:
+                spotify_patcher.launch_spotify(remote_debug_port=self._spotify_debug_port())
+            self.notify(f"Updated to {APP_VERSION} and applied it to Spotify." if ok
+                        else f"Updated to {APP_VERSION}, but re-patching failed: {msg}")
+            self.refresh_icon()
+        except Exception as e:
+            log.warning("post-update re-patch failed: %s", e)
 
     def install_update(self, *_args) -> None:
         if self._update_in_progress:
@@ -730,6 +815,12 @@ class InterceptifyApp:
                 update_label, self.install_update,
                 visible=lambda item: self._latest_release is not None,
             ),
+            Item(f"Check for updates (now {APP_VERSION})", self.check_updates_now),
+            Item(
+                "Update automatically",
+                self.toggle_auto_update,
+                checked=lambda item: bool(self.cfg.get("auto_update", True)),
+            ),
             Menu.SEPARATOR,
             Item(
                 "Show status dot in Spotify",
@@ -782,6 +873,8 @@ class InterceptifyApp:
         # moment someone is looking at it.
         def _startup_warnings() -> None:
             time.sleep(2.0)
+            if self._post_update:
+                self._apply_update_to_spotify()
             if spotify_patcher.PAYLOAD_SYNC_ERROR:
                 self.notify(spotify_patcher.PAYLOAD_SYNC_ERROR)
             warn = self._deployment_warning()
@@ -840,7 +933,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if argv and argv[0] in ("--version", "-V"):
         print(f"{APP_NAME} {APP_VERSION}")
         return 0
-    InterceptifyApp().run()
+    # The updater relaunches with --updated so the new build knows to put its
+    # payload into Spotify instead of waiting for the next scheduled run.
+    InterceptifyApp(post_update=bool(argv and argv[0] == "--updated")).run()
     return 0
 
 

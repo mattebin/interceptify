@@ -166,7 +166,13 @@ def task_xml(cmd: str, trigger: str, at: str = "") -> str:
         "<AllowHardTerminate>true</AllowHardTerminate>"
         f"<StartWhenAvailable>{WANT_SETTINGS['StartWhenAvailable']}</StartWhenAvailable>"
         "<Enabled>true</Enabled>"
-        "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>"
+        # The tray is meant to run for the whole session. Under the one-hour
+        # limit Task Scheduler killed its bootloader after an hour; the tray
+        # only survived as an orphaned child. Self-heal runs keep the limit.
+        f"<ExecutionTimeLimit>{'PT0S' if cmd == tray_command() else 'PT1H'}</ExecutionTimeLimit>"
+        # Task Scheduler's default is 7 (below normal), and a Spotify started
+        # by self-heal inherited it.
+        "<Priority>4</Priority>"
     )
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
@@ -231,6 +237,7 @@ def describe(name: str) -> dict | None:
         "command": _tag(x, "Command"),
         "arguments": _tag(x, "Arguments"),
         "level": _tag(x, "RunLevel"),
+        "limit": _tag(x, "ExecutionTimeLimit"),
         "userid": _tag(x, "UserId"),
         "triggers": triggers,
         # The trigger ELEMENTS, e.g. ["LogonTrigger"]. StartBoundary inside a
@@ -342,6 +349,8 @@ def wrong_with(got: dict | None, cmd: str, trigger: str = "") -> list[str]:
         problems.append(f"arguments are {got.get('arguments')!r}, expected {want_args!r}")
     if trigger and trigger not in (got.get("trigger_kinds") or []):
         problems.append(f"trigger is {got.get('trigger_kinds') or '(none)'}, expected {trigger}")
+    if cmd == tray_command() and (got.get("limit") or "") not in ("PT0S",):
+        problems.append(f"is stopped by Task Scheduler after {got.get('limit') or 'its default limit'}")
     # A task that is defined correctly and cannot RUN is not a correct task. The
     # power conditions were never inspected, so a self-heal Windows was actively
     # refusing looked identical to one that had been working all along.

@@ -163,15 +163,23 @@ DELIVERY_CLEAR_AFTER_S = 24 * 3600
 # Rotated, not unbounded. Four scheduled runs a day writing to one file forever
 # is a log that eventually costs more than it tells you, and nothing was ever
 # going to prune it.
+_LOG_FORMAT = "%(asctime)s %(levelname)s: %(message)s"
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-    handlers=[
-        logging.handlers.RotatingFileHandler(
-            LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    format=_LOG_FORMAT,
+    handlers=[_file_handler, logging.StreamHandler()],
 )
+# basicConfig does nothing once the root logger has a handler, and in the
+# packaged build main.py has already configured one by the time this module is
+# imported. The file handler was then never attached and selfheal.log stayed at
+# 0 bytes after real runs. Attach it explicitly.
+_root_logger = logging.getLogger()
+if _file_handler not in _root_logger.handlers:
+    _file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    _root_logger.addHandler(_file_handler)
+    _root_logger.setLevel(logging.INFO)
 log = logging.getLogger("selfheal")
 
 
@@ -551,6 +559,32 @@ def wait_for_connector(cdp: CDP, timeout: int = 60) -> bool:
 #   INTERCEPTIFY_INCIDENT_LOG=<path>   environment, or
 #   {"incident_log": "<path>"}         in config.json
 # --------------------------------------------------------------------------
+
+def _user_settings() -> dict:
+    """What the user chose in the tray. Self-heal used to ignore all of it: it
+    re-patched after an explicit Unpatch, turned the status dot back on and
+    switched debug capture off, because it only ever called patch() with its
+    own defaults."""
+    out = {"show_badge": True, "debug_capture": False, "user_unpatched": False}
+    try:
+        cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        for k in out:
+            if k in cfg:
+                out[k] = bool(cfg[k])
+    except Exception:
+        pass
+    return out
+
+
+def _patch_as_user(debug_capture: bool | None = None):
+    """patch() with the user's status-dot setting. `debug_capture` is forced by
+    the verification rounds (they must not leave the sniffer on) and follows
+    the user's setting everywhere else."""
+    s = _user_settings()
+    return spotify_patcher.patch(
+        show_badge=s["show_badge"],
+        debug_capture=s["debug_capture"] if debug_capture is None else debug_capture)
+
 
 def _incident_log_path() -> Path | None:
     env = os.environ.get("INTERCEPTIFY_INCIDENT_LOG", "").strip()
@@ -1356,7 +1390,7 @@ def repair_and_verify(max_rounds: int = 3, duration_ms: int = 12000) -> dict:
         if not spotify_patcher.kill_spotify():
             report["rounds"].append({"round": rnd, "error": "could not stop Spotify; it holds xpui.spa open"})
             continue
-        ok, msg = spotify_patcher.patch(debug_capture=False)
+        ok, msg = _patch_as_user(debug_capture=False)
         log.info("patch: %s %s", ok, msg)
         if not ok:
             report["rounds"].append({"round": rnd, "error": f"patch failed: {msg}"})
@@ -1429,11 +1463,12 @@ def repair_and_verify(max_rounds: int = 3, duration_ms: int = 12000) -> dict:
     if report["verdict"] != "PASS":
         restore_config(config_before, f"cycle ended {report['verdict']} — no candidate was proven")
 
-    # leave the user on a clean, non-debug Spotify
+    # leave the user on the Spotify they configured: no debug port unless
+    # they turned debug capture on in the tray, which uses 9222
     try:
         spotify_patcher.kill_spotify()
-        spotify_patcher.patch(debug_capture=False)
-        restart_spotify(0)
+        _patch_as_user()
+        restart_spotify(9222 if _user_settings()["debug_capture"] else 0)
     except Exception as e:
         log.warning("final clean relaunch: %s", e)
 
@@ -1554,7 +1589,7 @@ def selftest_now(duration_ms: int = 12000, allow_restart: bool = False) -> dict:
                 "restarted": False,
             }
         spotify_patcher.kill_spotify()
-        spotify_patcher.patch(debug_capture=False)
+        _patch_as_user(debug_capture=False)
         restart_spotify(CDP_PORT)
         restarted = True
 
@@ -1628,6 +1663,12 @@ def _run(force: bool = False, duration_ms: int = 12000) -> int:
     reason = drift_reason(fp, state)
     log.info("spotify=%s patched=%s payload_match=%s config_match=%s",
              fp["spotify_version"], fp["patched"], fp["payload_matches"], fp["config_matches"])
+
+    # The tray says "Unpatch Spotify (stop blocking ads)". A scheduled run that
+    # puts the patch back a few hours later makes that menu item a lie.
+    if not force and _user_settings()["user_unpatched"]:
+        log.info("the user chose Unpatch in the tray; leaving Spotify alone until they patch again")
+        return 0
 
     # ALWAYS harvest first. An ad getting through is exactly the case where the
     # fingerprint is unchanged and the health check says "nothing to do", so

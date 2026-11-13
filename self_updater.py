@@ -246,6 +246,12 @@ def write_updater_bat(bat_path: Path, current_pid: int, new_exe: Path,
     about the bytes that actually get installed. certutil is used because it is
     present on every supported Windows and this runs after our process is gone.
     """
+    # This script runs detached with no window, after the app has exited. It
+    # used to `pause` on failure, which waited forever on a console nobody could
+    # see and never brought the tray back. Every path now ends with the tray
+    # running again (old build on failure, new build on success) and one line
+    # in update.log saying which.
+    log_path = bat_path.with_name("update.log")
     guard = ""
     if expected_sha256:
         want = expected_sha256.lower()
@@ -257,13 +263,18 @@ for /f "skip=1 tokens=* delims=" %%H in ('certutil -hashfile "{new_exe}" SHA256'
 )
 set "GOT=%GOT: =%"
 if /I not "%GOT%"=="%WANT%" (
-    echo Refusing to install: SHA-256 of the downloaded build does not match.
+    echo %DATE% %TIME% refused: SHA-256 of the downloaded build does not match >> "{log_path}"
     del "{new_exe}" >NUL 2>&1
-    pause
+    start "" "{target_exe}"
+    del "%~f0"
     exit /b 1
 )
 """
+    # chcp 65001 so cmd reads the rest of this UTF-8 file as UTF-8: a detached
+    # cmd otherwise decodes it in the OEM codepage and an install path with a
+    # non-ASCII character names a file that does not exist.
     script = f"""@echo off
+chcp 65001 >NUL
 setlocal enabledelayedexpansion
 set PID={current_pid}
 :waitloop
@@ -275,11 +286,13 @@ if not errorlevel 1 (
 {guard}
 move /Y "{new_exe}" "{target_exe}" >NUL 2>&1
 if errorlevel 1 (
-    echo Failed to replace exe -- new build left at "{new_exe}"
-    pause
+    echo %DATE% %TIME% failed to replace the exe, new build left at "{new_exe}" >> "{log_path}"
+    start "" "{target_exe}"
+    del "%~f0"
     exit /b 1
 )
-start "" "{target_exe}"
+echo %DATE% %TIME% updated >> "{log_path}"
+start "" "{target_exe}" --updated
 del "%~f0"
 """
     bat_path.write_text(script, encoding="utf-8")

@@ -76,6 +76,11 @@ jobs:
       - name: A version nobody can download must be reported, not assumed shipped
         run: python tests/test_publish_gap.py
 
+      # The menu has to mean what it says: Unpatch stays unpatched, an update
+      # installs and reaches Spotify, the updater never hangs out of sight.
+      - name: The tray does what its menu says
+        run: python tests/test_tray_behaviour.py
+
       # Applies to MANUAL runs too, via the required `version` input.
       - name: Version consistency (tag/input vs APP_VERSION vs manifest)
         run: python tests/test_version_consistency.py "${{ github.event.inputs.version || github.ref_name }}"
