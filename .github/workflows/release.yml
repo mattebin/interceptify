@@ -81,6 +81,11 @@ jobs:
       - name: The tray does what its menu says
         run: python tests/test_tray_behaviour.py
 
+      # Runs the real updater script through the real cmd: a good swap, a
+      # tampered download, a locked exe. Reading the script proves nothing.
+      - name: The updater script ends with the tray running, whatever happens
+        run: python tests/test_updater_script.py
+
       # Applies to MANUAL runs too, via the required `version` input.
       - name: Version consistency (tag/input vs APP_VERSION vs manifest)
         run: python tests/test_version_consistency.py "${{ github.event.inputs.version || github.ref_name }}"

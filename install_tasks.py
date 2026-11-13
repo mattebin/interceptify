@@ -56,7 +56,14 @@ else:
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "Interceptify"
 
+# The tray is NOT a scheduled task. It is a program that runs for the whole
+# session and ends only when the user quits it, so it is started the way
+# Windows starts such programs: the per-user Run entry. Task Scheduler is for
+# jobs, and it ended the tray after its one-hour execution limit.
+# TRAY_TASK is the name of the task older versions registered, kept only so it
+# can be found and removed.
 TRAY_TASK = "Interceptify Tray"
+TRAY_ENTRY = "tray"
 HEAL_TASK = "Interceptify SelfHeal"
 
 
@@ -96,9 +103,8 @@ def heal_command() -> str:
 
 def tasks() -> list[tuple[str, str, list[str], str]]:
     """(name, command line, schtasks schedule args, expected trigger element)."""
-    tray, heal = tray_command(), heal_command()
+    heal = heal_command()
     return [
-        (TRAY_TASK, tray, ["/SC", "ONLOGON"], "LogonTrigger"),
         (HEAL_TASK, heal, ["/SC", "ONLOGON"], "LogonTrigger"),
         (f"{HEAL_TASK} (morning)", heal, ["/SC", "DAILY", "/ST", "08:00"], "CalendarTrigger"),
         (f"{HEAL_TASK} (night)", heal, ["/SC", "DAILY", "/ST", "21:00"], "CalendarTrigger"),
@@ -166,10 +172,9 @@ def task_xml(cmd: str, trigger: str, at: str = "") -> str:
         "<AllowHardTerminate>true</AllowHardTerminate>"
         f"<StartWhenAvailable>{WANT_SETTINGS['StartWhenAvailable']}</StartWhenAvailable>"
         "<Enabled>true</Enabled>"
-        # The tray is meant to run for the whole session. Under the one-hour
-        # limit Task Scheduler killed its bootloader after an hour; the tray
-        # only survived as an orphaned child. Self-heal runs keep the limit.
-        f"<ExecutionTimeLimit>{'PT0S' if cmd == tray_command() else 'PT1H'}</ExecutionTimeLimit>"
+        # A self-heal run takes under a minute. The limit is a backstop for a
+        # run that hangs, which is the only kind of process these tasks start.
+        "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>"
         # Task Scheduler's default is 7 (below normal), and a Spotify started
         # by self-heal inherited it.
         "<Priority>4</Priority>"
@@ -354,8 +359,6 @@ def wrong_with(got: dict | None, cmd: str, trigger: str = "") -> list[str]:
     # process the task starts inherits - including a Spotify self-heal relaunches.
     if (got.get("priority") or "7") != "4":
         problems.append(f"runs at below-normal priority ({got.get('priority') or '7'})")
-    if cmd == tray_command() and (got.get("limit") or "") not in ("PT0S",):
-        problems.append(f"is stopped by Task Scheduler after {got.get('limit') or 'its default limit'}")
     # A task that is defined correctly and cannot RUN is not a correct task. The
     # power conditions were never inspected, so a self-heal Windows was actively
     # refusing looked identical to one that had been working all along.
@@ -387,6 +390,12 @@ def foreign_deployment_tasks() -> list[tuple[str, str]]:
             continue
         if _looks_frozen(got["command"]) != mine_frozen:
             out.append((name, f"{got['command']} {got['arguments']}".strip()))
+    legacy = describe(TRAY_TASK)
+    if legacy and legacy.get("command") and _looks_frozen(legacy["command"]) != mine_frozen:
+        out.append((TRAY_TASK, f"{legacy['command']} {legacy['arguments']}".strip()))
+    run = run_key_value()
+    if run and _looks_frozen(_split_command(run)[0]) != mine_frozen:
+        out.append(("startup entry", run))
     return out
 
 
@@ -418,7 +427,14 @@ def status() -> int:
         if ran:
             print(f"      last run {ran}, result {res}")
     v = run_key_value()
-    print(f"  HKCU Run: {v}  <-- competing autostart" if v else "  HKCU Run: absent (good)")
+    if not v:
+        print("  Tray at login: off")
+    elif tray_autostart_on():
+        print(f"  Tray at login: on  ({v})")
+    else:
+        print(f"  Tray at login: {v}  <-- starts a different install")
+    if describe(TRAY_TASK) is not None:
+        print(f"  {TRAY_TASK}: leftover scheduled task from an older version  <-- ends the tray after its time limit")
     foreign = foreign_deployment_tasks()
     if foreign:
         print("\n  SPLIT DEPLOYMENT — these run the other model and can re-patch with a different payload:")
@@ -427,28 +443,58 @@ def status() -> int:
     return 1 if foreign else 0
 
 
-def remove_run_key() -> None:
-    """Drop the HKCU Run entry.
+def tray_autostart_on() -> bool:
+    """True when the startup entry launches THIS install's tray."""
+    v = run_key_value()
+    if not v:
+        return False
+    got_exe, got_args = _split_command(v)
+    want_exe, want_args = _split_command(tray_command())
+    return _same_path(got_exe, want_exe) and _same_args(got_args, want_args)
 
-    It is a second, independent autostart for the same app. Two of them means
-    two trays, both patching, and the survivor is whichever won the race.
-    """
+
+def set_run_key() -> bool:
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, tray_command())
+        print("  tray starts at login (startup entry)")
+        return True
+    except OSError as e:
+        print(f"  could not write the startup entry: {e}")
+        return False
+
+
+def remove_run_key() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_ALL_ACCESS) as k:
             winreg.QueryValueEx(k, RUN_VALUE)
             winreg.DeleteValue(k, RUN_VALUE)
-            print("  removed the competing HKCU Run entry")
+            print("  tray no longer starts at login")
+        return True
     except FileNotFoundError:
-        pass
+        return True
     except OSError as e:
-        print(f"  could not read the Run key: {e}")
+        print(f"  could not change the startup entry: {e}")
+        return False
+
+
+def remove_legacy_tray_task() -> bool:
+    """Delete the scheduled task older versions used to start the tray."""
+    if describe(TRAY_TASK) is None:
+        return True
+    r = _schtasks("/Delete", "/TN", TRAY_TASK, "/F")
+    if r.returncode == 0:
+        print(f"  removed the old scheduled task {TRAY_TASK}")
+        return True
+    print(f"  FAILED to remove {TRAY_TASK}: {(r.stdout or r.stderr).strip()[:80]}")
+    return False
 
 
 # What the tray's Autostart menu switches. Three separate choices, because
 # "start the tray icon" and "let scheduled runs restart Spotify to repair the
 # patch" are not the same decision.
 GROUPS = {
-    "tray": [TRAY_TASK],
+    "tray": [TRAY_ENTRY],
     "login_repair": [HEAL_TASK],
     "daily_repair": [f"{HEAL_TASK} (morning)", f"{HEAL_TASK} (night)"],
 }
@@ -456,18 +502,58 @@ GROUPS = {
 
 def group_enabled(group: str) -> bool:
     """True when every task in the group is registered and correct."""
+    if group == "tray":
+        return tray_autostart_on()
     names = set(GROUPS[group])
     return all(not wrong_with(describe(n), cmd, trg)
                for n, cmd, _, trg in tasks() if n in names)
 
 
+def refresh_outdated() -> list[str]:
+    """Bring autostart entries written by an older version of THIS install up
+    to date. Only entries that already exist and already point here are
+    touched, so which options the user has on is kept.
+
+    - The tray's scheduled task becomes the startup entry.
+    - Self-heal tasks with old settings (below-normal priority) are re-registered.
+
+    Returns what it changed; TRAY_ENTRY is in the list when the tray moved."""
+    stale = set()
+    legacy = describe(TRAY_TASK)
+    if legacy is not None:
+        want_exe, want_args = _split_command(tray_command())
+        if _same_path(legacy.get("command", ""), want_exe) and _same_args(legacy.get("arguments", ""), want_args):
+            stale.add(TRAY_ENTRY)
+    for name, cmd, _, trigger in tasks():
+        got = describe(name)
+        if got is None:
+            continue
+        want_exe, want_args = _split_command(cmd)
+        if not _same_path(got.get("command", ""), want_exe) or not _same_args(got.get("arguments", ""), want_args):
+            continue                      # another install's task: not ours to rewrite
+        if wrong_with(got, cmd, trigger):
+            stale.add(name)
+    if stale:
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            install(only=stale)
+    return sorted(stale)
+
+
 def install(only: "set[str] | None" = None) -> int:
-    # The competing Run key is dropped AFTER at least one task is registered.
-    # Dropping it first meant a failed registration left the user with no
-    # autostart at all: we removed the mechanism that was working before we knew
-    # whether the replacement would.
     blocked: list[tuple[str, str]] = []
     registered_any = False
+    if only is None or TRAY_ENTRY in only:
+        # The new entry first, the old task second: a failure in between leaves
+        # the tray starting twice (the second start sees the first and exits),
+        # never not at all.
+        if set_run_key():
+            registered_any = True
+            if not remove_legacy_tray_task():
+                blocked.append((TRAY_TASK, "the old scheduled task could not be removed"))
+        else:
+            blocked.append(("tray at login", "the startup entry could not be written"))
     for name, cmd, sched, trigger in tasks():
         if only is not None and name not in only:
             continue
@@ -525,10 +611,6 @@ def install(only: "set[str] | None" = None) -> int:
             INSTALL_STAMP.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
         except OSError:
             pass
-        remove_run_key()
-    elif run_key_value():
-        print("  kept the HKCU Run entry: no scheduled task was registered, so removing it\n"
-              "  would leave you with no autostart at all.")
 
     if blocked:
         print("\n  Could not put these right:")
@@ -549,8 +631,10 @@ def install(only: "set[str] | None" = None) -> int:
 
 
 def remove(only: "set[str] | None" = None) -> int:
-    remove_run_key()
     rc = 0
+    if only is None or TRAY_ENTRY in only:
+        if not (remove_run_key() and remove_legacy_tray_task()):
+            rc = 1
     for name, _, _, _ in tasks():
         if only is not None and name not in only:
             continue

@@ -11,7 +11,8 @@ with it. Each case here is something that was observed NOT to hold:
      never brought the tray back; it broke on non-ASCII install paths.
   5. The tray is silent: it never shows a toast. What happened is in the log
      and on the status line at the top of the menu.
-  6. Task Scheduler killed the tray after one hour.
+  6. Task Scheduler killed the tray after one hour. The tray is no longer a
+     scheduled task at all: it starts from the Windows startup entry.
   7. The packaged self-heal never wrote its log.
 
 No network, no Spotify, nothing outside a temp directory.
@@ -125,34 +126,102 @@ def main() -> int:
     check("4c. a non-ASCII install path survives as UTF-8 bytes",
           str(target).encode("utf-8") in raw, "path not found in the script bytes")
     relaunch_old = f'start "" "{target}"'
-    check("4d. both failure branches bring the existing tray back",
-          lines.count(relaunch_old) == 2, f"count={lines.count(relaunch_old)}")
-    check("4e. success relaunches with --updated so the new payload gets applied",
-          f'start "" "{target}" --updated' in lines)
+    check("4d. every branch (two failures, one success) ends by starting the tray",
+          lines.count(relaunch_old) == 3, f"count={lines.count(relaunch_old)}")
+    check("4e. the relaunch carries no special flag: any updater, old or new, starts the tray the same way",
+          "--updated" not in text)
     check("4f. every outcome leaves a line in update.log",
           text.count(str(inst / "update.log")) == 3, f"count={text.count(str(inst / 'update.log'))}")
 
     # -------------------------------------------------------------------- 6
-    tray_xml = install_tasks.task_xml(install_tasks.tray_command(), "LogonTrigger")
+    names = [n for n, _, _, _ in install_tasks.tasks()]
+    check("6a. the tray is not a scheduled task: only the three self-heal checks are",
+          len(names) == 3 and install_tasks.TRAY_TASK not in names
+          and all(n.startswith(install_tasks.HEAL_TASK) for n in names), str(names))
     heal_xml = install_tasks.task_xml(install_tasks.heal_command(), "LogonTrigger")
-    check("6a. the tray task has no execution time limit",
-          "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in tray_xml)
-    check("6b. self-heal tasks keep the one-hour limit",
+    check("6b. self-heal tasks keep a one-hour limit as a backstop for a hung run",
           "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>" in heal_xml)
-    check("6c. tasks run at normal priority, in schema order after the time limit",
-          "</ExecutionTimeLimit><Priority>4</Priority>" in tray_xml and "<Priority>4</Priority>" in heal_xml)
-    exe, args = install_tasks._split_command(install_tasks.tray_command())
+    check("6c. ...and run at normal priority, in schema order after the time limit",
+          "</ExecutionTimeLimit><Priority>4</Priority>" in heal_xml)
+    exe, args = install_tasks._split_command(install_tasks.heal_command())
     good = {"command": exe.strip('"'), "arguments": args, "level": "", "trigger_kinds": ["LogonTrigger"],
-            "priority": "4"}
-    old = install_tasks.wrong_with({**good, "limit": "PT1H"}, install_tasks.tray_command(), "LogonTrigger")
-    low = install_tasks.wrong_with({**good, "limit": "PT0S", "priority": ""}, install_tasks.tray_command(), "LogonTrigger")
-    check("6e. a task registered without a priority (Windows default, below normal) is reported as wrong",
+            "priority": "4", "limit": "PT1H"}
+    low = install_tasks.wrong_with({**good, "priority": ""}, install_tasks.heal_command(), "LogonTrigger")
+    check("6d. a task registered without a priority (Windows default, below normal) is reported as wrong",
           any("below-normal priority" in p for p in low), str(low))
-    fine = [p for p in install_tasks.wrong_with({**good, "limit": "PT0S"}, install_tasks.tray_command(), "LogonTrigger")
-            if "priority" in p or "stopped by" in p]
-    check("6f. ...and a task with the new settings is not", fine == [], str(fine))
-    check("6d. an already-registered tray task with the old limit is reported as wrong",
-          any("stopped by Task Scheduler" in p for p in old), str(old))
+    fine = [p for p in install_tasks.wrong_with(good, install_tasks.heal_command(), "LogonTrigger") if "priority" in p]
+    check("6e. ...and one with the new settings is not", fine == [], str(fine))
+
+    # The startup entry, against a fake registry and a fake task list: the real
+    # ones belong to whoever runs this test.
+    import contextlib
+    import io
+    reg: dict = {}
+    legacy: dict = {}
+    deleted: list = []
+
+    class R0:
+        returncode = 0
+        stdout = stderr = ""
+
+    saved_reg = (install_tasks.run_key_value, install_tasks.set_run_key, install_tasks.remove_run_key,
+                 install_tasks.describe, install_tasks._schtasks, install_tasks.INSTALL_STAMP,
+                 install_tasks.wrong_with)
+
+    def fake_set():
+        reg["v"] = install_tasks.tray_command()
+        return True
+
+    def fake_schtasks(*a):
+        if a[0] == "/Delete":
+            deleted.append(a[2])
+            legacy.pop(a[2], None)
+        return R0()
+
+    try:
+        install_tasks.run_key_value = lambda: reg.get("v")
+        install_tasks.set_run_key = fake_set
+        install_tasks.remove_run_key = lambda: (reg.pop("v", None), True)[1]
+        install_tasks.describe = lambda n: legacy.get(n)
+        install_tasks._schtasks = fake_schtasks
+        install_tasks.INSTALL_STAMP = tmp / ".tasks-installed"
+        te, ta = install_tasks._split_command(install_tasks.tray_command())
+        legacy[install_tasks.TRAY_TASK] = {"command": te.strip('"'), "arguments": ta, "level": ""}
+        with contextlib.redirect_stdout(io.StringIO()):
+            install_tasks.install(only={install_tasks.TRAY_ENTRY})
+        check("6f. switching the tray on writes the startup entry for this install",
+              install_tasks.tray_autostart_on() and install_tasks.group_enabled("tray"), str(reg))
+        check("6g. ...and removes the scheduled task an older version left behind, and nothing else",
+              deleted == [install_tasks.TRAY_TASK], str(deleted))
+        reg["v"] = r'"C:\somewhere else\Interceptify.exe"'
+        check("6h. a startup entry that points at a different install does not count as on",
+              not install_tasks.tray_autostart_on())
+        deleted.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            install_tasks.remove(only={install_tasks.TRAY_ENTRY})
+        check("6i. switching the tray off clears the startup entry and touches no self-heal task",
+              "v" not in reg and deleted == [], f"{reg} {deleted}")
+
+        # migration at tray start
+        reg.clear(); deleted.clear()
+        legacy[install_tasks.TRAY_TASK] = {"command": te.strip('"'), "arguments": ta, "level": ""}
+        install_tasks.wrong_with = lambda got, cmd, trigger="": []
+        fixed = install_tasks.refresh_outdated()
+        check("6j. an old tray task for THIS install is replaced by the startup entry",
+              fixed == [install_tasks.TRAY_ENTRY] and install_tasks.tray_autostart_on()
+              and deleted == [install_tasks.TRAY_TASK], f"fixed={fixed} reg={reg} deleted={deleted}")
+        reg.clear(); deleted.clear()
+        legacy[install_tasks.TRAY_TASK] = {"command": r"C:\other\Interceptify.exe", "arguments": "", "level": ""}
+        fixed = install_tasks.refresh_outdated()
+        check("6k. ...another install's tray task is left alone",
+              fixed == [] and not reg and deleted == [], f"fixed={fixed} reg={reg} deleted={deleted}")
+        legacy.clear()
+        fixed = install_tasks.refresh_outdated()
+        check("6l. ...and with autostart off nothing is switched on", fixed == [] and not reg, f"{fixed} {reg}")
+    finally:
+        (install_tasks.run_key_value, install_tasks.set_run_key, install_tasks.remove_run_key,
+         install_tasks.describe, install_tasks._schtasks, install_tasks.INSTALL_STAMP,
+         install_tasks.wrong_with) = saved_reg
 
     # ---------------------------------------------------------------- 3 + 5
     import main as app
@@ -208,7 +277,7 @@ def main() -> int:
           f"installs={installs} status={a._last_status}")
     check("3i. nothing in the update flow produced a toast", a.icon.shown == [], str(a.icon.shown))
 
-    # autostart: three separate switches, each touching only its own tasks
+    # autostart: three separate switches, each touching only its own entry
     did_tasks = []
     saved_it = (install_tasks.install, install_tasks.remove, install_tasks.group_enabled)
     on = {"tray": True, "login_repair": False, "daily_repair": False}
@@ -220,11 +289,11 @@ def main() -> int:
         a.toggle_autostart_group("tray")
         check("8a. switching the daily repair on registers only the two daily tasks",
               did_tasks[0] == ("install", sorted(install_tasks.GROUPS["daily_repair"])), str(did_tasks[:1]))
-        check("8b. switching the tray off removes only the tray task",
-              did_tasks[1] == ("remove", [install_tasks.TRAY_TASK]), str(did_tasks[1:2]))
+        check("8b. switching the tray off removes only the tray's startup entry",
+              did_tasks[1] == ("remove", [install_tasks.TRAY_ENTRY]), str(did_tasks[1:2]))
         every = sorted(n for g in install_tasks.GROUPS.values() for n in g)
-        check("8c. the three options cover every task the app registers, with no overlap",
-              every == sorted(n for n, _, _, _ in install_tasks.tasks()), str(every))
+        check("8c. the three options cover the startup entry and every scheduled task, with no overlap",
+              every == sorted([install_tasks.TRAY_ENTRY] + [n for n, _, _, _ in install_tasks.tasks()]), str(every))
         menu_src = src[src.index("def build_menu"):src.index("def run(self)")]
         check("8d. the tray menu has an Autostart submenu built from those options",
               'Item("Autostart", Menu(' in menu_src and "_AUTOSTART_LABELS" in menu_src)
@@ -232,36 +301,36 @@ def main() -> int:
         install_tasks.install, install_tasks.remove, install_tasks.group_enabled = saved_it
 
     # ...and the real install()/remove() honour the selection (stubbed above).
-    import contextlib
-    import io
-    deleted = []
+    deleted2 = []
 
     class R:
         returncode = 0
         stdout = stderr = ""
 
     saved_real = (install_tasks._schtasks, install_tasks.describe, install_tasks.wrong_with,
-                  install_tasks.remove_run_key, install_tasks.INSTALL_STAMP)
+                  install_tasks.remove_run_key, install_tasks.set_run_key, install_tasks.INSTALL_STAMP)
+    touched_run = []
     try:
-        install_tasks._schtasks = lambda *args: (deleted.append(args[2]) if args[0] == "/Delete" else None) or R()
-        install_tasks.describe = lambda n: {"level": ""}
+        install_tasks._schtasks = lambda *args: (deleted2.append(args[2]) if args[0] == "/Delete" else None) or R()
+        install_tasks.describe = lambda n: None if n == install_tasks.TRAY_TASK else {"level": ""}
         install_tasks.wrong_with = lambda got, cmd, trigger="": []
-        install_tasks.remove_run_key = lambda: None
+        install_tasks.remove_run_key = lambda: (touched_run.append("remove"), True)[1]
+        install_tasks.set_run_key = lambda: (touched_run.append("set"), True)[1]
         install_tasks.INSTALL_STAMP = tmp / ".tasks-installed"
         daily = set(install_tasks.GROUPS["daily_repair"])
         with contextlib.redirect_stdout(io.StringIO()):
             install_tasks.remove(only=daily)
-        check("8e. remove(only=...) deletes exactly the selected tasks",
-              sorted(deleted) == sorted(daily), str(deleted))
+        check("8e. remove(only=...) deletes exactly the selected tasks and leaves the startup entry alone",
+              sorted(deleted2) == sorted(daily) and touched_run == [], f"{deleted2} {touched_run}")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            install_tasks.install(only={install_tasks.TRAY_TASK})
+            install_tasks.install(only={install_tasks.HEAL_TASK})
         seen = [l for l in buf.getvalue().splitlines() if "already correct" in l]
-        check("8f. install(only=...) looks at exactly the selected tasks",
-              len(seen) == 1 and install_tasks.TRAY_TASK in seen[0], str(seen))
+        check("8f. install(only=...) looks at exactly the selected task and leaves the startup entry alone",
+              len(seen) == 1 and install_tasks.HEAL_TASK in seen[0] and touched_run == [], f"{seen} {touched_run}")
     finally:
         (install_tasks._schtasks, install_tasks.describe, install_tasks.wrong_with,
-         install_tasks.remove_run_key, install_tasks.INSTALL_STAMP) = saved_real
+         install_tasks.remove_run_key, install_tasks.set_run_key, install_tasks.INSTALL_STAMP) = saved_real
 
     # post-update: the new payload goes into Spotify
     state = {"patched": True, "live": "old", "ours": "new", "running": True, "unpatched": False}
@@ -310,6 +379,96 @@ def main() -> int:
                        env={**os.environ, "APPDATA": str(tmp / "appdata")})
     check("7. self-heal attaches its log file even when logging was configured first (the packaged case)",
           r.stdout.strip().endswith("True"), (r.stdout + r.stderr)[-200:])
+
+    # ------------------------------------------------- 9: diagnostics are not ads
+    import re as _re
+    hook_dead = {"t": 2000, "kind": "l1-hook-dead", "id": "l1", "gate": {"closed": True}}
+    spec_mute = {"t": 2001, "kind": "speculative-mute", "gate": {"closed": True}}
+    delivered = {"t": 2002, "kind": "delivered", "id": "ad-1", "gate": {"closed": True}}
+    saved_h = (selfheal.read_incidents_from_disk, selfheal._vault_append)
+    written: list[str] = []
+    try:
+        selfheal._vault_append = lambda lines: written.extend(lines)
+        selfheal.read_incidents_from_disk = lambda: [hook_dead, spec_mute]
+        st: dict = {}
+        n = selfheal.harvest("1.3.9", st)
+        check("9a. a dead hook and a speculative mute are not counted as ads reaching the user",
+              n == 0 and st.get("incident_watermark") == 2001, f"n={n} state={st}")
+        check("9b. ...they are still logged, labelled as diagnostics, and never parsed back as a delivery",
+              len(written) == 2 and all("diagnostic" in w for w in written)
+              and not any(selfheal._FAILURE_LINE.match(w.strip()) for w in written), str(written)[:200])
+        selfheal.read_incidents_from_disk = lambda: [hook_dead, delivered]
+        n = selfheal.harvest("1.3.9", {})
+        check("9c. a real delivery next to a diagnostic still counts, once", n == 1, f"n={n}")
+    finally:
+        selfheal.read_incidents_from_disk, selfheal._vault_append = saved_h
+
+    # ------------------------------------------------- 10: gate-key repair
+    yes = ["ad_enabled", "ads_enabled", "enable-ads", "adEnabled", "enableAds", "AD_ENABLED"]
+    no = ["on_demand_capped", "ready", "is_loaded", "headphones", "added_at", "leaderboard_shown", "broadcast"]
+    check("10a. only keys with ad/ads as a word are gate candidates",
+          all(selfheal._names_ads(k) for k in yes) and not any(selfheal._names_ads(k) for k in no),
+          f"wrong yes={[k for k in yes if not selfheal._names_ads(k)]} wrong no={[k for k in no if selfheal._names_ads(k)]}")
+    ext = tmp / "extensions"
+    ext.mkdir(exist_ok=True)
+    shipped_pats = ["^ad[_-]?enabled$", "^ads?[_-]?enabled$"]
+    (ext / "adblock.config.json").write_text(json.dumps(
+        {"adGateKeyPatterns": shipped_pats, "adGateFallbackKeys": ["ad_enabled"]}), encoding="utf-8")
+    saved_cfg = selfheal.OUR_CONFIG
+    try:
+        selfheal.OUR_CONFIG = ext / "adblock.config.local.json"
+        selfheal.persist_gate_pattern("adverts_on")
+        local = json.loads(selfheal.OUR_CONFIG.read_text(encoding="utf-8"))
+        check("10b. adopting a new gate key keeps every shipped pattern behind it",
+              local["adGateKeyPatterns"][0] == "^adverts_on$" and local["adGateKeyPatterns"][1:] == shipped_pats,
+              str(local["adGateKeyPatterns"]))
+        check("10c. ...and the shipped fallback key stays reachable",
+              local["adGateFallbackKeys"] == ["adverts_on", "ad_enabled"], str(local["adGateFallbackKeys"]))
+    finally:
+        selfheal.OUR_CONFIG = saved_cfg
+
+    # ------------------------------------------------- 11: only the user ends the tray
+    import patch_lock
+    check("11a. nothing in the app restarts, watches or flags the tray: it is simply never ended",
+          "ensure_tray_running" not in (ROOT / "selfheal.py").read_text(encoding="utf-8")
+          and "user_exited" not in src and "RestartOnFailure" not in heal_xml)
+    started = []
+    saved_m = (patch_lock.hold_tray_mutex, app.InterceptifyApp)
+
+    class NoApp:
+        def __init__(self, *a, **k):
+            started.append(1)
+
+        def run(self):
+            pass
+
+    try:
+        app.InterceptifyApp = NoApp
+        patch_lock.hold_tray_mutex = lambda: False
+        rc = app.main([])
+        check("11b. a second start while a tray is running exits quietly instead of adding an icon",
+              rc == 0 and started == [], f"rc={rc} started={started}")
+        patch_lock.hold_tray_mutex = lambda: True
+        app.main([])
+        check("11c. ...and the first start runs", started == [1], str(started))
+    finally:
+        patch_lock.hold_tray_mutex, app.InterceptifyApp = saved_m
+
+    # ------------------------------------------------- 12: works with the updater already installed
+    saved_frozen = app.is_frozen_build
+    try:
+        app.is_frozen_build = lambda: True
+        c0 = json.loads(app.CONFIG_PATH.read_text(encoding="utf-8"))
+        c0["last_version"] = "2.0.6-older"
+        app.CONFIG_PATH.write_text(json.dumps(c0), encoding="utf-8")
+        first = app.InterceptifyApp()            # as started by ANY updater: no flag, no argument
+        check("12a. a build started after an update knows it was just updated, with no flag from the updater",
+              first._post_update is True)
+        second = app.InterceptifyApp()
+        check("12b. ...and an ordinary start of the same version does not re-apply anything",
+              second._post_update is False)
+    finally:
+        app.is_frozen_build = saved_frozen
 
     print()
     if FAILURES:

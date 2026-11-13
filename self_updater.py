@@ -292,7 +292,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo %DATE% %TIME% updated >> "{log_path}"
-start "" "{target_exe}" --updated
+start "" "{target_exe}"
 del "%~f0"
 """
     bat_path.write_text(script, encoding="utf-8")

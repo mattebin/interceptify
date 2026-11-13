@@ -62,6 +62,45 @@ _k32.CloseHandle.argtypes = [wintypes.HANDLE]
 _k32.CloseHandle.restype = wintypes.BOOL
 
 
+# One tray per session. The handle is kept for the life of the process and
+# released by Windows when the process ends, however it ends.
+TRAY_MUTEX_NAME = "Local\\Interceptify.Tray"
+_tray_handle = None
+
+
+def hold_tray_mutex() -> bool:
+    """Claim the tray slot. False means another tray already holds it."""
+    global _tray_handle
+    ctypes.set_last_error(0)
+    handle = _k32.CreateMutexW(None, False, TRAY_MUTEX_NAME)
+    if not handle:
+        return True                       # cannot tell: never block the tray over it
+    if ctypes.get_last_error() == 183:    # ERROR_ALREADY_EXISTS
+        _k32.CloseHandle(handle)
+        return False
+    _tray_handle = handle
+    return True
+
+
+def release_tray_mutex() -> None:
+    """Give the slot up early, for a tray that is about to hand over to a new
+    process of itself."""
+    global _tray_handle
+    if _tray_handle:
+        _k32.CloseHandle(_tray_handle)
+        _tray_handle = None
+
+
+def tray_is_running() -> bool:
+    _k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    _k32.OpenMutexW.restype = wintypes.HANDLE
+    handle = _k32.OpenMutexW(0x00100000, False, TRAY_MUTEX_NAME)   # SYNCHRONIZE
+    if handle:
+        _k32.CloseHandle(handle)
+        return True
+    return False
+
+
 @contextmanager
 def _named(name: str, timeout: float, what: str):
     """Hold a named mutex for the block. Yields True if acquired.

@@ -767,6 +767,17 @@ def read_incidents_from_disk() -> list[dict]:
     return [seen[k] for k in sorted(seen)]
 
 
+# Records the payload writes that are NOT an ad reaching anyone: a hook that
+# never fired, a mute armed on suspicion and released. harvest() counted every
+# record as a delivery, so a dead L1 hook was reported as "AD DELIVERED THROUGH
+# A CLOSED GATE" and left an UNRESOLVED flag that nothing could clear.
+DIAGNOSTIC_KINDS = frozenset({"l1-hook-dead", "speculative-mute"})
+
+
+def is_ad_incident(it: dict) -> bool:
+    return (it.get("kind") or "delivered") not in DIAGNOSTIC_KINDS
+
+
 def is_expected_incident(it: dict) -> bool:
     """True when selftest opened the gate on purpose to prove its ad trigger works.
 
@@ -790,6 +801,8 @@ def _incident_line(it: dict, spotify_ver: str) -> str:
     # worse outcome than a delivery the gate absorbed, so it is labelled louder.
     heard = kind in ("muted", "skipped")
 
+    if not is_ad_incident(it):
+        return f"- diagnostic ({kind}) {ident} - not an ad; recorded for troubleshooting only"
     if is_expected_incident(it):
         return (f"- ✅ expected ad during self-test {ident} — the verifier opened "
                 f"the gate deliberately to prove its trigger fires")
@@ -825,7 +838,7 @@ def harvest(spotify_ver: str, state: dict) -> int:
     _vault_append([_incident_line(i, spotify_ver) for i in fresh])
     # Advance past everything seen, expected or not, so nothing is reported twice.
     state["incident_watermark"] = max(int(i["t"]) for i in fresh)
-    real = [i for i in fresh if not is_expected_incident(i)]
+    real = [i for i in fresh if is_ad_incident(i) and not is_expected_incident(i)]
     if real:
         log.warning("harvested %d ad incident(s), %d of them real block failures -> %s",
                     len(fresh), len(real), VAULT_NOTE)
@@ -1276,6 +1289,16 @@ SCAN_CONNECTOR = r"""
 """
 
 
+def _names_ads(key: str) -> bool:
+    """True when "ad"/"ads" is a WORD in the key, in snake, kebab or camel case.
+
+    The filter used to be a bare substring match, so `on_demand_capped`,
+    `ready` and `is_loaded` all counted as ad switches, and a repair could
+    adopt one of them as the gate key."""
+    words = [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", key)]
+    return any(w in ("ad", "ads") for w in words)
+
+
 def candidate_gate_keys(cdp: CDP) -> list[str]:
     """Live ad-state keys that look like a boolean ad switch."""
     raw = cdp.ev(DUMP_STATE_KEYS)
@@ -1285,7 +1308,7 @@ def candidate_gate_keys(cdp: CDP) -> list[str]:
         st = {}
     cands = []
     for k, v in st.items():
-        if str(v).lower() in ("true", "false") and re.search(r"ad", k, re.I):
+        if str(v).lower() in ("true", "false") and _names_ads(k):
             cands.append(k)
     # most-likely first
     cands.sort(key=lambda k: (0 if re.search(r"enab", k, re.I) else 1, len(k)))
@@ -1359,7 +1382,16 @@ def persist_gate_pattern(key: str) -> None:
         cfg = json.loads(OUR_CONFIG.read_text(encoding="utf-8"))
     except Exception:
         cfg = {}
-    pats = cfg.get("adGateKeyPatterns") or []
+    # The local file is merged over the shipped one key by key, so a list here
+    # REPLACES the shipped list. Starting from an empty list meant one adopted
+    # key threw away every shipped pattern. Start from what ships.
+    try:
+        shipped = json.loads((OUR_CONFIG.parent / "adblock.config.json").read_text(encoding="utf-8"))
+    except Exception:
+        shipped = {}
+    pats = list(cfg.get("adGateKeyPatterns") or shipped.get("adGateKeyPatterns") or [])
+    if not cfg.get("adGateFallbackKeys"):
+        cfg["adGateFallbackKeys"] = list(shipped.get("adGateFallbackKeys") or [])
     new = "^" + re.escape(key) + "$"
     if new not in pats:
         pats.insert(0, new)

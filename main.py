@@ -324,9 +324,18 @@ def make_icon(active: bool) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 class InterceptifyApp:
-    def __init__(self, post_update: bool = False) -> None:
+    def __init__(self) -> None:
         self.cfg = load_config()
-        self._post_update = post_update
+        self._post_update = False
+        # "Was I just updated?" has one answer: the version this install last
+        # ran as, kept in config.json. It does not depend on how the updater
+        # started us, so it holds for the updater already on people's machines
+        # (2.0.6 and older) exactly as it does for this one.
+        if is_frozen_build() and self.cfg.get("last_version") != APP_VERSION:
+            self._post_update = True
+        if self.cfg.get("last_version") != APP_VERSION:
+            self.cfg["last_version"] = APP_VERSION
+            save_config(self.cfg)
         self._last_status: Optional[tuple[str, str]] = None
         self._auto_update_tried: Optional[str] = None
         self.icon: Optional[pystray.Icon] = None
@@ -366,6 +375,27 @@ class InterceptifyApp:
                 self.icon.update_menu()
         except Exception:
             pass
+
+    def _restart_as_plain_process(self) -> None:
+        """Start a fresh tray as an ordinary process and end this one. Used
+        once, when moving off the old scheduled task: a process that task
+        started is ended by Task Scheduler when its time limit passes."""
+        if not is_frozen_build():
+            return
+        try:
+            import patch_lock
+            patch_lock.release_tray_mutex()
+            subprocess.Popen([sys.executable], cwd=str(ROOT), close_fds=True,
+                             creationflags=0x00000008 | 0x00000200)
+        except Exception as e:
+            log.warning("could not restart outside the scheduled task: %s", e)
+            return
+        try:
+            if self.icon is not None:
+                self.icon.stop()
+        except Exception:
+            pass
+        os._exit(0)
 
     def _status_line(self) -> str:
         if not self._last_status:
@@ -910,6 +940,20 @@ class InterceptifyApp:
         # moment someone is looking at it.
         def _startup_warnings() -> None:
             time.sleep(2.0)
+            # Autostart entries written by an older version carry settings
+            # that kill the tray after an hour. Bring our own up to date.
+            try:
+                import install_tasks
+                fixed = install_tasks.refresh_outdated()
+                if fixed:
+                    log.info("brought autostart entries up to date: %s", ", ".join(fixed))
+                    self._autostart_groups.clear()
+                if install_tasks.TRAY_ENTRY in fixed:
+                    # This process was started by the old scheduled task and is
+                    # still on its clock. Hand over to one that is not.
+                    self._restart_as_plain_process()
+            except Exception as e:
+                log.warning("autostart refresh failed: %s", e)
             if self._post_update:
                 self._apply_update_to_spotify()
             if spotify_patcher.PAYLOAD_SYNC_ERROR:
@@ -970,9 +1014,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if argv and argv[0] in ("--version", "-V"):
         print(f"{APP_NAME} {APP_VERSION}")
         return 0
-    # The updater relaunches with --updated so the new build knows to put its
-    # payload into Spotify instead of waiting for the next scheduled run.
-    InterceptifyApp(post_update=bool(argv and argv[0] == "--updated")).run()
+    # One tray per session: a second start (a shortcut, a scheduled check
+    # racing a logon) leaves the running one alone instead of adding an icon.
+    import patch_lock
+    if not patch_lock.hold_tray_mutex():
+        return 0
+    InterceptifyApp().run()
     return 0
 
 
