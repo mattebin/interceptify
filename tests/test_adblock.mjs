@@ -2461,7 +2461,7 @@ async function testS() {
 }
 
 // ===========================================================================
-// TEST T — EXPORT NAMES ARE THE MINIFIER'S, NOT OURS
+// TEST T: EXPORT NAMES ARE THE MINIFIER'S, NOT OURS
 //
 // Spotify 1.3.9 renamed the in-stream provider's exports from {d, m} to
 // {dY, mr} and added a React hook (bS). The L1 fast path REPLACED the module's
@@ -2597,7 +2597,7 @@ async function testT() {
 }
 
 // ===========================================================================
-// TEST U — FOUND BY WHAT IT IS, NOT WHAT IT IS CALLED
+// TEST U: FOUND BY WHAT IT IS, NOT WHAT IT IS CALLED
 //
 // Every outage so far was a NAME moving while the thing itself stayed put: a
 // module id, the chunk array, an export. Three more lookups were still by name.
