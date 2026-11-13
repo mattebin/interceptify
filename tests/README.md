@@ -1,7 +1,36 @@
-# Interceptify v2 — adblock.js regression tests
+# Interceptify tests
+
+No Spotify, no network and no admin rights needed. CI runs all of them before a release.
+
+| File | What it guards |
+|---|---|
+| `test_adblock.mjs` | The payload: never skips real music, blocks ads, survives Spotify's module changes (sections A to U) |
+| `test_tray_behaviour.py` | The tray does what its menu says: silent, Unpatch is respected, updates, Autostart options, a repair restarts Spotify once |
+| `test_updater_script.py` | The update script swaps the exe and brings the tray back, also on failure and in folders with non-ASCII names |
+| `test_patch_roundtrip.py` | Patch and Unpatch restore Spotify's file exactly |
+| `test_config_contract.py` | Every config key is read by the payload and has a default |
+| `test_config_upgrade.py` | A release replaces the shipped config and keeps your local one |
+| `test_delivery_state.py` | When self-heal may call an ad problem resolved |
+| `test_publish_gap.py` | Self-heal notices a fix that was never released |
+| `test_recon.py` | The record of Spotify-side names and the report of what moved |
+| `test_redact.py` | Tokens are masked in diagnostic files |
+| `test_version_consistency.py` | Tag, app version, manifest and exe resource agree |
+| `test_bundled_payload.py` | The built exe carries this commit's payload and does not ask for admin |
+| `test_frozen_cycle.py` | The packaged exe works from its own folder (paths, log, read-only verify) |
+
+```
+node tests/test_adblock.mjs
+python tests/test_tray_behaviour.py
+python tests/test_bundled_payload.py dist/Interceptify.exe   # the two exe tests take the built exe
+```
+
+## The payload suite (test_adblock.mjs)
+
+Sections A to U. The newest: R and S (Spotify 1.3.0), T (1.3.9, renamed exports), U (things found by what they are, not by name).
+The notes below describe the oldest and most important sections.
 
 Dependency-free, Node-only regression test for `extensions/adblock.js` (the IIFE
-injected into Spotify's renderer). No npm install, no test framework — just Node
+injected into Spotify's renderer). No npm install, no test framework - just Node
 24+ and the standard library (`node:vm`, `node:fs`).
 
 ## Run
@@ -31,7 +60,7 @@ prototype-bearing globals like `HTMLElement`/`AudioNode` for the load-time
 hooks). It then captures the FSM `check()` tick (`setInterval(fn, 500)`) and the
 installed `window.fetch`, and drives them by hand.
 
-### TEST A — the no-over-skip invariant (critical)
+### TEST A: the no-over-skip invariant (critical)
 
 This is the regression that matters: the v1 blocker over-skipped real songs when
 ad UI lingered one render past the ad audio. The test:
@@ -50,10 +79,10 @@ ad UI lingered one render past the ad audio. The test:
 
 A throwaway negative control (run during development, not committed) confirmed
 the keystone assertion has teeth: when the ad genuinely persists, the advance
-counter keeps climbing — so the only reason TEST A passes is that adblock.js
+counter keeps climbing - so the only reason TEST A passes is that adblock.js
 correctly stops advancing once now-playing moves off the ad.
 
-### TEST C — the L1 in-stream skip is gated (over-skip bypass)
+### TEST C: the L1 in-stream skip is gated (over-skip bypass)
 
 TEST A covers the DOM `advance()` choke point. TEST C covers the **other**
 advancing channel: the webpack-driven `neutralizeInStreamAd()` → `api.skipToNext()`
@@ -62,22 +91,22 @@ gates, so a re-read / lingering / prefetched in-stream ad object could skip a
 **real** song. The test drives the **real** webpack provider hook (pushes a
 synthetic module `46849` onto `webpackChunkclient_web`, invokes the wrapped
 factory webpack-style, then calls the wrapped `d()` to install the `inStreamAd`
-getter/setter), so the skip runs through the genuine code path — then asserts:
+getter/setter), so the skip runs through the genuine code path - then asserts:
 
-1. **C1** — from idle, an in-stream ad object fires `skipToNext()` once (the
+1. **C1** - from idle, an in-stream ad object fires `skipToNext()` once (the
    lever still works) and arms the post-skip cooldown lock.
-2. **C2** — a *different* in-stream ad **within** the cooldown window is
+2. **C2** - a *different* in-stream ad **within** the cooldown window is
    **suppressed** (the distinct ad key rules out the dedupe Set).
-3. **C3** — after the FSM confirms an ad (so `currentAdFp` is captured) and
+3. **C3** - after the FSM confirms an ad (so `currentAdFp` is captured) and
    now-playing has moved to a real song, the in-stream skip is **suppressed**
    even after the cooldown expires.
 
 C2 and C3 have a **committed, verified negative control**: temporarily forcing
 `inStreamSkipSafe()` to `return true` (pre-fix ungated behavior) makes both fail
 with `before=1 after=2` (the skip lands on the real song), while C1 still passes
-— so the assertions provably catch the exact over-skip bypass.
+- so the assertions provably catch the exact over-skip bypass.
 
-### TEST B — the manifest classifier
+### TEST B: the manifest classifier
 
 Exercises the `/manifests/v9/json/sources/<hex>/options/...` interception in the
 single `window.fetch` hook. A fake base `fetch` is installed *before* adblock.js
@@ -91,7 +120,7 @@ loads, so the wrapper chains to it.
 
 ## Scope
 
-The test **never** modifies `extensions/adblock.js` or any other project file —
+The test **never** modifies `extensions/adblock.js` or any other project file -
 it only reads `extensions/adblock.js`. All behavior is driven through the
 captured `check()` tick and `window.fetch`. If a real adblock.js bug ever made
 these invariants impossible to satisfy, the harness would fail loudly rather

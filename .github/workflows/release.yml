@@ -52,7 +52,7 @@ jobs:
         run: python tests/test_config_contract.py
 
       - name: Python syntax
-        run: python -m compileall -q main.py selfheal.py spotify_patcher.py self_updater.py patch_lock.py install_tasks.py redact.py recon_ids.py cdp_capture.py cdp_netlog.py
+        run: python -m compileall -q main.py selfheal.py spotify_patcher.py self_updater.py patch_lock.py install_tasks.py redact.py recon_ids.py
 
       - name: Install runtime deps for the state/config tests
         run: pip install -r requirements.txt
@@ -178,7 +178,7 @@ jobs:
 
             Windows tray app that blocks ads in the Spotify desktop client by patching its `xpui.spa` UI bundle.
 
-            > 🛑 **READ THIS FIRST** — You need the **desktop installer** version of Spotify from [spotify.com/download](https://www.spotify.com/download). The **Microsoft Store version will NOT work** (sandbox prevents file modification). Uninstall the Store version and install from spotify.com before using this.
+            > 🛑 **READ THIS FIRST.** You need the **desktop installer** version of Spotify from [spotify.com/download](https://www.spotify.com/download). The **Microsoft Store version will NOT work** (sandbox prevents file modification). Uninstall the Store version and install from spotify.com before using this.
 
             > ⚠️ **The .exe is not code-signed.** Windows SmartScreen will warn on first run. Verify the SHA-256 below matches the `.sha256` file before running it. Note that both come from this same release, so they confirm the download was not corrupted in transit; they are not an independent guarantee of who built it.
 
@@ -186,19 +186,19 @@ jobs:
             1. Download **Interceptify.exe** below.
             2. Double-click. No admin prompt: it runs as you.
             3. Right-click the tray icon → **Patch Spotify**. Spotify will close and relaunch with ad-blocking active.
-            4. Optional: tray → **Run at Windows startup**. That registers the scheduled tasks that keep the patch alive across Spotify updates, pointed at this .exe.
+            4. Optional: tray → **Autostart**. Tick **Start Interceptify when I log in**, and the repair options if you want the patch put back after Spotify updates.
 
             ### How it works
             - Injects a small JS file into Spotify's UI bundle (`%APPDATA%\Spotify\Apps\xpui.spa`)
-            - **Total block:** flips Spotify's core ad-scheduler off (`ad_enabled = false`) and clears queued ad slots, so ad breaks are never scheduled or loaded — not just skipped after they start. Re-applied continuously so a server refresh can't reopen ads.
+            - **Total block:** flips Spotify's core ad-scheduler off (`ad_enabled = false`) and clears queued ad slots, so ad breaks are never scheduled or loaded, not just skipped after they start. Re-applied continuously so a server refresh can't reopen ads.
             - Reactive fallback: if an ad ever slips through, it's skipped (via Spotify's own override-skip) and muted so it's silent.
             - Hides visual ad surfaces with CSS.
-            - Supports Spotify's current V8-snapshot desktop builds (1.2.93 through 1.3.0), where the ad modules are reached at runtime from `__webpack_modules__`.
+            - Supports Spotify's current V8-snapshot desktop builds (1.2.93 through 1.3.9), where the ad modules are reached at runtime from `__webpack_modules__`.
 
             ### Settings
-            Tunables live in `extensions/adblock.config.json`, which belongs to the release and is replaced on every update. Put your own changes in `extensions/adblock.config.local.json` — that file is never overwritten and wins over the shipped defaults.
+            Tunables live in `extensions/adblock.config.json`, which belongs to the release and is replaced on every update. Put your own changes in `extensions/adblock.config.local.json`. That file is never overwritten and wins over the shipped defaults.
 
             ### Spotify auto-updates
-            Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update — original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.
+            Spotify auto-updates wipe the patch. Click **Patch Spotify** again after an update, or tick the repair options under **Autostart** and it is put back for you. The original `xpui.spa` is preserved at `xpui.spa.interceptify-backup`.
 
             See the [README](https://github.com/mattebin/interceptify#readme) for honest limitations.

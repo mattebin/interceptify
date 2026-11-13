@@ -1,0 +1,40 @@
+name: Bug report
+description: Ads came through, Spotify does not load, or the app misbehaves
+body:
+  - type: input
+    id: interceptify
+    attributes:
+      label: Interceptify version
+      description: Shown in the tray menu as "Check for updates (now X.Y.Z)"
+    validations:
+      required: true
+  - type: input
+    id: spotify
+    attributes:
+      label: Spotify version
+      description: In Spotify, open the menu and choose Help, About Spotify
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where did you install Spotify from?
+      options:
+        - spotify.com installer
+        - Microsoft Store (not supported)
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you got instead
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log (optional)
+      description: If you use the repair options, paste the last lines of selfheal.log from the folder where Interceptify.exe is
+      render: text
