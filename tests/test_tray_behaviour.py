@@ -9,8 +9,8 @@ with it. Each case here is something that was observed NOT to hold:
      it, and after an install Spotify kept the old payload.
   4. The updater script paused forever on a hidden console when it failed and
      never brought the tray back; it broke on non-ASCII install paths.
-  5. Toasts over 255 characters were rejected by Windows, so the longest
-     warnings never appeared.
+  5. The tray is silent: it never shows a toast. What happened is in the log
+     and on the status line at the top of the menu.
   6. Task Scheduler killed the tray after one hour.
   7. The packaged self-heal never wrote its log.
 
@@ -166,15 +166,23 @@ def main() -> int:
             self.menu = None
 
         def notify(self, msg, title=""):
-            if len(msg) > 255:
-                raise ValueError("string too long")       # what Windows does
-            self.shown.append(msg)
+            self.shown.append(msg)                        # a toast: must never happen
+
+        def update_menu(self):
+            pass
 
     a = app.InterceptifyApp()
     a.icon = FakeIcon()
+    a.notify("Spotify patched.")
     a.notify("x" * 276)
-    check("5. a 276-character warning is shown, trimmed, instead of rejected",
-          len(a.icon.shown) == 1 and len(a.icon.shown[0]) <= 255, f"shown={len(a.icon.shown)}")
+    check("5a. the tray never shows a toast",
+          a.icon.shown == [], f"toasts={len(a.icon.shown)}")
+    check("5b. ...the last message is on the menu's status line instead, trimmed to fit",
+          a._status_line().endswith("...") and len(a._status_line()) < 110 and "x" * 20 in a._status_line(),
+          a._status_line()[:60])
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    check("5c. ...and no code path in the tray can raise one",
+          ".icon.notify(" not in src and "icon.notify(" not in src, "main.py still calls icon.notify")
 
     check("3a. automatic updates are on by default", a.cfg.get("auto_update") is True, str(a.cfg))
     installs = []
@@ -183,19 +191,77 @@ def main() -> int:
     class Rel:
         tag = "v9.9.9"
 
-    a.icon.shown.clear()
+    a._last_status = None
     a._offer_or_install(Rel())
     check("3b. a newer release is installed, not just announced",
-          installs == [1] and not a.icon.shown, f"installs={installs} toasts={a.icon.shown}")
+          installs == [1] and a._last_status is None, f"installs={installs} status={a._last_status}")
     a._offer_or_install(Rel())
-    check("3c. the same release is not retried every poll; it falls back to the toast",
-          installs == [1] and len(a.icon.shown) == 1, f"installs={installs} toasts={len(a.icon.shown)}")
+    check("3c. the same release is not retried every poll; the status line says it is waiting",
+          installs == [1] and a._last_status is not None and "v9.9.9" in a._last_status[0],
+          f"installs={installs} status={a._last_status}")
     a.cfg["auto_update"] = False
     a._auto_update_tried = None
-    a.icon.shown.clear()
+    a._last_status = None
     a._offer_or_install(Rel())
-    check("3d. with automatic updates off it only announces",
-          installs == [1] and len(a.icon.shown) == 1, f"installs={installs} toasts={len(a.icon.shown)}")
+    check("3d. with automatic updates off it only says an update exists",
+          installs == [1] and a._last_status is not None and "v9.9.9" in a._last_status[0],
+          f"installs={installs} status={a._last_status}")
+    check("3i. nothing in the update flow produced a toast", a.icon.shown == [], str(a.icon.shown))
+
+    # autostart: three separate switches, each touching only its own tasks
+    did_tasks = []
+    saved_it = (install_tasks.install, install_tasks.remove, install_tasks.group_enabled)
+    on = {"tray": True, "login_repair": False, "daily_repair": False}
+    try:
+        install_tasks.group_enabled = lambda g: on[g]
+        install_tasks.install = lambda only=None: (did_tasks.append(("install", sorted(only))) or 0)
+        install_tasks.remove = lambda only=None: (did_tasks.append(("remove", sorted(only))) or 0)
+        a.toggle_autostart_group("daily_repair")
+        a.toggle_autostart_group("tray")
+        check("8a. switching the daily repair on registers only the two daily tasks",
+              did_tasks[0] == ("install", sorted(install_tasks.GROUPS["daily_repair"])), str(did_tasks[:1]))
+        check("8b. switching the tray off removes only the tray task",
+              did_tasks[1] == ("remove", [install_tasks.TRAY_TASK]), str(did_tasks[1:2]))
+        every = sorted(n for g in install_tasks.GROUPS.values() for n in g)
+        check("8c. the three options cover every task the app registers, with no overlap",
+              every == sorted(n for n, _, _, _ in install_tasks.tasks()), str(every))
+        menu_src = src[src.index("def build_menu"):src.index("def run(self)")]
+        check("8d. the tray menu has an Autostart submenu built from those options",
+              'Item("Autostart", Menu(' in menu_src and "_AUTOSTART_LABELS" in menu_src)
+    finally:
+        install_tasks.install, install_tasks.remove, install_tasks.group_enabled = saved_it
+
+    # ...and the real install()/remove() honour the selection (stubbed above).
+    import contextlib
+    import io
+    deleted = []
+
+    class R:
+        returncode = 0
+        stdout = stderr = ""
+
+    saved_real = (install_tasks._schtasks, install_tasks.describe, install_tasks.wrong_with,
+                  install_tasks.remove_run_key, install_tasks.INSTALL_STAMP)
+    try:
+        install_tasks._schtasks = lambda *args: (deleted.append(args[2]) if args[0] == "/Delete" else None) or R()
+        install_tasks.describe = lambda n: {"level": ""}
+        install_tasks.wrong_with = lambda got, cmd, trigger="": []
+        install_tasks.remove_run_key = lambda: None
+        install_tasks.INSTALL_STAMP = tmp / ".tasks-installed"
+        daily = set(install_tasks.GROUPS["daily_repair"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            install_tasks.remove(only=daily)
+        check("8e. remove(only=...) deletes exactly the selected tasks",
+              sorted(deleted) == sorted(daily), str(deleted))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            install_tasks.install(only={install_tasks.TRAY_TASK})
+        seen = [l for l in buf.getvalue().splitlines() if "already correct" in l]
+        check("8f. install(only=...) looks at exactly the selected tasks",
+              len(seen) == 1 and install_tasks.TRAY_TASK in seen[0], str(seen))
+    finally:
+        (install_tasks._schtasks, install_tasks.describe, install_tasks.wrong_with,
+         install_tasks.remove_run_key, install_tasks.INSTALL_STAMP) = saved_real
 
     # post-update: the new payload goes into Spotify
     state = {"patched": True, "live": "old", "ours": "new", "running": True, "unpatched": False}

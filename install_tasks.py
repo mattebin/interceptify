@@ -444,7 +444,24 @@ def remove_run_key() -> None:
         print(f"  could not read the Run key: {e}")
 
 
-def install() -> int:
+# What the tray's Autostart menu switches. Three separate choices, because
+# "start the tray icon" and "let scheduled runs restart Spotify to repair the
+# patch" are not the same decision.
+GROUPS = {
+    "tray": [TRAY_TASK],
+    "login_repair": [HEAL_TASK],
+    "daily_repair": [f"{HEAL_TASK} (morning)", f"{HEAL_TASK} (night)"],
+}
+
+
+def group_enabled(group: str) -> bool:
+    """True when every task in the group is registered and correct."""
+    names = set(GROUPS[group])
+    return all(not wrong_with(describe(n), cmd, trg)
+               for n, cmd, _, trg in tasks() if n in names)
+
+
+def install(only: "set[str] | None" = None) -> int:
     # The competing Run key is dropped AFTER at least one task is registered.
     # Dropping it first meant a failed registration left the user with no
     # autostart at all: we removed the mechanism that was working before we knew
@@ -452,6 +469,8 @@ def install() -> int:
     blocked: list[tuple[str, str]] = []
     registered_any = False
     for name, cmd, sched, trigger in tasks():
+        if only is not None and name not in only:
+            continue
         existing = describe(name)
         # Leave a correct task alone. A task authored by an elevated process
         # keeps a security descriptor that only Administrators can modify, so
@@ -529,10 +548,12 @@ def install() -> int:
     return 0
 
 
-def remove() -> int:
+def remove(only: "set[str] | None" = None) -> int:
     remove_run_key()
     rc = 0
     for name, _, _, _ in tasks():
+        if only is not None and name not in only:
+            continue
         r = _schtasks("/Delete", "/TN", name, "/F")
         if r.returncode == 0:
             print(f"  removed {name}")

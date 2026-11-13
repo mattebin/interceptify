@@ -327,11 +327,13 @@ class InterceptifyApp:
     def __init__(self, post_update: bool = False) -> None:
         self.cfg = load_config()
         self._post_update = post_update
+        self._last_status: Optional[tuple[str, str]] = None
         self._auto_update_tried: Optional[str] = None
         self.icon: Optional[pystray.Icon] = None
         self._latest_release: Optional[self_updater.Release] = None
         self._update_in_progress = False
         self._autostart_cache: Optional[tuple[bool, float]] = None
+        self._autostart_groups: dict[str, tuple[bool, float]] = {}
 
         # Optional personal feature: Spotify-update watcher that re-applies the
         # patch after a Spotify auto-update. Activates only if the local
@@ -353,15 +355,23 @@ class InterceptifyApp:
     # ---- Helpers ---------------------------------------------------------
 
     def notify(self, msg: str, title: str = APP_NAME) -> None:
-        log.info("NOTIFY: %s", msg)
-        # Windows rejects a balloon text over 255 characters outright, so the
-        # longest warnings were the ones that never appeared.
-        shown = msg if len(msg) <= 250 else msg[:247] + "..."
+        """Record what just happened. This app never shows a toast: it is a
+        silent tray icon. The message goes to the log and to the status line
+        at the top of the tray menu, where it is there when you look and
+        nowhere when you do not."""
+        log.info("STATUS: %s", msg)
+        self._last_status = (msg, time.strftime("%H:%M"))
         try:
             if self.icon is not None:
-                self.icon.notify(shown, title)
-        except Exception as e:
-            log.warning("Notify failed: %s -- %s", e, msg)
+                self.icon.update_menu()
+        except Exception:
+            pass
+
+    def _status_line(self) -> str:
+        if not self._last_status:
+            return f"{APP_NAME} {APP_VERSION}"
+        msg, at = self._last_status
+        return f"{at}  {msg if len(msg) <= 90 else msg[:87] + '...'}"
 
     def _is_active(self) -> bool:
         """Active = Spotify is currently patched."""
@@ -545,7 +555,7 @@ class InterceptifyApp:
             self._auto_update_tried = rel.tag
             self.install_update()
         else:
-            self.notify(f"Update {rel.tag} available. Click 'Install update' in the tray menu.")
+            self.notify(f"Update {rel.tag} available: 'Install update' in this menu.")
 
     def check_updates_now(self, *_args) -> None:
         def worker():
@@ -748,19 +758,40 @@ class InterceptifyApp:
         self._autostart_cache = (value, now)
         return value
 
-    def toggle_autostart(self, *_args) -> None:
+    _AUTOSTART_LABELS = {
+        "tray": "Start Interceptify when I log in",
+        "login_repair": "Check and repair the patch when I log in",
+        "daily_repair": "Check and repair the patch daily (08:00 and 21:00)",
+    }
+
+    def _autostart_group_enabled(self, group: str, fresh: bool = False) -> bool:
+        now = time.monotonic()
+        cached = self._autostart_groups.get(group)
+        if not fresh and cached is not None and now - cached[1] < self._AUTOSTART_TTL:
+            return cached[0]
         try:
             import install_tasks
-            if self._is_autostart_enabled(fresh=True):
-                install_tasks.remove()
-                self.notify("Auto-start at Windows login: OFF")
+            value = install_tasks.group_enabled(group)
+        except Exception:
+            value = False
+        self._autostart_groups[group] = (value, now)
+        return value
+
+    def toggle_autostart_group(self, group: str) -> None:
+        label = self._AUTOSTART_LABELS[group]
+        try:
+            import install_tasks
+            names = set(install_tasks.GROUPS[group])
+            if self._autostart_group_enabled(group, fresh=True):
+                rc = install_tasks.remove(only=names)
+                self.notify(f"{label}: off" if rc == 0 else f"{label}: could not be switched off")
             else:
-                rc = install_tasks.install()
-                self.notify("Auto-start at Windows login: ON" if rc == 0 else
-                            "Auto-start could not be fully registered - see the log.")
+                rc = install_tasks.install(only=names)
+                self.notify(f"{label}: on" if rc == 0 else f"{label}: could not be switched on")
         except Exception as e:
-            self.notify(f"Auto-start toggle failed: {e}")
-        self._autostart_cache = None       # we just changed it; never serve the old answer
+            self.notify(f"{label}: failed ({e})")
+        self._autostart_groups.pop(group, None)   # just changed; never serve the old answer
+        self._autostart_cache = None
         self.refresh_icon()
 
     def _deployment_warning(self) -> Optional[str]:
@@ -779,7 +810,7 @@ class InterceptifyApp:
             return None
         return ("Autostart is registered for a different Interceptify install "
                 f"({', '.join(n for n, _ in foreign)}). It can re-patch Spotify with an "
-                "older payload. Use 'Run at Windows startup' to re-register it for this one.")
+                "older payload. Switch the Autostart options off and on to re-register them for this one.")
 
     # ---- Exit ----------------------------------------------------------
 
@@ -810,6 +841,9 @@ class InterceptifyApp:
             "Install update"
         )
         items = [
+            # Where a toast would have been: the last thing that happened.
+            Item(lambda item: self._status_line(), None, enabled=False),
+            Menu.SEPARATOR,
             Item(toggle_label, self.toggle, default=True),
             Item(
                 update_label, self.install_update,
@@ -841,11 +875,14 @@ class InterceptifyApp:
             ))
         items.extend([
             Menu.SEPARATOR,
-            Item(
-                "Run at Windows startup",
-                self.toggle_autostart,
-                checked=lambda item: self._is_autostart_enabled(),
-            ),
+            Item("Autostart", Menu(*[
+                Item(
+                    label,
+                    (lambda g: (lambda *_a: self.toggle_autostart_group(g)))(group),
+                    checked=(lambda g: (lambda item: self._autostart_group_enabled(g)))(group),
+                )
+                for group, label in self._AUTOSTART_LABELS.items()
+            ])),
             Menu.SEPARATOR,
             Item("Exit", self.quit_app),
         ])
